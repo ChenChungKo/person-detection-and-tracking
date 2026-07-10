@@ -41,8 +41,6 @@ $env:RTSP_URL = "rtsp://帳號:密碼@攝影機IP:554/stream1"
 python test_rtsp.py
 ```
 
-請勿把含帳密的 RTSP URL 寫進程式碼或提交到 GitHub。
-
 ## 文件
 
 - [今日報告 7/10](PPT%20report/報告7_10.pdf)
