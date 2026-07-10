@@ -13,14 +13,3 @@
 ## 文件
 
 - [今日報告 7/10](PPT%20report/報告7_10.pdf)
-
-## 時程概要
-
-| Week | Date | Work |
-|------|------|------|
-| W1 | 7/13 ~ 7/17 | Environment、Related Work |
-| W2 | 7/20 ~ 7/24 | Calibration |
-| W3 | 7/27 ~ 7/31 | Detection、Tracking |
-| W4 | 8/3 ~ 8/7 | Mapping |
-| W5 | 8/10 ~ 8/14 | Mapping、Analytics |
-| W6 | 8/17 ~ 8/21 | Verification |
