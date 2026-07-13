@@ -41,6 +41,24 @@ $env:RTSP_URL = "rtsp://帳號:密碼@攝影機IP:554/stream1"
 python test_rtsp.py
 ```
 
+## Calibration（測試中 / WIP）
+
+> 狀態：**手動點選校正仍在測試**，流程與介面可能再調整。
+
+用地板對應點計算 Homography（地磚參考 45 cm）。影像點需落在地板平面；原點若被遮擋可不點，改用相對座標即可。
+
+```powershell
+python calibrate_homography.py
+python calibrate_homography.py "test/static_frame.jpg"
+```
+
+操作：
+- 左鍵點地板點（建議 6～8 點）
+- `u` 撤銷、`r` 重設、`c` 結束點選並輸入世界座標（cm）
+- 預覽俯視圖後按 `s` 存成 `calibration/homography.json`，`q` 離開
+
+測試影像：`test/static_frame.jpg`
+
 ## 文件
 
 - [今日報告 7/10](PPT%20report/報告7_10.pdf)
