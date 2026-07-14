@@ -1,0 +1,105 @@
+{
+  "created_at": "2026-07-14T04:51:48.978496+00:00",
+  "image_path": "C:\\5Gjump\\test\\static_frame.jpg",
+  "image_size_wh": [
+    2880,
+    1620
+  ],
+  "tile_cm": 45.0,
+  "units": "cm",
+  "roi": {
+    "origin": "top_left_virtual",
+    "x_min_cm": 170.0,
+    "y_min_cm": 0.0,
+    "x_max_cm": 530.0,
+    "y_max_cm": 540.0,
+    "width_cm": 360.0,
+    "height_cm": 540.0,
+    "note": "Valid floor ROI starts at X=170cm because left side is occluded by desks. Coordinates still use virtual TL=(0,0)."
+  },
+  "image_points_xy": [
+    [
+      1158.75,
+      852.75
+    ],
+    [
+      2643.75,
+      1298.25
+    ],
+    [
+      1107.0,
+      1325.25
+    ],
+    [
+      1332.0,
+      1215.0
+    ],
+    [
+      1131.75,
+      1143.0
+    ],
+    [
+      1318.5,
+      1064.25
+    ],
+    [
+      1300.5,
+      848.25
+    ]
+  ],
+  "world_points_xy": [
+    [
+      170.0,
+      0.0
+    ],
+    [
+      440.0,
+      405.0
+    ],
+    [
+      170.0,
+      360.0
+    ],
+    [
+      215.0,
+      315.0
+    ],
+    [
+      170.0,
+      270.0
+    ],
+    [
+      215.0,
+      225.0
+    ],
+    [
+      215.0,
+      0.0
+    ]
+  ],
+  "homography": [
+    [
+      -0.5583690388522308,
+      -0.6141395779697083,
+      875.7472444577244
+    ],
+    [
+      -0.11949989399907635,
+      -2.4875602168120166,
+      2262.615695473397
+    ],
+    [
+      -9.026901360643142e-06,
+      -0.003195379762416252,
+      1.0
+    ]
+  ],
+  "mean_reproj_error_cm": 1.984488713363108,
+  "note": "Virtual TL=(0,0). Removed high-error points 2,3,5,6 from previous run.",
+  "dropped_point_indices_1based": [
+    2,
+    3,
+    5,
+    6
+  ]
+}

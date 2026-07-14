@@ -6,5 +6,6 @@ venv/
 *.pt
 *.onnx
 *.mp4
+!test/test.mp4
 .DS_Store
 Thumbs.db

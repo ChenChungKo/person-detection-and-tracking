@@ -21,43 +21,69 @@ pip install -r requirements.txt
 
 在 VS Code 選擇解譯器：`Python: Select Interpreter` → `.venv`
 
-## OpenCV RTSP 即時測試
+首次執行偵測時會自動下載 `yolov8n.pt`。
 
-確認攝影機 RTSP 可在 VLC 播放後，於已啟動 `.venv` 的終端機執行：
+## OpenCV RTSP 即時測試
 
 ```powershell
 python test_rtsp.py "rtsp://帳號:密碼@攝影機IP:554/stream1"
 ```
 
-- 會開啟預覽視窗（預設縮放寬度 ≤ 1280，仍讀取完整 2880×1620）
+- 預覽預設寬度 ≤ 1280（仍讀取完整 2880×1620）
 - 按 `q` 結束
-- 可選參數：`--max-width 1600` 調整預覽大小
-- 無視窗只測取流：`python test_rtsp.py "rtsp://..." --no-preview --frames 60`
-
-也可先設定環境變數，避免把帳密寫進指令歷史：
+- 無視窗：`python test_rtsp.py "rtsp://..." --no-preview --frames 60`
 
 ```powershell
 $env:RTSP_URL = "rtsp://帳號:密碼@攝影機IP:554/stream1"
 python test_rtsp.py
 ```
 
-## Calibration（測試中 / WIP）
+## Calibration
 
-> 狀態：**手動點選校正仍在測試**，流程與介面可能再調整。
+目前定案校正檔：`calibration/homography.json`  
+- 虛擬左上角為 `(0,0)`（點不到也沒關係）  
+- 有效地板區約 `X 170~530 cm`、`Y 0~540 cm`（左側桌區遮擋）  
+- 地磚：左側第一格 35 cm，其餘 45 cm  
 
-用地板對應點計算 Homography（地磚參考 45 cm）。影像點需落在地板平面；原點若被遮擋可不點，改用相對座標即可。
+重跑／驗證：
 
 ```powershell
-python calibrate_homography.py
-python calibrate_homography.py "test/static_frame.jpg"
+python calibrate_boundary.py --width 530 --height 540
+python verify_homography.py
 ```
 
-操作：
-- 左鍵點地板點（建議 6～8 點）
-- `u` 撤銷、`r` 重設、`c` 結束點選並輸入世界座標（cm）
-- 預覽俯視圖後按 `s` 存成 `calibration/homography.json`，`q` 離開
+## 平面格子佔用
 
-測試影像：`test/static_frame.jpg`
+格子刻度見 `test/floor_grid_generated.jpg`（參考手繪：`test/floor_grid.png`）。
+
+```powershell
+python grid_occupancy.py
+python grid_occupancy.py --x 215 --y 360
+```
+
+監視器點選地板 → 對應格子點亮。
+
+## YOLO 人框測試
+
+```powershell
+python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --no-map
+python detect_person.py --source test/test.mp4 --no-map
+```
+
+## 偵測 + 定位（腳點 → 格子）
+
+以 bbox 底邊中點為腳點；桌旁被擋時可用 `--ref auto` / `--ref head_drop`。
+
+```powershell
+python detect_grid.py --source test/test.mp4 --ref auto
+python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto
+python detect_grid.py --source test/test.mp4 --ref foot
+```
+
+- 紅點：腳點；紫點：從頭往下估算；藍點：頭  
+- 按 `q` 結束，`s` 存圖  
+
+測試影片：`test/test.mp4`
 
 ## 文件
 
