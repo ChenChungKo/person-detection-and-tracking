@@ -98,15 +98,9 @@ python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --
 
 ## Demo 影片（上：偵測，下：格子）
 
-由 `test/test.mp4` 匯出的合成結果（寬 800px，上監視器畫面、下平面格子）：
+由 `test/test.mp4` 匯出的合成結果（上監視器畫面、下平面格子）：
 
-https://github.com/ChenChungKo/person-detection-and-tracking/blob/main/test/demo_detect_grid.mp4
-
-重新產生：
-
-```powershell
-python export_demo_video.py --source test/test.mp4 --out test/demo_detect_grid.mp4 --ref auto
-```
+https://github.com/ChenChungKo/person-detection-and-tracking/raw/main/test/demo_detect_grid.mp4
 
 ## 狀態備註（2026-07-15）
 
