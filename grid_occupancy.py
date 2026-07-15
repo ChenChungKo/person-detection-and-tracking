@@ -17,10 +17,47 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "test" / "static_frame.jpg"
 DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "grid_lit_preview.jpg"
+
+# Windows TTF for crisp labels (OpenCV putText is blurry on many displays)
+_FONT_REGULAR: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None
+_FONT_BOLD: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None
+
+
+def _load_fonts() -> tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, ImageFont.FreeTypeFont | ImageFont.ImageFont]:
+    global _FONT_REGULAR, _FONT_BOLD
+    if _FONT_REGULAR is not None and _FONT_BOLD is not None:
+        return _FONT_REGULAR, _FONT_BOLD
+    # Prefer CJK fonts first so Traditional Chinese titles render (not □□□)
+    candidates = [
+        Path(r"C:\Windows\Fonts\msyh.ttc"),      # Microsoft YaHei
+        Path(r"C:\Windows\Fonts\msyhbd.ttc"),
+        Path(r"C:\Windows\Fonts\mingliu.ttc"),
+        Path(r"C:\Windows\Fonts\mingliub.ttc"),
+        Path(r"C:\Windows\Fonts\kaiu.ttf"),
+        Path(r"C:\Windows\Fonts\segoeui.ttf"),
+        Path(r"C:\Windows\Fonts\arial.ttf"),
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                _FONT_REGULAR = ImageFont.truetype(str(path), 18)
+                _FONT_BOLD = ImageFont.truetype(str(path), 22)
+                return _FONT_REGULAR, _FONT_BOLD
+            except OSError:
+                continue
+    _FONT_REGULAR = ImageFont.load_default()
+    _FONT_BOLD = _FONT_REGULAR
+    return _FONT_REGULAR, _FONT_BOLD
+
+
+def _pil_to_bgr(pil_img: Image.Image) -> np.ndarray:
+    rgb = np.asarray(pil_img.convert("RGB"))
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
 def x_edges() -> list[float]:
@@ -95,15 +132,24 @@ def cell_label(col: int, row: int) -> str:
 def draw_grid(
     active: tuple[int, int] | None,
     valid_x_min: float = 170.0,
-    cell_px: int = 48,
+    cell_px: int = 72,
 ) -> np.ndarray:
+    """Draw grid with Pillow (sharp text/lines on Windows)."""
+    font, font_title = _load_fonts()
     n_cols = len(X_EDGES) - 1
     n_rows = len(Y_EDGES) - 1
-    margin_l, margin_t = 78, 40
-    margin_r, margin_b = 24, 55
+    margin_l, margin_t = 96, 52
+    margin_r, margin_b = 28, 64
     w = margin_l + n_cols * cell_px + margin_r
     h = margin_t + n_rows * cell_px + margin_b
-    canvas = np.full((h, w, 3), 245, dtype=np.uint8)
+
+    img = Image.new("RGB", (w, h), (245, 245, 245))
+    draw = ImageDraw.Draw(img)
+
+    purple = (140, 60, 160)
+    desk = (210, 210, 210)  # X < valid_xmin low-confidence / desk zone
+    lit = (255, 220, 0)  # occupied cell
+    white = (255, 255, 255)
 
     for j in range(n_rows):
         for i in range(n_cols):
@@ -111,64 +157,60 @@ def draw_grid(
             y0 = margin_t + j * cell_px
             x1 = x0 + cell_px
             y1 = y0 + cell_px
-            # dim invalid left columns (X < valid_x_min)
             if X_EDGES[i + 1] <= valid_x_min:
-                color = (210, 210, 210)
+                fill = desk
             elif active is not None and active == (i, j):
-                color = (0, 220, 255)  # lit cell (BGR yellow-ish)
+                fill = lit
             else:
-                color = (255, 255, 255)
-            cv2.rectangle(canvas, (x0, y0), (x1, y1), color, -1)
-            cv2.rectangle(canvas, (x0, y0), (x1, y1), (180, 80, 180), 1)
+                fill = white
+            draw.rectangle((x0, y0, x1 - 1, y1 - 1), fill=fill, outline=purple, width=2)
 
-    # axis labels (all ticks)
     for i, xv in enumerate(X_EDGES):
         px = margin_l + i * cell_px
-        cv2.putText(
-            canvas,
-            f"{xv:g}",
-            (px - 12, h - 18),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.32,
-            (40, 40, 40),
-            1,
-            cv2.LINE_AA,
-        )
+        draw.text((px - 14, h - margin_b + 8), f"{xv:g}", fill=(40, 40, 40), font=font)
     for j, yv in enumerate(Y_EDGES):
         py = margin_t + j * cell_px
-        cv2.putText(
-            canvas,
-            f"{yv:g}",
-            (6, py + 4),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.32,
-            (40, 40, 40),
-            1,
-            cv2.LINE_AA,
-        )
+        draw.text((8, py - 10), f"{yv:g}", fill=(40, 40, 40), font=font)
 
-    cv2.putText(
-        canvas,
-        "Floor grid (lit = occupied cell)",
-        (margin_l, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (20, 20, 20),
-        2,
-        cv2.LINE_AA,
+    draw.text(
+        (margin_l, 8),
+        "地板格子（黃＝佔用）",
+        fill=(20, 20, 20),
+        font=font_title,
+    )
+    draw.text(
+        (margin_l, 30),
+        f"淺灰＝桌區／低可信（X < {valid_x_min:g} cm）",
+        fill=(90, 90, 90),
+        font=font,
     )
     if active is not None:
-        cv2.putText(
-            canvas,
+        draw.text(
+            (margin_l, h - 28),
             cell_label(*active),
-            (margin_l, h - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 100, 200),
-            1,
-            cv2.LINE_AA,
+            fill=(200, 100, 0),
+            font=font,
         )
-    return canvas
+    return _pil_to_bgr(img)
+
+
+def show_grid_window(win: str, grid_bgr: np.ndarray) -> None:
+    """Show grid at 1:1 pixel size to avoid OpenCV upscale blur."""
+    show_fixed_window(win, grid_bgr)
+
+
+def show_fixed_window(win: str, image_bgr: np.ndarray) -> None:
+    """Show image with window size locked to the image pixel size."""
+    h, w = image_bgr.shape[:2]
+    if not hasattr(show_fixed_window, "_ready"):
+        show_fixed_window._ready = set()  # type: ignore[attr-defined]
+    ready: set[str] = show_fixed_window._ready  # type: ignore[attr-defined]
+    if win not in ready:
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        ready.add(win)
+    # Keep size fixed every frame (matches preview pixels; ignores manual drag)
+    cv2.resizeWindow(win, w, h)
+    cv2.imshow(win, image_bgr)
 
 
 def resize_for_preview(frame: np.ndarray, max_width: int) -> tuple[np.ndarray, float]:
@@ -202,8 +244,8 @@ def main() -> None:
         imwrite_unicode(Path(args.out), grid)
         print(f"已輸出：{args.out}")
         cv2.namedWindow("Grid", cv2.WINDOW_NORMAL)
+        show_grid_window("Grid", grid)
         while True:
-            cv2.imshow("Grid", grid)
             if cv2.waitKey(20) & 0xFF in (ord("q"), 27):
                 break
         cv2.destroyAllWindows()
@@ -221,7 +263,6 @@ def main() -> None:
     cam_win = "Camera (click floor)"
     grid_win = "Grid occupancy"
     cv2.namedWindow(cam_win, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(grid_win, cv2.WINDOW_NORMAL)
 
     def on_mouse(event, x, y, flags, param) -> None:  # noqa: ARG001
         nonlocal active, last_world
@@ -258,7 +299,7 @@ def main() -> None:
             )
         grid = draw_grid(active, valid_x_min=args.valid_xmin)
         cv2.imshow(cam_win, cam)
-        cv2.imshow(grid_win, grid)
+        show_grid_window(grid_win, grid)
         key = cv2.waitKey(20) & 0xFF
         if key in (ord("q"), 27):
             break
