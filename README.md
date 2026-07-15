@@ -96,6 +96,18 @@ python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --
 
 測試影片：`test/test.mp4`
 
+## Demo 影片（上：偵測，下：格子）
+
+由 `test/test.mp4` 匯出的合成結果（寬 800px，上監視器畫面、下平面格子）：
+
+https://github.com/ChenChungKo/person-detection-and-tracking/blob/main/test/demo_detect_grid.mp4
+
+重新產生：
+
+```powershell
+python export_demo_video.py --source test/test.mp4 --out test/demo_detect_grid.mp4 --ref auto
+```
+
 ## 狀態備註（2026-07-15）
 
 - 已完成：YOLO26 偵測、影片腳點／格子定位、格子 UI、RTSP 取流與延遲改善  
