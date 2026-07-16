@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         help="horizontal: cam left + grid right; vertical: cam top + grid bottom",
     )
     p.add_argument("--width", type=int, default=800, help="output width for vertical layout (px)")
-    p.add_argument("--height", type=int, default=540, help="panel height for horizontal layout (px)")
+    p.add_argument("--height", type=int, default=720, help="panel height for horizontal layout (px)")
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument("--no-timing", action="store_true")
     return p.parse_args()
@@ -148,9 +148,12 @@ def main() -> None:
             locate_ms = (time.perf_counter() - tl0) * 1000.0
 
             vis, cells, _logs = annotate_and_cells(frame, dets, h_mat, args.valid_xmin)
-            # Keep cam panel readable; detection already used full-res frame
-            cam = resize_for_preview(vis, max(args.width, 960))
             grid = draw_multi_grid(cells, args.valid_xmin)
+            # Horizontal: keep full-res cam so the README embed fills the column width
+            if args.layout == "horizontal":
+                cam = vis
+            else:
+                cam = resize_for_preview(vis, max(args.width, 960))
 
             if not args.no_timing and dets:
                 from detect_grid import put_label

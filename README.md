@@ -100,7 +100,9 @@ python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --
 
 由 `test/test.mp4` 匯出的合成結果（左監視器畫面、右平面格子）：
 
-![Demo：左偵測、右格子](test/demo_detect_grid.webp)
+<p align="center">
+  <img src="test/demo_detect_grid.webp" width="100%" alt="Demo：左偵測、右格子"/>
+</p>
 
 ## 狀態備註（2026-07-15）
 
