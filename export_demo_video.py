@@ -1,8 +1,13 @@
-"""Export vertical demo: camera (top) + floor grid (bottom).
+"""Export demo video: camera + floor grid side-by-side or stacked.
 
 Usage:
   python export_demo_video.py
-  python export_demo_video.py --source test/test.mp4 --out test/demo_detect_grid.mp4
+  python export_demo_video.py --layout horizontal --height 540
+  python export_demo_video.py --layout vertical --width 800
+
+README 建議用 WebP（比 GIF 小、畫質好）；可用 ffmpeg 從 mp4 轉：
+  ffmpeg -i test/demo_detect_grid.mp4 -vf "fps=12,scale=720:-1" -loop 0 test/demo_detect_grid.webp
+  ffmpeg -i test/demo_detect_grid.mp4 -vf "fps=10,scale=640:-1" test/demo_detect_grid.gif
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "demo_detect_grid.mp4"
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Export cam+grid stacked demo video")
+    p = argparse.ArgumentParser(description="Export cam+grid demo video")
     p.add_argument("--source", default=str(DEFAULT_SOURCE))
     p.add_argument("--calib", default=str(DEFAULT_CALIB))
     p.add_argument("--model", default="yolo26s.pt")
@@ -43,7 +48,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-aspect", type=float, default=1.15)
     p.add_argument("--min-bottom-ratio", type=float, default=0.28)
     p.add_argument("--valid-xmin", type=float, default=170.0)
-    p.add_argument("--width", type=int, default=800, help="output stack width (px)")
+    p.add_argument(
+        "--layout",
+        choices=["horizontal", "vertical"],
+        default="horizontal",
+        help="horizontal: cam left + grid right; vertical: cam top + grid bottom",
+    )
+    p.add_argument("--width", type=int, default=800, help="output width for vertical layout (px)")
+    p.add_argument("--height", type=int, default=540, help="panel height for horizontal layout (px)")
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument("--no-timing", action="store_true")
     return p.parse_args()
@@ -57,12 +69,26 @@ def fit_width(img: np.ndarray, width: int) -> np.ndarray:
     return cv2.resize(img, (width, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
 
 
+def fit_height(img: np.ndarray, height: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    if h == height:
+        return img
+    scale = height / float(h)
+    return cv2.resize(img, (max(1, int(round(w * scale))), height), interpolation=cv2.INTER_AREA)
+
+
 def stack_vertical(cam: np.ndarray, grid: np.ndarray, width: int) -> np.ndarray:
     top = fit_width(cam, width)
     bottom = fit_width(grid, width)
-    # 2px separator
     sep = np.full((2, width, 3), (40, 40, 40), dtype=np.uint8)
     return np.vstack([top, sep, bottom])
+
+
+def stack_horizontal(cam: np.ndarray, grid: np.ndarray, height: int) -> np.ndarray:
+    left = fit_height(cam, height)
+    right = fit_height(grid, height)
+    sep = np.full((height, 2, 3), (40, 40, 40), dtype=np.uint8)
+    return np.hstack([left, sep, right])
 
 
 def main() -> None:
@@ -86,12 +112,10 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     writer: cv2.VideoWriter | None = None
-    ema_detect = 0.0
-    ema_locate = 0.0
-    timing_n = 0
     n = 0
     t0 = time.perf_counter()
-    print(f"匯出中：{source.name} → {out_path}（約 {total} 幀，width={args.width}）")
+    layout_desc = f"height={args.height}" if args.layout == "horizontal" else f"width={args.width}"
+    print(f"匯出中：{source.name} → {out_path}（約 {total} 幀，{args.layout}，{layout_desc}）")
 
     try:
         while True:
@@ -129,16 +153,9 @@ def main() -> None:
             grid = draw_multi_grid(cells, args.valid_xmin)
 
             if not args.no_timing and dets:
-                alpha = 0.15 if timing_n else 1.0
-                ema_detect = (1 - alpha) * ema_detect + alpha * detect_ms
-                ema_locate = (1 - alpha) * ema_locate + alpha * locate_ms
-                timing_n += 1
                 from detect_grid import put_label
 
-                timing_txt = (
-                    f"detect {detect_ms:.0f}ms  locate {locate_ms:.2f}ms"
-                    f"  | avg {ema_detect:.0f}/{ema_locate:.2f}ms"
-                )
+                timing_txt = f"detect {detect_ms:.0f}ms  locate {locate_ms:.2f}ms"
                 (tw, _th), _ = cv2.getTextSize(
                     timing_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2
                 )
@@ -153,7 +170,10 @@ def main() -> None:
                     thickness=2,
                 )
 
-            stacked = stack_vertical(cam, grid, args.width)
+            if args.layout == "horizontal":
+                stacked = stack_horizontal(cam, grid, args.height)
+            else:
+                stacked = stack_vertical(cam, grid, args.width)
             if writer is None:
                 h, w = stacked.shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")

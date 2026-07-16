@@ -96,11 +96,20 @@ python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --
 
 測試影片：`test/test.mp4`
 
-## Demo 影片（上：偵測，下：格子）
+## Demo 影片（左：偵測，右：格子）
 
-由 `test/test.mp4` 匯出的合成結果（上監視器畫面、下平面格子）：
+由 `test/test.mp4` 匯出的合成結果（左監視器畫面、右平面格子）：
 
-![Demo：上偵測、下格子](test/demo_detect_grid.webp)
+![Demo：左偵測、右格子](test/demo_detect_grid.webp)
+
+匯出與 README 用動圖（GitHub 建議 **WebP**，比 GIF 小且較清晰；GIF 相容性最好但檔案常更大）：
+
+```powershell
+python export_demo_video.py --source test/test.mp4 --layout horizontal --height 540 --out test/demo_detect_grid.mp4
+ffmpeg -y -i test/demo_detect_grid.mp4 -vf "fps=12,scale=720:-1" -loop 0 test/demo_detect_grid.webp
+# 若需要 GIF：
+# ffmpeg -y -i test/demo_detect_grid.mp4 -vf "fps=10,scale=640:-1,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" test/demo_detect_grid.gif
+```
 
 ## 狀態備註（2026-07-15）
 

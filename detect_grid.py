@@ -366,13 +366,7 @@ def main() -> None:
     if not args.no_timing:
         print("計時：僅在偵測到人時顯示於格子上方（detect=辨識，locate=定位）。")
 
-    ema_detect = 0.0
-    ema_locate = 0.0
-    timing_n = 0
-
     def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        nonlocal ema_detect, ema_locate, timing_n
-
         t0 = time.perf_counter()
         results = model.predict(frame, conf=args.conf, classes=[0], verbose=False)
         detect_ms = (time.perf_counter() - t0) * 1000.0
@@ -405,14 +399,7 @@ def main() -> None:
 
         # Only show timing when at least one person was detected this frame
         if not args.no_timing and dets:
-            alpha = 0.15 if timing_n else 1.0
-            ema_detect = (1 - alpha) * ema_detect + alpha * detect_ms
-            ema_locate = (1 - alpha) * ema_locate + alpha * locate_ms
-            timing_n += 1
-            timing_txt = (
-                f"detect {detect_ms:.0f}ms  locate {locate_ms:.2f}ms"
-                f"  | avg {ema_detect:.0f}/{ema_locate:.2f}ms"
-            )
+            timing_txt = f"detect {detect_ms:.0f}ms  locate {locate_ms:.2f}ms"
             # Top-right so it does not overlap the grid title on the left
             (tw, _th), _ = cv2.getTextSize(
                 timing_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2
