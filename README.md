@@ -32,12 +32,14 @@ python test_rtsp.py "rtsp://帳號:密碼@攝影機IP:554/stream1"
 - 預覽預設寬度 ≤ 1280（仍讀取完整 2880×1620）
 - 按 `q` 結束
 - 無視窗：`python test_rtsp.py "rtsp://..." --no-preview --frames 60`
+- 腳本會將 RTSP 設為 **TCP** 傳輸（較穩）
 
 ```powershell
 $env:RTSP_URL = "rtsp://帳號:密碼@攝影機IP:554/stream1"
 python test_rtsp.py
 ```
 
+完整偵測流程的降延遲說明見下方「RTSP 降延遲」。
 ## Calibration
 
 目前定案校正檔：`calibration/homography.json`  
@@ -84,17 +86,37 @@ python detect_grid.py --source test/test.mp4 --ref auto
 python detect_grid.py --source test/test.mp4 --ref foot
 ```
 
-RTSP 即時已可連線並降延遲（最新幀），但**即時格子定位準度仍待修正**（影片可用）：
+RTSP 即時範例（建議搭配跳幀與防抖）：
 
 ```powershell
-python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto
+python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto --stride 3 --cell-hold 2
 ```
 
 - 畫面：人框 + 腳點；超出範圍才標 `OUT`
 - 格子視窗：右上角固定顯示上次 `detect`／`locate` 耗時（沒偵測到人也會保留上一次數值，不會消失／閃爍）
 - 按 `q` 結束，`s` 存圖  
+- **即時格子定位準度仍待修正**（本機影片較穩）
 
 測試影片：`test/test.mp4`
+
+### RTSP 降延遲（自動啟用）
+
+來源為 `rtsp://` 時，`detect_grid.py` / `detect_person.py` 會自動做兩件事（實作見 `latest_frame.py`）：
+
+1. **只處理最新幀（`LatestFrameCapture`）**  
+   YOLO 推論較慢時，OpenCV/FFmpeg 會把攝影機新幀堆在緩衝區；若依序 `cap.read()`，畫面會落後數秒。背景執行緒持續讀流並**只保留最新一幀**（舊幀直接覆蓋丟棄），主執行緒每次推論都拿「當下最新畫面」，優先保證即時性（中間幀會被捨棄）。
+
+2. **RTSP 走 TCP**  
+   開串流前設定 `OPENCV_FFMPEG_CAPTURE_OPTIONS=rtsp_transport;tcp`，比 UDP 穩、較少因封包遺失造成卡頓或重連。
+
+這與下方 `--stride` 不同：
+
+| 機制 | 目的 | 作用 |
+|------|------|------|
+| `LatestFrameCapture` | 降低「畫面落後感」 | 丟緩衝區舊幀，永遠處理最新畫面 |
+| `--stride` | 降低運算量 | 不必每幀都跑 YOLO |
+
+本機 `.mp4` 不會啟用最新幀讀取（逐幀播放比較合理）。
 
 ### 跳幀（`--stride`）
 
@@ -129,7 +151,7 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 
 ## 狀態備註（2026-07-22）
 
-- 已完成：YOLO26 偵測、影片腳點／格子定位、格子 UI、RTSP 取流與延遲改善、跳幀（`--stride`）、格子防抖（`--cell-hold`，抑制站立不動時的格子閃爍）  
+- 已完成：YOLO26 偵測、影片腳點／格子定位、格子 UI、RTSP 取流與降延遲（`LatestFrameCapture` 最新幀 + TCP）、跳幀（`--stride`）、格子防抖（`--cell-hold`）  
 - 未完成／暫緩：多人 ID 追蹤、外貌 Re-ID、即時 RTSP 定位準度調校  
 
 ## 文件
