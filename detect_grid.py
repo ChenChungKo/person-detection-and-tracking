@@ -5,6 +5,7 @@ Ground reference:
 
 Usage:
   python detect_grid.py --source test/test.mp4 --ref auto
+  python detect_grid.py --source test/test.mp4 --stride 3
   python detect_grid.py --source "rtsp://user:pass@ip:554/stream1" --ref auto
 """
 
@@ -298,6 +299,116 @@ def draw_multi_grid(cells: set[tuple[int, int]], valid_xmin: float) -> np.ndarra
     return base
 
 
+class CellStabilizer:
+    """Debounce grid-cell occupancy against per-detection jitter.
+
+    A cell only lights up after appearing in ``hold`` consecutive detection
+    RUNS (not rendered/cached frames), and only turns off after being absent
+    for ``hold`` consecutive runs. This keeps small bbox jitter (e.g. a
+    slight body twist) from flickering between adjacent cells.
+    """
+
+    def __init__(self, hold: int = 2) -> None:
+        self.hold = max(1, hold)
+        self._on_streak: dict[tuple[int, int], int] = {}
+        self._off_streak: dict[tuple[int, int], int] = {}
+        self._confirmed: set[tuple[int, int]] = set()
+
+    def update(self, raw_cells: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        tracked = set(self._on_streak) | set(self._off_streak) | raw_cells | self._confirmed
+        for cell in tracked:
+            if cell in raw_cells:
+                self._on_streak[cell] = self._on_streak.get(cell, 0) + 1
+                self._off_streak[cell] = 0
+                if self._on_streak[cell] >= self.hold:
+                    self._confirmed.add(cell)
+            else:
+                self._off_streak[cell] = self._off_streak.get(cell, 0) + 1
+                self._on_streak[cell] = 0
+                if self._off_streak[cell] >= self.hold:
+                    self._confirmed.discard(cell)
+        # Drop fully-idle cells so the dicts do not grow without bound.
+        for cell in list(self._on_streak):
+            if self._on_streak[cell] == 0 and cell not in self._confirmed:
+                self._on_streak.pop(cell, None)
+                self._off_streak.pop(cell, None)
+        return set(self._confirmed)
+
+
+def detect_and_locate(
+    frame: np.ndarray,
+    model: YOLO,
+    h_mat: np.ndarray,
+    conf: float,
+    ref: str,
+    aspect: float,
+    truncate_ratio: float,
+    min_h_ratio: float,
+    min_aspect: float,
+    min_bottom_ratio: float,
+) -> tuple[list[dict], float, float]:
+    t0 = time.perf_counter()
+    results = model.predict(frame, conf=conf, classes=[0], verbose=False)
+    detect_ms = (time.perf_counter() - t0) * 1000.0
+
+    t1 = time.perf_counter()
+    dets = extract_foot_detections(
+        results[0],
+        conf,
+        frame.shape[0],
+        frame.shape[1],
+        mode=ref,
+        aspect=aspect,
+        truncate_ratio=truncate_ratio,
+        min_h_ratio=min_h_ratio,
+        min_aspect=min_aspect,
+        min_bottom_ratio=min_bottom_ratio,
+    )
+    for det in dets:
+        fx, fy = det["foot"]
+        wx, wy = image_to_world(h_mat, fx, fy)
+        det["world"] = (wx, wy)
+        det["cell"] = world_to_cell(wx, wy)
+    locate_ms = (time.perf_counter() - t1) * 1000.0
+    return dets, detect_ms, locate_ms
+
+
+def render_detection_view(
+    frame: np.ndarray,
+    dets: list[dict],
+    h_mat: np.ndarray,
+    valid_xmin: float,
+    timing: tuple[float, float] | None = None,
+    cached: bool = False,
+    grid_cells: set[tuple[int, int]] | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    vis, cells, logs = annotate_and_cells(frame, dets, h_mat, valid_xmin)
+    display_cells = grid_cells if grid_cells is not None else cells
+    grid = draw_multi_grid(display_cells, valid_xmin)
+
+    if timing is not None:
+        detect_ms, locate_ms = timing
+        suffix = "  cached" if cached else ""
+        timing_txt = f"detect {detect_ms:5.0f}ms  locate {locate_ms:5.2f}ms{suffix}"
+        # Fixed-size background box (sized for the widest possible text,
+        # including "cached") so position/size never jitters between frames
+        # regardless of digit width or whether the cached suffix is shown.
+        box_x, box_y, box_w, box_h = grid.shape[1] - 380, 8, 372, 34
+        cv2.rectangle(grid, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
+        cv2.putText(
+            grid,
+            timing_txt,
+            (box_x + 8, box_y + box_h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    return vis, grid, logs
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="YOLO ground-ref point -> light floor grid")
     p.add_argument("--source", default=str(DEFAULT_IMAGE))
@@ -338,6 +449,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="hide detect/locate timing on the Grid window",
     )
+    p.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="run YOLO every N frames; skipped frames reuse last detections (default 1=every frame)",
+    )
+    p.add_argument(
+        "--cell-hold",
+        type=int,
+        default=2,
+        help="a cell only lights/clears after N consecutive DETECTION RUNS agree "
+        "(counted in stride units, not raw frames); 1 disables debounce",
+    )
     return p.parse_args()
 
 
@@ -358,63 +482,39 @@ def main() -> None:
         ".webp",
     }
 
+    if args.stride < 1:
+        raise SystemExit("--stride 必須 >= 1")
+
     cam_win = "Detect + Grid"
     grid_win = "Grid"
     print(f"偵測：YOLO（{args.model}），conf={args.conf}（每幀獨立，無 ID／追蹤）")
     print(f"參考點模式：{args.ref}（紅=foot，紫=head_drop）。按 q 結束，s 存圖。")
     print(f"預覽寬度固定 max-width={args.max_width}（影片與格子視窗皆鎖定畫面像素大小）")
+    if args.stride > 1:
+        print(f"跳幀：每 {args.stride} 幀才跑 YOLO，中間幀沿用上次偵測結果。")
+    if args.cell_hold > 1:
+        print(f"防抖：格子需連續 {args.cell_hold} 次偵測結果一致才會點亮／熄滅。")
     if not args.no_timing:
         print("計時：僅在偵測到人時顯示於格子上方（detect=辨識，locate=定位）。")
 
+    det_kw = dict(
+        conf=args.conf,
+        ref=args.ref,
+        aspect=args.aspect,
+        truncate_ratio=args.truncate_ratio,
+        min_h_ratio=args.min_h_ratio,
+        min_aspect=args.min_aspect,
+        min_bottom_ratio=args.min_bottom_ratio,
+    )
+
     def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        t0 = time.perf_counter()
-        results = model.predict(frame, conf=args.conf, classes=[0], verbose=False)
-        detect_ms = (time.perf_counter() - t0) * 1000.0
-
-        t1 = time.perf_counter()
-        dets = extract_foot_detections(
-            results[0],
-            args.conf,
-            frame.shape[0],
-            frame.shape[1],
-            mode=args.ref,
-            aspect=args.aspect,
-            truncate_ratio=args.truncate_ratio,
-            min_h_ratio=args.min_h_ratio,
-            min_aspect=args.min_aspect,
-            min_bottom_ratio=args.min_bottom_ratio,
+        dets, detect_ms, locate_ms = detect_and_locate(frame, model, h_mat, **det_kw)
+        timing = None if args.no_timing else (detect_ms, locate_ms)
+        vis, grid, logs = render_detection_view(
+            frame, dets, h_mat, args.valid_xmin, timing=timing, cached=False
         )
-        for det in dets:
-            fx, fy = det["foot"]
-            wx, wy = image_to_world(h_mat, fx, fy)
-            det["world"] = (wx, wy)
-            det["cell"] = world_to_cell(wx, wy)
-        locate_ms = (time.perf_counter() - t1) * 1000.0
-
-        vis, cells, logs = annotate_and_cells(frame, dets, h_mat, args.valid_xmin)
-        grid = draw_multi_grid(cells, args.valid_xmin)
-
         for line in logs:
             print(line)
-
-        # Only show timing when at least one person was detected this frame
-        if not args.no_timing and dets:
-            timing_txt = f"detect {detect_ms:.0f}ms  locate {locate_ms:.2f}ms"
-            # Top-right so it does not overlap the grid title on the left
-            (tw, _th), _ = cv2.getTextSize(
-                timing_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2
-            )
-            tx = max(10, grid.shape[1] - tw - 20)
-            put_label(
-                grid,
-                timing_txt,
-                (tx, 30),
-                fg=(0, 255, 255),
-                bg=(0, 0, 0),
-                scale=0.85,
-                thickness=2,
-            )
-
         return vis, grid
 
     if is_image:
@@ -454,7 +554,13 @@ def main() -> None:
             reader.release()
             raise SystemExit("RTSP 連線後未收到畫面。")
 
+    stabilizer = CellStabilizer(args.cell_hold)
+    confirmed_cells: set[tuple[int, int]] = set()
+
     try:
+        frame_idx = 0
+        last_dets: list[dict] = []
+        last_timing: tuple[float, float] | None = None
         while True:
             if reader is not None:
                 ok, frame = reader.read()
@@ -469,7 +575,29 @@ def main() -> None:
                 if not ok or frame is None:
                     print("讀取結束或失敗。")
                     break
-            vis, grid = process_frame(frame)
+
+            frame_idx += 1
+            run_detect = frame_idx == 1 or (frame_idx - 1) % args.stride == 0
+            if run_detect:
+                last_dets, detect_ms, locate_ms = detect_and_locate(
+                    frame, model, h_mat, **det_kw
+                )
+                last_timing = None if args.no_timing else (detect_ms, locate_ms)
+                raw_cells = {d["cell"] for d in last_dets if d.get("cell") is not None}
+                confirmed_cells = stabilizer.update(raw_cells)
+            timing = last_timing if not args.no_timing else None
+            vis, grid, logs = render_detection_view(
+                frame,
+                last_dets,
+                h_mat,
+                args.valid_xmin,
+                timing=timing,
+                cached=not run_detect,
+                grid_cells=confirmed_cells,
+            )
+            if run_detect:
+                for line in logs:
+                    print(line)
             view = resize_for_preview(vis, args.max_width)
             show_fixed_window(cam_win, view)
             show_grid_window(grid_win, grid)

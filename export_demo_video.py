@@ -21,14 +21,12 @@ import numpy as np
 from ultralytics import YOLO
 
 from detect_grid import (
-    annotate_and_cells,
-    draw_multi_grid,
-    extract_foot_detections,
-    image_to_world,
+    CellStabilizer,
+    detect_and_locate,
     load_homography,
+    render_detection_view,
     resize_for_preview,
 )
-from grid_occupancy import world_to_cell
 
 DEFAULT_SOURCE = Path(__file__).resolve().parent / "test" / "test.mp4"
 DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
@@ -58,6 +56,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, default=720, help="panel height for horizontal layout (px)")
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument("--no-timing", action="store_true")
+    p.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="run YOLO every N frames; skipped frames reuse last detections",
+    )
+    p.add_argument(
+        "--cell-hold",
+        type=int,
+        default=2,
+        help="a cell only lights/clears after N consecutive DETECTION RUNS agree "
+        "(counted in stride units, not raw frames); 1 disables debounce",
+    )
     return p.parse_args()
 
 
@@ -111,11 +122,32 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.stride < 1:
+        raise SystemExit("--stride 必須 >= 1")
+
+    det_kw = dict(
+        conf=args.conf,
+        ref=args.ref,
+        aspect=args.aspect,
+        truncate_ratio=args.truncate_ratio,
+        min_h_ratio=args.min_h_ratio,
+        min_aspect=args.min_aspect,
+        min_bottom_ratio=args.min_bottom_ratio,
+    )
+
+    stabilizer = CellStabilizer(args.cell_hold)
+    confirmed_cells: set[tuple[int, int]] = set()
+
     writer: cv2.VideoWriter | None = None
     n = 0
+    frame_idx = 0
+    last_dets: list[dict] = []
+    last_timing: tuple[float, float] | None = None
+    detect_runs = 0
     t0 = time.perf_counter()
     layout_desc = f"height={args.height}" if args.layout == "horizontal" else f"width={args.width}"
-    print(f"匯出中：{source.name} → {out_path}（約 {total} 幀，{args.layout}，{layout_desc}）")
+    stride_note = f"，stride={args.stride}" if args.stride > 1 else ""
+    print(f"匯出中：{source.name} → {out_path}（約 {total} 幀，{args.layout}，{layout_desc}{stride_note}）")
 
     try:
         while True:
@@ -123,55 +155,32 @@ def main() -> None:
             if not ok or frame is None:
                 break
 
-            td0 = time.perf_counter()
-            results = model.predict(frame, conf=args.conf, classes=[0], verbose=False)
-            detect_ms = (time.perf_counter() - td0) * 1000.0
+            frame_idx += 1
+            run_detect = frame_idx == 1 or (frame_idx - 1) % args.stride == 0
+            if run_detect:
+                last_dets, detect_ms, locate_ms = detect_and_locate(
+                    frame, model, h_mat, **det_kw
+                )
+                last_timing = None if args.no_timing else (detect_ms, locate_ms)
+                detect_runs += 1
+                raw_cells = {d["cell"] for d in last_dets if d.get("cell") is not None}
+                confirmed_cells = stabilizer.update(raw_cells)
 
-            tl0 = time.perf_counter()
-            dets = extract_foot_detections(
-                results[0],
-                args.conf,
-                frame.shape[0],
-                frame.shape[1],
-                mode=args.ref,
-                aspect=args.aspect,
-                truncate_ratio=args.truncate_ratio,
-                min_h_ratio=args.min_h_ratio,
-                min_aspect=args.min_aspect,
-                min_bottom_ratio=args.min_bottom_ratio,
+            timing = last_timing if not args.no_timing else None
+            vis, grid, _logs = render_detection_view(
+                frame,
+                last_dets,
+                h_mat,
+                args.valid_xmin,
+                timing=timing,
+                cached=not run_detect,
+                grid_cells=confirmed_cells,
             )
-            for det in dets:
-                fx, fy = det["foot"]
-                wx, wy = image_to_world(h_mat, fx, fy)
-                det["world"] = (wx, wy)
-                det["cell"] = world_to_cell(wx, wy)
-            locate_ms = (time.perf_counter() - tl0) * 1000.0
-
-            vis, cells, _logs = annotate_and_cells(frame, dets, h_mat, args.valid_xmin)
-            grid = draw_multi_grid(cells, args.valid_xmin)
             # Horizontal: keep full-res cam so the README embed fills the column width
             if args.layout == "horizontal":
                 cam = vis
             else:
                 cam = resize_for_preview(vis, max(args.width, 960))
-
-            if not args.no_timing and dets:
-                from detect_grid import put_label
-
-                timing_txt = f"detect {detect_ms:.0f}ms  locate {locate_ms:.2f}ms"
-                (tw, _th), _ = cv2.getTextSize(
-                    timing_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2
-                )
-                tx = max(10, grid.shape[1] - tw - 20)
-                put_label(
-                    grid,
-                    timing_txt,
-                    (tx, 30),
-                    fg=(0, 255, 255),
-                    bg=(0, 0, 0),
-                    scale=0.85,
-                    thickness=2,
-                )
 
             if args.layout == "horizontal":
                 stacked = stack_horizontal(cam, grid, args.height)
@@ -195,7 +204,10 @@ def main() -> None:
 
     elapsed = time.perf_counter() - t0
     size_mb = out_path.stat().st_size / (1024 * 1024) if out_path.exists() else 0
-    print(f"完成：{out_path}（{n} 幀，{size_mb:.1f} MB，耗時 {elapsed:.1f}s）")
+    print(
+        f"完成：{out_path}（{n} 幀，YOLO {detect_runs} 次，"
+        f"{size_mb:.1f} MB，耗時 {elapsed:.1f}s）"
+    )
 
 
 if __name__ == "__main__":

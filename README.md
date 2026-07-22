@@ -91,10 +91,33 @@ python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --
 ```
 
 - 畫面：人框 + 腳點；超出範圍才標 `OUT`
-- 格子視窗：有偵測到人時右上角顯示 `detect`／`locate` 耗時
+- 格子視窗：右上角固定顯示上次 `detect`／`locate` 耗時（沒偵測到人也會保留上一次數值，不會消失／閃爍）
 - 按 `q` 結束，`s` 存圖  
 
 測試影片：`test/test.mp4`
+
+### 跳幀（`--stride`）
+
+RTSP／影片不必每幀都跑 YOLO，可跳幀降低運算量，中間幀沿用上次偵測結果：
+
+```powershell
+python detect_grid.py --source test/test.mp4 --stride 3
+```
+
+- `--stride N`：每 N 幀才跑一次 YOLO（預設 1＝每幀都跑）
+- 格子視窗會標示 `cached`，代表這幀是沿用結果、不是新偵測
+
+### 格子防抖（`--cell-hold`）
+
+站著不動時，因 bbox 微小晃動（例如身體扭動）經 Homography 放大，偶爾會讓判定的格子跳到隔壁格造成閃爍。加上防抖：
+
+```powershell
+python detect_grid.py --source test/test.mp4 --cell-hold 2
+```
+
+- 格子需連續 N 次偵測結果一致才會點亮／熄滅（預設 2；設 1 等於關閉防抖）
+- 這裡的「N 次」以**偵測次數**計算（跟 `--stride` 搭配時，只算真正跑 YOLO 的那幀，不受跳幀影響其穩定邏輯）
+- `export_demo_video.py` 也支援同名的 `--stride` / `--cell-hold`
 
 ## Demo 影片（左：偵測，右：格子）
 
@@ -104,9 +127,9 @@ python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --
   <img src="test/demo_detect_grid.webp" width="100%" alt="Demo：左偵測、右格子"/>
 </p>
 
-## 狀態備註（2026-07-15）
+## 狀態備註（2026-07-22）
 
-- 已完成：YOLO26 偵測、影片腳點／格子定位、格子 UI、RTSP 取流與延遲改善  
+- 已完成：YOLO26 偵測、影片腳點／格子定位、格子 UI、RTSP 取流與延遲改善、跳幀（`--stride`）、格子防抖（`--cell-hold`，抑制站立不動時的格子閃爍）  
 - 未完成／暫緩：多人 ID 追蹤、外貌 Re-ID、即時 RTSP 定位準度調校  
 
 ## 文件
