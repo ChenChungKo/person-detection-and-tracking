@@ -49,7 +49,7 @@ python test_rtsp.py
 | **v1** | `calibration/homography_v1_manual.json` | 手動點選磁磚角（`calibrate_boundary.py`） | 平均重投影誤差約 2.0 cm |
 | **v2** | `calibration/homography_v2_chessboard.json` | 地板大棋盤格自動角點（`calibrate_chessboard_floor.py`） | 平均重投影誤差約 0.2 cm；軸向已對齊房間 X/Y |
 
-預設腳本仍讀 `calibration/homography.json`（目前內容＝**v1** 備份）。要比對 v2 時加上 `--calib`：
+預設腳本讀 `calibration/homography.json`（目前＝**v2**）。要比對 v1 時加上 `--calib`：
 
 ```powershell
 python detect_grid.py --source test/test.mp4 --calib calibration/homography_v1_manual.json
