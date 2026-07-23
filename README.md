@@ -42,7 +42,21 @@ python test_rtsp.py
 完整偵測流程的降延遲說明見下方「RTSP 降延遲」。
 ## Calibration
 
-目前定案校正檔：`calibration/homography.json`  
+地板 Homography 有兩個版本（都保留，互不覆蓋）：
+
+| 版本 | 檔案 | 作法 | 備註 |
+|------|------|------|------|
+| **v1** | `calibration/homography_v1_manual.json` | 手動點選磁磚角（`calibrate_boundary.py`） | 平均重投影誤差約 2.0 cm |
+| **v2** | `calibration/homography_v2_chessboard.json` | 地板大棋盤格自動角點（`calibrate_chessboard_floor.py`） | 平均重投影誤差約 0.2 cm；軸向已對齊房間 X/Y |
+
+預設腳本仍讀 `calibration/homography.json`（目前內容＝**v1** 備份）。要比對 v2 時加上 `--calib`：
+
+```powershell
+python detect_grid.py --source test/test.mp4 --calib calibration/homography_v1_manual.json
+python detect_grid.py --source test/test.mp4 --calib calibration/homography_v2_chessboard.json
+```
+
+座標系：
 - 虛擬左上角為 `(0,0)`（點不到也沒關係）  
 - 有效地板區約 `X 170~530 cm`、`Y 0~540 cm`（左側桌區遮擋）  
 - 地磚：左側第一格 35 cm，其餘 45 cm  
@@ -50,8 +64,13 @@ python test_rtsp.py
 重跑／驗證：
 
 ```powershell
+# v1 手動點選
 python calibrate_boundary.py --width 530 --height 540
 python verify_homography.py
+
+# v2 棋盤格（先 capture 再 calibrate）
+python calibrate_chessboard_floor.py capture --source "rtsp://帳號:密碼@攝影機IP:554/stream1"
+python calibrate_chessboard_floor.py calibrate --image calibration/chessboard_floor/capture.jpg --origin-x 190 --origin-y 400 --out calibration/homography_v2_chessboard.json
 ```
 
 ## 平面格子佔用
