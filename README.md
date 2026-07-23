@@ -46,7 +46,7 @@ python test_rtsp.py
 
 | 版本 | 檔案 | 作法 | 備註 |
 |------|------|------|------|
-| **v1** | `calibration/homography_v1_manual.json` | 手動點選磁磚角（`calibrate_boundary.py`） | 舊版手動校正 |
+| **v1** | `calibration/homography_v1_manual.json` | 手動點選磁磚角（`calibrate_boundary.py`） | 點擊量測誤差約 **8.9 cm** |
 | **v2** | `calibration/homography_v2_chessboard.json` | 地板大棋盤格自動角點（`calibrate_chessboard_floor.py`） | 目前預設；點擊量測誤差約 **3.8 cm** |
 
 預設腳本讀 `calibration/homography.json`（目前＝**v2**）。要比對 v1 時加上 `--calib`：
