@@ -131,7 +131,7 @@ def cell_label(col: int, row: int) -> str:
 
 def draw_grid(
     active: tuple[int, int] | None,
-    valid_x_min: float = 170.0,
+    valid_x_min: float = 0.0,
     cell_px: int = 72,
 ) -> np.ndarray:
     """Draw grid with Pillow (sharp text/lines on Windows)."""
@@ -147,7 +147,7 @@ def draw_grid(
     draw = ImageDraw.Draw(img)
 
     purple = (140, 60, 160)
-    desk = (210, 210, 210)  # X < valid_xmin low-confidence / desk zone
+    desk = (210, 210, 210)  # X < valid_xmin low-confidence / desk zone (disabled if <= 0)
     lit = (255, 220, 0)  # occupied cell
     white = (255, 255, 255)
 
@@ -157,7 +157,7 @@ def draw_grid(
             y0 = margin_t + j * cell_px
             x1 = x0 + cell_px
             y1 = y0 + cell_px
-            if X_EDGES[i + 1] <= valid_x_min:
+            if valid_x_min > 0 and X_EDGES[i + 1] <= valid_x_min:
                 fill = desk
             elif active is not None and active == (i, j):
                 fill = lit
@@ -178,12 +178,20 @@ def draw_grid(
         fill=(20, 20, 20),
         font=font_title,
     )
-    draw.text(
-        (margin_l, 30),
-        f"淺灰＝桌區／低可信（X < {valid_x_min:g} cm）",
-        fill=(90, 90, 90),
-        font=font,
-    )
+    if valid_x_min > 0:
+        draw.text(
+            (margin_l, 30),
+            f"淺灰＝桌區／低可信（X < {valid_x_min:g} cm）",
+            fill=(90, 90, 90),
+            font=font,
+        )
+    else:
+        draw.text(
+            (margin_l, 30),
+            "全格可用（未標記桌區低可信）",
+            fill=(90, 90, 90),
+            font=font,
+        )
     if active is not None:
         draw.text(
             (margin_l, h - 28),
@@ -227,7 +235,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image", default=str(DEFAULT_IMAGE))
     p.add_argument("--x", type=float, default=None, help="world X cm (skip click)")
     p.add_argument("--y", type=float, default=None, help="world Y cm (skip click)")
-    p.add_argument("--valid-xmin", type=float, default=170.0)
+    p.add_argument(
+        "--valid-xmin",
+        type=float,
+        default=0.0,
+        help="desk-zone gray mask threshold in cm; 0 = full grid (no gray); 170 = old desk mask",
+    )
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument("--max-width", type=int, default=1280)
     return p.parse_args()
@@ -276,14 +289,16 @@ def main() -> None:
         active = world_to_cell(wx, wy)
         status = cell_label(*active) if active else "OUTSIDE GRID"
         extra = ""
-        if active is not None and X_EDGES[active[0] + 1] <= args.valid_xmin:
+        if active is not None and args.valid_xmin > 0 and X_EDGES[active[0] + 1] <= args.valid_xmin:
             extra = " (left desk zone / low confidence)"
         print(f"world=({wx:.1f},{wy:.1f}) -> {status}{extra}")
 
     cv2.setMouseCallback(cam_win, on_mouse)
     print("左鍵點監視器地板 -> 右側格子會點亮。q 離開。")
-    print(f"有效區建議 X>={args.valid_xmin:g} cm")
-
+    if args.valid_xmin > 0:
+        print(f"有效區建議 X>={args.valid_xmin:g} cm（左側淺灰為桌區低可信）")
+    else:
+        print("全格可用（--valid-xmin 0，未標記桌區）")
     while True:
         cam = view.copy()
         if last_world[0] is not None:

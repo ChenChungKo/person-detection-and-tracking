@@ -45,7 +45,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-h-ratio", type=float, default=0.12)
     p.add_argument("--min-aspect", type=float, default=1.15)
     p.add_argument("--min-bottom-ratio", type=float, default=0.28)
-    p.add_argument("--valid-xmin", type=float, default=170.0)
+    p.add_argument(
+        "--valid-xmin",
+        type=float,
+        default=0.0,
+        help="desk-zone gray mask threshold in cm; 0 = full grid (no gray)",
+    )
     p.add_argument(
         "--layout",
         choices=["horizontal", "vertical"],

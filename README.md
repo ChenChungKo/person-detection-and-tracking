@@ -58,8 +58,9 @@ python detect_grid.py --source test/test.mp4 --calib calibration/homography_v2_c
 
 座標系：
 - 虛擬左上角為 `(0,0)`（點不到也沒關係）  
-- 有效地板區約 `X 170~530 cm`、`Y 0~540 cm`（左側桌區遮擋）  
+- 地板格範圍約 `X 0~530 cm`、`Y 0~540 cm`  
 - 地磚：左側第一格 35 cm，其餘 45 cm  
+- 預設**不再**把左側畫成淺灰桌區（`--valid-xmin 0`）；若要恢復舊遮罩：`--valid-xmin 170` 
 
 重跑／驗證：
 
@@ -93,7 +94,7 @@ python grid_occupancy.py --x 215 --y 360
 ```
 
 監視器點選地板 → 對應格子點亮。  
-圖例：黃＝佔用；淺灰＝桌區／低可信（`X < 170 cm`）。
+圖例：黃＝佔用；若加 `--valid-xmin 170`，淺灰＝桌區／低可信（`X < 170 cm`）。
 
 ## YOLO 人框測試
 
@@ -170,18 +171,41 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 - 這裡的「N 次」以**偵測次數**計算（跟 `--stride` 搭配時，只算真正跑 YOLO 的那幀，不受跳幀影響其穩定邏輯）
 - `export_demo_video.py` 也支援同名的 `--stride` / `--cell-hold`
 
+## 目前最佳設定（2026-07-23）
+
+經 RTSP／影片實測後，**目前建議預設組合**：
+
+| 項目 | 設定 |
+|------|------|
+| Homography | **v2** 棋盤格（`calibration/homography.json`＝v2） |
+| 格子範圍 | **全格**（`--valid-xmin 0`，不畫左側桌區灰格） |
+| 偵測 | `yolo26s.pt`、`--ref auto` |
+| 即時／效能 | `--stride 3`、`--cell-hold 2` |
+
+建議指令：
+
+```powershell
+python detect_grid.py --source test/test.mp4 --ref auto --stride 3 --cell-hold 2
+python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto --stride 3 --cell-hold 2
+```
+
+舊版手動校正仍保留：`--calib calibration/homography_v1_manual.json`；舊桌區灰格：`--valid-xmin 170`。
+
 ## Demo 影片（左：偵測，右：格子）
 
-由 `test/test.mp4` 匯出的合成結果（左監視器畫面、右平面格子）：
+由 `test/test.mp4` 匯出（**v2 Homography + 全格 + stride 3 + cell-hold 2**）：
 
 <p align="center">
-  <img src="test/demo_detect_grid.webp" width="100%" alt="Demo：左偵測、右格子"/>
+  <img src="test/demo_detect_grid.webp" width="100%" alt="Demo：左偵測、右格子（v2 全格）"/>
 </p>
 
-## 狀態備註（2026-07-22）
+上一版 demo 備份（未刪除）：`test/demo_detect_grid_prev.webp`（對應舊設定時期）。
 
-- 已完成：YOLO26 偵測、影片腳點／格子定位、格子 UI、RTSP 取流與降延遲（`LatestFrameCapture` 最新幀 + TCP）、跳幀（`--stride`）、格子防抖（`--cell-hold`）  
-- 未完成／暫緩：多人 ID 追蹤、外貌 Re-ID、即時 RTSP 定位準度調校  
+## 狀態備註（2026-07-23）
+
+- 已完成：YOLO26 偵測、影片／RTSP 腳點格子定位、Homography **v1（手動）／v2（棋盤格）**、全格顯示、RTSP 降延遲、跳幀、格子防抖、點擊量測真實誤差  
+- 目前最佳：見上方「目前最佳設定」  
+- 未完成／暫緩：多人 ID 追蹤、外貌 Re-ID、鏡頭畸變校正接入管線  
 
 ## 文件
 

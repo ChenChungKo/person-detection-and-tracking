@@ -274,7 +274,7 @@ def annotate_and_cells(
         else:
             cells.add(cell)
             low_conf = used == "head_drop"
-            if X_EDGES[cell[0] + 1] <= valid_xmin:
+            if valid_xmin > 0 and X_EDGES[cell[0] + 1] <= valid_xmin:
                 low_conf = True
             logs.append(
                 f"person {det['conf']:.2f} {used}=({fx:.1f},{fy:.1f}) "
@@ -441,7 +441,13 @@ def parse_args() -> argparse.Namespace:
         default=0.28,
         help="reject boxes whose bottom is above this frame-height ratio",
     )
-    p.add_argument("--valid-xmin", type=float, default=170.0)
+    p.add_argument(
+        "--valid-xmin",
+        type=float,
+        default=0.0,
+        help="cells with X right-edge <= this are marked low-confidence/desk gray; "
+        "0 disables desk zone (full grid). Use 170 to restore old desk mask.",
+    )
     p.add_argument("--max-width", type=int, default=1280)
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument(
