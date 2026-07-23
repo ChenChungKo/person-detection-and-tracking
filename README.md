@@ -46,10 +46,8 @@ python test_rtsp.py
 
 | 版本 | 檔案 | 作法 | 備註 |
 |------|------|------|------|
-| **v1** | `calibration/homography_v1_manual.json` | 手動點選磁磚角（`calibrate_boundary.py`） | 擬合殘差約 2 cm（僅校正點）；實際走路／點地板誤差通常更大 |
-| **v2** | `calibration/homography_v2_chessboard.json` | 地板大棋盤格自動角點（`calibrate_chessboard_floor.py`） | 棋盤角點擬合殘差約 0.2 cm（**不是**全場真實誤差）；軸向已對齊房間 X/Y；點擊已知點實測約數 cm 級（隨位置而變） |
-
-> **注意**：表格裡的「擬合／重投影誤差」只代表校正點自己對回指定座標有多貼，**不能直接當成定位精度**。真實誤差請用下方 `--measure-error` 量；人站定位還會再加上腳點／bbox 抖動等誤差。
+| **v1** | `calibration/homography_v1_manual.json` | 手動點選磁磚角（`calibrate_boundary.py`） | 舊版手動校正 |
+| **v2** | `calibration/homography_v2_chessboard.json` | 地板大棋盤格自動角點（`calibrate_chessboard_floor.py`） | 目前預設；點擊量測誤差約 **3.8 cm** |
 
 預設腳本讀 `calibration/homography.json`（目前＝**v2**）。要比對 v1 時加上 `--calib`：
 
