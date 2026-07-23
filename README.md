@@ -193,13 +193,26 @@ python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --
 
 ## Demo 影片（左：偵測，右：格子）
 
-由 `test/test.mp4` 匯出（**v2 Homography + 全格 + stride 3 + cell-hold 2**）：
+皆由同一支 `test/test.mp4` 匯出（`--stride 3 --cell-hold 2 --valid-xmin 0`），僅 Homography 版本不同：
+
+| 版本 | 影片 | WebP |
+|------|------|------|
+| **v1** 手動點選 | `test/demo_v1_manual.mp4` | `test/demo_v1_manual.webp` |
+| **v2** 棋盤格（目前預設／最佳） | `test/demo_v2_chessboard.mp4` | `test/demo_v2_chessboard.webp` |
+
+README 主圖使用 **v2**：
 
 <p align="center">
-  <img src="test/demo_detect_grid.webp" width="100%" alt="Demo：左偵測、右格子（v2 全格）"/>
+  <img src="test/demo_v2_chessboard.webp" width="100%" alt="Demo v2：左偵測、右格子"/>
 </p>
 
-上一版 demo 備份（未刪除）：`test/demo_detect_grid_prev.webp`（對應舊設定時期）。
+v1 對照：
+
+<p align="center">
+  <img src="test/demo_v1_manual.webp" width="100%" alt="Demo v1：左偵測、右格子"/>
+</p>
+
+（舊檔 `demo_detect_grid.webp` 仍保留，內容等同當時的預設 demo。）
 
 ## 狀態備註（2026-07-23）
 
