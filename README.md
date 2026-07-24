@@ -4,11 +4,15 @@
 
 ## 系統架構圖
 
-![系統架構圖](picture/架構圖.png)
+<p align="center">
+  <img src="picture/架構圖.png" alt="系統架構圖" width="560" />
+</p>
 
 ## 預計進度
 
-![預計進度](picture/時程圖.png)
+<p align="center">
+  <img src="picture/時程圖.png" alt="預計進度" width="560" />
+</p>
 
 ## 環境建置
 
