@@ -118,20 +118,45 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 ```powershell
 python detect_grid.py --source test/test.mp4 --ref auto
 python detect_grid.py --source test/test.mp4 --ref foot
+python detect_grid.py --source test/test.mp4 --no-track --stride 3
 ```
 
-RTSP 即時範例（建議搭配跳幀與防抖）：
+RTSP 即時範例：
 
 ```powershell
-python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto --stride 3 --cell-hold 2
+# 偵測 + 定位 + ID（預設）
+python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto --cell-hold 2
+
+# 只要定位、可跳幀加速
+python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto --no-track --stride 3 --cell-hold 2
 ```
 
-- 畫面：人框 + 腳點；超出範圍才標 `OUT`
+- 畫面：人框 + 腳點 + **僅顯示 `ID`**（預設開追蹤；`--no-track` 關閉）；超出範圍才標 `ID OUT`
 - 格子視窗：右上角固定顯示上次 `detect`／`locate` 耗時（沒偵測到人也會保留上一次數值，不會消失／閃爍）
 - 按 `q` 結束，`s` 存圖  
 - **即時格子定位準度仍待修正**（本機影片較穩）
 
 測試影片：`test/test.mp4`
+
+### 人物 ID 追蹤（預設開啟）
+
+管線：`YOLO26 detect` → **ByteTrack**（短時關聯）→ **穩定 ID 層**（ByteTrack 換號後，用「可走到的地板距離 + 外貌相似」決定是否接回舊 ID）。
+
+- **不預設假設畫面只有同一人**；`--single-person` 僅供 demo，預設關閉  
+- 畫面標籤**只顯示 `ID1` / `ID2`…**（格子座標改寫在 console）  
+- Tracker 設定：`trackers/bytetrack_stable.yaml`  
+- 本機 `.mp4` 預設**即時跟播**（推論慢會丟幀）；要逐幀慢播加 `--no-realtime`  
+- 關閉追蹤：`--no-track`
+
+```powershell
+python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet
+# 較嚴格才接回舊 ID（較易發新號）
+python detect_grid.py --source test/test.mp4 --appear-thresh 0.65 --quiet
+```
+
+常用參數：`--appear-thresh`（外貌門檻）、`--id-max-speed`（cm/s）、`--id-max-dist` / `--id-max-gap`。
+
+深度學習 Person Re-ID（跨長時間／換裝）仍列為後續工作。
 
 ### RTSP 降延遲（自動啟用）
 
@@ -160,8 +185,9 @@ RTSP／影片不必每幀都跑 YOLO，可跳幀降低運算量，中間幀沿�
 python detect_grid.py --source test/test.mp4 --stride 3
 ```
 
-- `--stride N`：每 N 幀才跑一次 YOLO（預設 1＝每幀都跑）
+- `--stride N`：每 N 幀才跑一次 YOLO（**預設 2**；設 1＝每幀都跑）
 - 格子視窗會標示 `cached`，代表這幀是沿用結果、不是新偵測
+- 本機影片另有 `--realtime`（預設開）：依影片時間軸丟幀，避免播放變慢動作
 
 ### 格子防抖（`--cell-hold`）
 
@@ -175,7 +201,7 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 - 這裡的「N 次」以**偵測次數**計算（跟 `--stride` 搭配時，只算真正跑 YOLO 的那幀，不受跳幀影響其穩定邏輯）
 - `export_demo_video.py` 也支援同名的 `--stride` / `--cell-hold`
 
-## 目前最佳設定（2026-07-23）
+## 目前最佳設定（2026-07-31）
 
 經 RTSP／影片實測後，**目前建議預設組合**：
 
@@ -184,13 +210,18 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 | Homography | **v2** 棋盤格（`calibration/homography.json`＝v2） |
 | 格子範圍 | **全格**（`--valid-xmin 0`，不畫左側桌區灰格） |
 | 偵測 | `yolo26s.pt`、`--ref auto` |
-| 即時／效能 | `--stride 3`、`--cell-hold 2` |
+| 追蹤 | **ByteTrack** + 地板距離／外貌接回 ID（預設開；畫面只顯示 `ID`） |
+| 即時／效能 | 預設 `--stride 2` + 本機影片即時丟幀；關追蹤可 `--stride 3` |
 
 建議指令：
 
 ```powershell
-python detect_grid.py --source test/test.mp4 --ref auto --stride 3 --cell-hold 2
-python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto --stride 3 --cell-hold 2
+# 偵測 + 定位 + ID（較順：跳幀＋即時跟播）
+python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet
+
+# 只要定位、不要 ID
+python detect_grid.py --source test/test.mp4 --ref auto --no-track --stride 3 --cell-hold 2
+python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto --no-track --stride 3 --cell-hold 2
 ```
 
 舊版手動校正仍保留：`--calib calibration/homography_v1_manual.json`；舊桌區灰格：`--valid-xmin 170`。
@@ -218,11 +249,11 @@ v1 對照：
 
 （舊檔 `demo_detect_grid.webp` 仍保留，內容等同當時的預設 demo。）
 
-## 狀態備註（2026-07-23）
+## 狀態備註（2026-07-31）
 
-- 已完成：YOLO26 偵測、影片／RTSP 腳點格子定位、Homography **v1（手動）／v2（棋盤格）**、全格顯示、RTSP 降延遲、跳幀、格子防抖、點擊量測真實誤差  
+- 已完成：YOLO26 偵測、**ByteTrack + 地板移動距離／外貌相似接回 ID**（預設不假設單人；畫面只顯示 ID）、影片／RTSP 腳點格子定位、Homography **v1（手動）／v2（棋盤格）**、全格顯示、RTSP 降延遲、跳幀、本機即時跟播、格子防抖、點擊量測真實誤差  
 - 目前最佳：見上方「目前最佳設定」  
-- 未完成／暫緩：多人 ID 追蹤、外貌 Re-ID、鏡頭畸變校正接入管線  
+- 未完成／暫緩：深度學習 Person Re-ID、鏡頭畸變校正接入管線  
 
 ## 文件
 

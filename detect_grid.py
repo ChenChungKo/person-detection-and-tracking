@@ -3,9 +3,13 @@
 Ground reference:
   - foot / head_drop / auto (see --ref)
 
+Tracking (same person -> same ID):
+  - default: Ultralytics ByteTrack (see --tracker)
+  - disable with --no-track
+
 Usage:
   python detect_grid.py --source test/test.mp4 --ref auto
-  python detect_grid.py --source test/test.mp4 --stride 3
+  python detect_grid.py --source test/test.mp4 --stride 3 --no-track
   python detect_grid.py --source "rtsp://user:pass@ip:554/stream1" --ref auto
 """
 
@@ -36,12 +40,13 @@ from latest_frame import LatestFrameCapture
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "test" / "static_frame.jpg"
 DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
 DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "detect_grid_preview.jpg"
+DEFAULT_TRACKER = Path(__file__).resolve().parent / "trackers" / "bytetrack_stable.yaml"
 
 
 def resize_for_preview(frame: np.ndarray, max_width: int) -> np.ndarray:
     h, w = frame.shape[:2]
     if max_width <= 0 or w <= max_width:
-        return frame
+        return frame.copy()
     scale = max_width / float(w)
     return cv2.resize(frame, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
 
@@ -156,11 +161,12 @@ def extract_foot_detections(
     min_aspect: float = 1.15,
     min_bottom_ratio: float = 0.28,
 ) -> list[dict]:
-    """Return person ground-ref points from YOLO detect boxes."""
+    """Return person ground-ref points from YOLO detect/track boxes."""
     out: list[dict] = []
     if result.boxes is None or len(result.boxes) == 0:
         return out
     boxes = result.boxes
+    has_ids = boxes.id is not None
     for i in range(len(boxes)):
         if int(boxes.cls[i].item()) != 0:
             continue
@@ -168,18 +174,27 @@ def extract_foot_detections(
         if conf < conf_thres:
             continue
         x1, y1, x2, y2 = boxes.xyxy[i].tolist()
-        if not is_plausible_person_box(
-            x1,
-            y1,
-            x2,
-            y2,
-            frame_h,
-            frame_w,
-            min_h_ratio=min_h_ratio,
-            min_aspect=min_aspect,
-            min_bottom_ratio=min_bottom_ratio,
-        ):
-            continue
+        track_id = int(boxes.id[i].item()) if has_ids else None
+        # Tracked boxes: keep ID continuity; only drop tiny junk.
+        # Untracked detect: keep stricter desk/monitor FP filter.
+        if track_id is None:
+            if not is_plausible_person_box(
+                x1,
+                y1,
+                x2,
+                y2,
+                frame_h,
+                frame_w,
+                min_h_ratio=min_h_ratio,
+                min_aspect=min_aspect,
+                min_bottom_ratio=min_bottom_ratio,
+            ):
+                continue
+        else:
+            bw = max(1.0, x2 - x1)
+            bh = max(1.0, y2 - y1)
+            if bh < 0.04 * frame_h or (bw * bh) < 0.002 * frame_w * frame_h:
+                continue
         ref_x, ref_y, used = estimate_ref_point(
             x1, y1, x2, y2, frame_h, mode, aspect, truncate_ratio
         )
@@ -190,8 +205,32 @@ def extract_foot_detections(
                 "head": (0.5 * (x1 + x2), float(y1)),
                 "mode": used,
                 "conf": conf,
+                "track_id": track_id,
             }
         )
+    return out
+
+
+def scale_detections_for_preview(detections: list[dict], scale: float) -> list[dict]:
+    """Scale box/foot drawing coords; keep world/cell in original units."""
+    if abs(scale - 1.0) < 1e-6:
+        return detections
+    out: list[dict] = []
+    for det in detections:
+        d = dict(det)
+        x1, y1, x2, y2 = det["xyxy"]
+        d["xyxy"] = (
+            int(round(x1 * scale)),
+            int(round(y1 * scale)),
+            int(round(x2 * scale)),
+            int(round(y2 * scale)),
+        )
+        fx, fy = det["foot"]
+        d["foot"] = (fx * scale, fy * scale)
+        if "head" in det:
+            hx, hy = det["head"]
+            d["head"] = (hx * scale, hy * scale)
+        out.append(d)
     return out
 
 
@@ -231,16 +270,18 @@ def annotate_and_cells(
     h_mat: np.ndarray,
     valid_xmin: float,
 ) -> tuple[np.ndarray, set[tuple[int, int]], list[str]]:
-    vis = frame.copy()
+    vis = frame  # caller passes a writable preview-sized copy
     cells: set[tuple[int, int]] = set()
     logs: list[str] = []
-    fs = max(1.0, frame.shape[1] / 1280.0)
+    fs = max(0.75, frame.shape[1] / 1280.0)
     thick = max(2, int(round(2 * fs)))
 
     for det in detections:
         x1, y1, x2, y2 = det["xyxy"]
         fx, fy = det["foot"]
         used = det.get("mode", "foot")
+        tid = det.get("track_id")
+        id_txt = f"ID{tid}" if tid is not None else "person"
         box_color = (0, 255, 0)
         if "world" in det and "cell" in det:
             wx, wy = det["world"]
@@ -251,16 +292,16 @@ def annotate_and_cells(
 
         cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, max(2, thick))
         ref_color = (0, 0, 255) if used == "foot" else (255, 0, 255)
-        cv2.circle(vis, (int(fx), int(fy)), max(7, int(6 * fs)), ref_color, -1)
+        cv2.circle(vis, (int(fx), int(fy)), max(6, int(5 * fs)), ref_color, -1)
+
+        label_y = y1 - 12
+        if label_y < int(40 * fs):
+            label_y = y1 + int(36 * fs)
 
         if cell is None:
-            low_conf = True
-            label_y = y1 - 12
-            if label_y < int(40 * fs):
-                label_y = y1 + int(36 * fs)
             put_label(
                 vis,
-                "OUT",
+                f"{id_txt} OUT",
                 (x1, label_y),
                 fg=(255, 255, 255),
                 bg=(0, 0, 220),
@@ -268,7 +309,7 @@ def annotate_and_cells(
                 thickness=thick,
             )
             logs.append(
-                f"person {det['conf']:.2f} {used}=({fx:.1f},{fy:.1f}) "
+                f"{id_txt} conf={det['conf']:.2f} {used}=({fx:.1f},{fy:.1f}) "
                 f"world=({wx:.1f},{wy:.1f}) OUT"
             )
         else:
@@ -276,13 +317,45 @@ def annotate_and_cells(
             low_conf = used == "head_drop"
             if valid_xmin > 0 and X_EDGES[cell[0] + 1] <= valid_xmin:
                 low_conf = True
+            cell_txt = cell_label(*cell)
+            put_label(
+                vis,
+                id_txt,
+                (x1, label_y),
+                fg=(0, 0, 0),
+                bg=(0, 255, 255),
+                scale=0.85 * fs,
+                thickness=thick,
+            )
             logs.append(
-                f"person {det['conf']:.2f} {used}=({fx:.1f},{fy:.1f}) "
-                f"world=({wx:.1f},{wy:.1f}) {cell_label(*cell)}"
+                f"{id_txt} conf={det['conf']:.2f} "
+                f"world=({wx:.1f},{wy:.1f}) {cell_txt}"
                 + (" [low]" if low_conf else "")
             )
 
     return vis, cells, logs
+
+
+class GridCache:
+    """Avoid redrawing the floor grid when occupied cells are unchanged."""
+
+    def __init__(self) -> None:
+        self._cells: set[tuple[int, int]] | None = None
+        self._valid_xmin: float | None = None
+        self._base: np.ndarray | None = None
+
+    def get(self, cells: set[tuple[int, int]], valid_xmin: float) -> np.ndarray:
+        if (
+            self._base is not None
+            and self._cells == cells
+            and self._valid_xmin == valid_xmin
+        ):
+            return self._base.copy()
+        img = draw_multi_grid(cells, valid_xmin)
+        self._cells = set(cells)
+        self._valid_xmin = valid_xmin
+        self._base = img
+        return img.copy()
 
 
 def draw_multi_grid(cells: set[tuple[int, int]], valid_xmin: float) -> np.ndarray:
@@ -335,6 +408,201 @@ class CellStabilizer:
         return set(self._confirmed)
 
 
+class StableIdMapper:
+    """Remap volatile tracker IDs using floor motion limits + appearance.
+
+    Does NOT assume \"there is only one person\". A lost ID is reused only when
+    a new detection is both:
+      1) reachable in floor space given elapsed time and max walking speed, and
+      2) similar in appearance (HSV histogram of the torso crop).
+    """
+
+    def __init__(
+        self,
+        max_dist_cm: float = 320.0,
+        max_gap_frames: int = 250,
+        max_speed_cm_s: float = 180.0,
+        appear_thresh: float = 0.50,
+        fps: float = 20.0,
+        single_person: bool = False,
+    ) -> None:
+        self.max_dist_cm = max_dist_cm
+        self.max_gap_frames = max_gap_frames
+        self.max_speed_cm_s = max_speed_cm_s
+        self.appear_thresh = appear_thresh
+        self.fps = max(1.0, fps)
+        self.single_person = single_person  # optional demo-only; default off
+        self._raw_to_stable: dict[int, int] = {}
+        self._stable: dict[int, dict] = {}  # sid -> frame, wx, wy, feat
+        self._next_id = 1
+
+    def _expire(self, frame_idx: int) -> None:
+        dead = [
+            sid
+            for sid, meta in self._stable.items()
+            if frame_idx - int(meta["frame"]) > self.max_gap_frames
+        ]
+        for sid in dead:
+            self._stable.pop(sid, None)
+        self._raw_to_stable = {
+            raw: sid for raw, sid in self._raw_to_stable.items() if sid in self._stable
+        }
+
+    @staticmethod
+    def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
+        return float(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5)
+
+    @staticmethod
+    def appearance_feat(frame: np.ndarray, xyxy: tuple[int, int, int, int]) -> np.ndarray | None:
+        """Compact torso color histogram (no learned Re-ID model required)."""
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = xyxy
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(w - 1, int(x2)), min(h - 1, int(y2))
+        if x2 - x1 < 8 or y2 - y1 < 16:
+            return None
+        # Focus on torso (skip head/feet) — more stable for clothing cue.
+        y_a = y1 + int(0.20 * (y2 - y1))
+        y_b = y1 + int(0.75 * (y2 - y1))
+        x_a = x1 + int(0.15 * (x2 - x1))
+        x_b = x1 + int(0.85 * (x2 - x1))
+        crop = frame[y_a:y_b, x_a:x_b]
+        if crop.size == 0:
+            return None
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
+        n = float(np.linalg.norm(hist))
+        if n < 1e-6:
+            return None
+        return hist / n
+
+    @staticmethod
+    def _appear_sim(a: np.ndarray | None, b: np.ndarray | None) -> float:
+        if a is None or b is None:
+            return 0.0
+        return float(np.dot(a, b))
+
+    def _reach_limit_cm(self, gap_frames: int) -> float:
+        gap_s = max(0, gap_frames) / self.fps
+        # reachable distance + small localization slack
+        return min(self.max_dist_cm, self.max_speed_cm_s * gap_s + 60.0)
+
+    def apply(
+        self,
+        dets: list[dict],
+        frame_idx: int,
+        frame: np.ndarray | None = None,
+    ) -> list[dict]:
+        self._expire(frame_idx)
+        if not dets:
+            return dets
+
+        work = list(dets)
+        # Demo-only shortcut (explicit --single-person). Off by default.
+        if self.single_person and len(work) > 1:
+            if self._stable:
+                sid, meta = max(self._stable.items(), key=lambda kv: kv[1]["frame"])
+                anchor = (float(meta["wx"]), float(meta["wy"]))
+                work = [min(work, key=lambda d: self._dist(d.get("world", (1e9, 1e9)), anchor))]
+            else:
+                work = [max(work, key=lambda d: float(d.get("conf", 0.0)))]
+
+        feats: list[np.ndarray | None] = []
+        for det in work:
+            if frame is None:
+                feats.append(None)
+            else:
+                feats.append(self.appearance_feat(frame, det["xyxy"]))
+
+        assigned: dict[int, int] = {}
+        used_sids: set[int] = set()
+
+        # 1) Keep raw tracker ID links while that raw ID is still alive.
+        for i, det in enumerate(work):
+            raw = det.get("track_id")
+            if raw is None:
+                continue
+            sid = self._raw_to_stable.get(int(raw))
+            if sid is not None and sid in self._stable and sid not in used_sids:
+                assigned[i] = sid
+                used_sids.add(sid)
+
+        # 2) Rematch by motion reachability + appearance (no one-person prior).
+        unmatched_i = [i for i in range(len(work)) if i not in assigned]
+        candidates = [sid for sid in self._stable if sid not in used_sids]
+        pairs: list[tuple[float, int, int]] = []
+        for i in unmatched_i:
+            world = work[i].get("world")
+            if world is None:
+                continue
+            for sid in candidates:
+                meta = self._stable[sid]
+                gap = frame_idx - int(meta["frame"])
+                dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
+                limit = self._reach_limit_cm(gap)
+                if self.single_person and len(work) == 1 and len(candidates) == 1:
+                    limit = max(limit, self.max_dist_cm)
+                if dist > limit:
+                    continue
+                sim = self._appear_sim(feats[i], meta.get("feat"))
+                # Short gap + close on floor: motion alone is enough.
+                short_close = gap <= 15 and dist <= 100.0
+                if not short_close and sim < self.appear_thresh:
+                    continue
+                # Lower cost is better: prefer closer + more similar.
+                cost = dist / max(limit, 1.0) + (1.0 - sim)
+                pairs.append((cost, i, sid))
+        pairs.sort()
+        for _cost, i, sid in pairs:
+            if i in assigned or sid in used_sids:
+                continue
+            assigned[i] = sid
+            used_sids.add(sid)
+
+        # 3) New IDs for genuine new persons / failed rematch.
+        out: list[dict] = []
+        for i, det in enumerate(work):
+            d = dict(det)
+            raw = d.get("track_id")
+            if i in assigned:
+                sid = assigned[i]
+            elif (
+                self.single_person
+                and len(work) == 1
+                and len(self._stable) == 1
+                and not used_sids
+            ):
+                sid = next(iter(self._stable))
+            else:
+                sid = self._next_id
+                self._next_id += 1
+
+            if raw is not None:
+                self._raw_to_stable[int(raw)] = sid
+            wx, wy = d.get("world", (0.0, 0.0))
+            prev = self._stable.get(sid, {})
+            feat = feats[i]
+            old = prev.get("feat")
+            if feat is not None and old is not None:
+                feat = 0.8 * old + 0.2 * feat
+                n = float(np.linalg.norm(feat))
+                if n > 1e-6:
+                    feat = feat / n
+            elif feat is None:
+                feat = old
+            self._stable[sid] = {
+                "frame": frame_idx,
+                "wx": float(wx),
+                "wy": float(wy),
+                "feat": feat,
+            }
+            d["raw_track_id"] = raw
+            d["track_id"] = sid
+            out.append(d)
+        return out
+
+
 def detect_and_locate(
     frame: np.ndarray,
     model: YOLO,
@@ -346,9 +614,21 @@ def detect_and_locate(
     min_h_ratio: float,
     min_aspect: float,
     min_bottom_ratio: float,
+    track: bool = True,
+    tracker: str | None = None,
+    imgsz: int = 640,
 ) -> tuple[list[dict], float, float]:
     t0 = time.perf_counter()
-    results = model.predict(frame, conf=conf, classes=[0], verbose=False)
+    infer_kw = dict(conf=conf, classes=[0], imgsz=imgsz, verbose=False)
+    if track:
+        results = model.track(
+            frame,
+            persist=True,
+            tracker=tracker or str(DEFAULT_TRACKER),
+            **infer_kw,
+        )
+    else:
+        results = model.predict(frame, **infer_kw)
     detect_ms = (time.perf_counter() - t0) * 1000.0
 
     t1 = time.perf_counter()
@@ -381,18 +661,24 @@ def render_detection_view(
     timing: tuple[float, float] | None = None,
     cached: bool = False,
     grid_cells: set[tuple[int, int]] | None = None,
+    max_width: int = 1280,
+    grid_cache: GridCache | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    vis, cells, logs = annotate_and_cells(frame, dets, h_mat, valid_xmin)
+    # Draw on preview-sized frame (much cheaper than annotating 2880px then resize).
+    view = resize_for_preview(frame, max_width)
+    scale = view.shape[1] / float(frame.shape[1]) if frame.shape[1] else 1.0
+    draw_dets = scale_detections_for_preview(dets, scale)
+    vis, cells, logs = annotate_and_cells(view, draw_dets, h_mat, valid_xmin)
     display_cells = grid_cells if grid_cells is not None else cells
-    grid = draw_multi_grid(display_cells, valid_xmin)
+    if grid_cache is not None:
+        grid = grid_cache.get(display_cells, valid_xmin)
+    else:
+        grid = draw_multi_grid(display_cells, valid_xmin)
 
     if timing is not None:
         detect_ms, locate_ms = timing
         suffix = "  cached" if cached else ""
         timing_txt = f"detect {detect_ms:5.0f}ms  locate {locate_ms:5.2f}ms{suffix}"
-        # Fixed-size background box (sized for the widest possible text,
-        # including "cached") so position/size never jitters between frames
-        # regardless of digit width or whether the cached suffix is shown.
         box_x, box_y, box_w, box_h = grid.shape[1] - 380, 8, 372, 34
         cv2.rectangle(grid, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
         cv2.putText(
@@ -458,8 +744,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--stride",
         type=int,
-        default=1,
-        help="run YOLO every N frames; skipped frames reuse last detections (default 1=every frame)",
+        default=2,
+        help="run YOLO every N frames; skipped frames reuse last detections "
+        "(default 2; use 1 only if you need denser track updates)",
     )
     p.add_argument(
         "--cell-hold",
@@ -467,6 +754,79 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="a cell only lights/clears after N consecutive DETECTION RUNS agree "
         "(counted in stride units, not raw frames); 1 disables debounce",
+    )
+    p.add_argument(
+        "--track",
+        dest="track",
+        action="store_true",
+        default=True,
+        help="enable ByteTrack IDs via model.track (default on for video)",
+    )
+    p.add_argument(
+        "--no-track",
+        dest="track",
+        action="store_false",
+        help="disable tracking; each frame is independent detect",
+    )
+    p.add_argument(
+        "--tracker",
+        default=str(DEFAULT_TRACKER),
+        help="Ultralytics tracker yaml (default: trackers/bytetrack_stable.yaml)",
+    )
+    p.add_argument(
+        "--imgsz",
+        type=int,
+        default=640,
+        help="YOLO inference size (default 640; higher is slower)",
+    )
+    p.add_argument(
+        "--realtime",
+        dest="realtime",
+        action="store_true",
+        default=True,
+        help="for local video: skip frames to keep near realtime (default on)",
+    )
+    p.add_argument(
+        "--no-realtime",
+        dest="realtime",
+        action="store_false",
+        help="process every frame even if playback becomes slow-motion",
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="do not print per-detection lines (less console lag)",
+    )
+    p.add_argument(
+        "--single-person",
+        dest="single_person",
+        action="store_true",
+        default=False,
+        help="DEMO ONLY: assume one person and force-reuse their ID (default off)",
+    )
+    p.add_argument(
+        "--id-max-dist",
+        type=float,
+        default=320.0,
+        help="cap on floor rematch distance (cm)",
+    )
+    p.add_argument(
+        "--id-max-gap",
+        type=int,
+        default=250,
+        help="max frames to remember a stable ID after last sighting",
+    )
+    p.add_argument(
+        "--id-max-speed",
+        type=float,
+        default=180.0,
+        help="max walk speed (cm/s) used to limit rematch distance by time gap",
+    )
+    p.add_argument(
+        "--appear-thresh",
+        type=float,
+        default=0.50,
+        help="min appearance similarity (0-1) to reuse an ID after tracker switch",
     )
     return p.parse_args()
 
@@ -491,17 +851,30 @@ def main() -> None:
     if args.stride < 1:
         raise SystemExit("--stride 必須 >= 1")
 
+    tracker_path = Path(args.tracker)
+    if args.track and not tracker_path.exists():
+        raise SystemExit(f"找不到 tracker 設定：{tracker_path}")
+
     cam_win = "Detect + Grid"
     grid_win = "Grid"
-    print(f"偵測：YOLO（{args.model}），conf={args.conf}（每幀獨立，無 ID／追蹤）")
+    if args.track:
+        print(
+            f"偵測＋追蹤：YOLO（{args.model}）+ ByteTrack（{tracker_path.name}），"
+            f"conf={args.conf}，imgsz={args.imgsz}，stride={args.stride}"
+        )
+    else:
+        print(
+            f"偵測：YOLO（{args.model}），conf={args.conf}，"
+            f"imgsz={args.imgsz}（每幀獨立，無 ID／追蹤）"
+        )
     print(f"參考點模式：{args.ref}（紅=foot，紫=head_drop）。按 q 結束，s 存圖。")
     print(f"預覽寬度固定 max-width={args.max_width}（影片與格子視窗皆鎖定畫面像素大小）")
     if args.stride > 1:
-        print(f"跳幀：每 {args.stride} 幀才跑 YOLO，中間幀沿用上次偵測結果。")
+        print(f"跳幀：每 {args.stride} 幀才跑 YOLO，中間幀沿用上次偵測／ID。")
     if args.cell_hold > 1:
         print(f"防抖：格子需連續 {args.cell_hold} 次偵測結果一致才會點亮／熄滅。")
     if not args.no_timing:
-        print("計時：僅在偵測到人時顯示於格子上方（detect=辨識，locate=定位）。")
+        print("計時：顯示於格子上方（detect=辨識，locate=定位）。")
 
     det_kw = dict(
         conf=args.conf,
@@ -511,16 +884,28 @@ def main() -> None:
         min_h_ratio=args.min_h_ratio,
         min_aspect=args.min_aspect,
         min_bottom_ratio=args.min_bottom_ratio,
+        track=args.track and not is_image,
+        tracker=str(tracker_path),
+        imgsz=args.imgsz,
     )
+    grid_cache = GridCache()
 
     def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         dets, detect_ms, locate_ms = detect_and_locate(frame, model, h_mat, **det_kw)
         timing = None if args.no_timing else (detect_ms, locate_ms)
         vis, grid, logs = render_detection_view(
-            frame, dets, h_mat, args.valid_xmin, timing=timing, cached=False
+            frame,
+            dets,
+            h_mat,
+            args.valid_xmin,
+            timing=timing,
+            cached=False,
+            max_width=args.max_width,
+            grid_cache=grid_cache,
         )
-        for line in logs:
-            print(line)
+        if not args.quiet:
+            for line in logs:
+                print(line)
         return vis, grid
 
     if is_image:
@@ -528,13 +913,12 @@ def main() -> None:
         if frame is None:
             raise SystemExit(f"無法讀取影像：{source}")
         vis, grid = process_frame(frame)
-        view = resize_for_preview(vis, args.max_width)
         while True:
-            show_fixed_window(cam_win, view)
+            show_fixed_window(cam_win, vis)
             show_grid_window(grid_win, grid)
             key = cv2.waitKey(20) & 0xFF
             if key == ord("s"):
-                imwrite_unicode(Path(args.out), view)
+                imwrite_unicode(Path(args.out), vis)
                 imwrite_unicode(Path(args.out).with_name("detect_grid_cells.jpg"), grid)
                 print(f"已存：{args.out}")
             elif key in (ord("q"), 27):
@@ -547,10 +931,15 @@ def main() -> None:
         raise SystemExit(f"無法開啟來源：{source}")
 
     use_latest = source.lower().startswith("rtsp://")
+    is_file_video = (not use_latest) and Path(source).suffix.lower() in {
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".mkv",
+    }
     reader: LatestFrameCapture | None = LatestFrameCapture(cap) if use_latest else None
     if use_latest:
         print("RTSP：啟用最新幀讀取（推論慢時丟棄舊幀，降低延遲感）")
-        # wait briefly for first frame
         for _ in range(50):
             ok, frame = reader.read()
             if ok and frame is not None:
@@ -560,13 +949,41 @@ def main() -> None:
             reader.release()
             raise SystemExit("RTSP 連線後未收到畫面。")
 
+    video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if video_fps <= 1e-3:
+        video_fps = 20.0
+    use_realtime = bool(args.realtime and is_file_video)
+    if use_realtime:
+        print(
+            f"本機影片：即時跟播（約 {video_fps:.1f} fps）；"
+            "推論慢會自動丟幀。完整逐幀請加 --no-realtime"
+        )
+
     stabilizer = CellStabilizer(args.cell_hold)
     confirmed_cells: set[tuple[int, int]] = set()
+    id_mapper = StableIdMapper(
+        max_dist_cm=args.id_max_dist,
+        max_gap_frames=args.id_max_gap,
+        max_speed_cm_s=args.id_max_speed,
+        appear_thresh=args.appear_thresh,
+        fps=video_fps if is_file_video or use_latest else 20.0,
+        single_person=args.single_person,
+    )
+    if args.track:
+        if args.single_person:
+            print("ID 穩定層：單人強制接回（demo，非真實辨識）")
+        else:
+            print(
+                f"ID 穩定層：移動距離上限 + 外貌相似"
+                f"（appear≥{args.appear_thresh:.2f}，max_speed={args.id_max_speed:.0f}cm/s）"
+            )
 
     try:
         frame_idx = 0
         last_dets: list[dict] = []
         last_timing: tuple[float, float] | None = None
+        last_id_key: tuple[int, ...] | None = None
+        t_play0 = time.perf_counter()
         while True:
             if reader is not None:
                 ok, frame = reader.read()
@@ -576,18 +993,35 @@ def main() -> None:
                         break
                     time.sleep(0.01)
                     continue
+                frame_idx += 1
             else:
-                ok, frame = cap.read()
+                if use_realtime:
+                    # Drop frames so wall-clock stays near video timeline.
+                    target = int((time.perf_counter() - t_play0) * video_fps) + 1
+                    while frame_idx + 1 < target:
+                        if not cap.grab():
+                            ok, frame = False, None
+                            break
+                        frame_idx += 1
+                    else:
+                        ok, frame = cap.read()
+                        if ok:
+                            frame_idx += 1
+                else:
+                    ok, frame = cap.read()
+                    if ok:
+                        frame_idx += 1
                 if not ok or frame is None:
                     print("讀取結束或失敗。")
                     break
 
-            frame_idx += 1
             run_detect = frame_idx == 1 or (frame_idx - 1) % args.stride == 0
             if run_detect:
                 last_dets, detect_ms, locate_ms = detect_and_locate(
                     frame, model, h_mat, **det_kw
                 )
+                if det_kw.get("track"):
+                    last_dets = id_mapper.apply(last_dets, frame_idx, frame=frame)
                 last_timing = None if args.no_timing else (detect_ms, locate_ms)
                 raw_cells = {d["cell"] for d in last_dets if d.get("cell") is not None}
                 confirmed_cells = stabilizer.update(raw_cells)
@@ -600,16 +1034,33 @@ def main() -> None:
                 timing=timing,
                 cached=not run_detect,
                 grid_cells=confirmed_cells,
+                max_width=args.max_width,
+                grid_cache=grid_cache,
             )
-            if run_detect:
-                for line in logs:
-                    print(line)
-            view = resize_for_preview(vis, args.max_width)
-            show_fixed_window(cam_win, view)
+            if run_detect and not args.quiet:
+                id_key = tuple(
+                    sorted(d["track_id"] for d in last_dets if d.get("track_id") is not None)
+                )
+                if id_key != last_id_key or logs:
+                    if id_key != last_id_key:
+                        print(f"[frame {frame_idx}] active IDs: {list(id_key) if id_key else '—'}")
+                        last_id_key = id_key
+                    for line in logs:
+                        print(line)
+            show_fixed_window(cam_win, vis)
             show_grid_window(grid_win, grid)
-            key = cv2.waitKey(1) & 0xFF
+
+            if use_realtime:
+                # If we are ahead of the timeline, wait a bit.
+                ahead = frame_idx / video_fps - (time.perf_counter() - t_play0)
+                wait_ms = 1
+                if ahead > 0.005:
+                    wait_ms = max(1, int(ahead * 1000))
+                key = cv2.waitKey(wait_ms) & 0xFF
+            else:
+                key = cv2.waitKey(1) & 0xFF
             if key == ord("s"):
-                imwrite_unicode(Path(args.out), view)
+                imwrite_unicode(Path(args.out), vis)
                 imwrite_unicode(Path(args.out).with_name("detect_grid_cells.jpg"), grid)
                 print(f"已存：{args.out}")
             elif key in (ord("q"), 27):
