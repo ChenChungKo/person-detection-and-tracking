@@ -269,6 +269,7 @@ def annotate_and_cells(
     detections: list[dict],
     h_mat: np.ndarray,
     valid_xmin: float,
+    out_margin: float = 45.0,
 ) -> tuple[np.ndarray, set[tuple[int, int]], list[str]]:
     vis = frame  # caller passes a writable preview-sized copy
     cells: set[tuple[int, int]] = set()
@@ -288,7 +289,7 @@ def annotate_and_cells(
             cell = det["cell"]
         else:
             wx, wy = image_to_world(h_mat, fx, fy)
-            cell = world_to_cell(wx, wy)
+            cell = world_to_cell(wx, wy, margin_cm=out_margin)
 
         cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, max(2, thick))
         ref_color = (0, 0, 255) if used == "foot" else (255, 0, 255)
@@ -617,6 +618,7 @@ def detect_and_locate(
     track: bool = True,
     tracker: str | None = None,
     imgsz: int = 640,
+    out_margin: float = 45.0,
 ) -> tuple[list[dict], float, float]:
     t0 = time.perf_counter()
     infer_kw = dict(conf=conf, classes=[0], imgsz=imgsz, verbose=False)
@@ -648,7 +650,7 @@ def detect_and_locate(
         fx, fy = det["foot"]
         wx, wy = image_to_world(h_mat, fx, fy)
         det["world"] = (wx, wy)
-        det["cell"] = world_to_cell(wx, wy)
+        det["cell"] = world_to_cell(wx, wy, margin_cm=out_margin)
     locate_ms = (time.perf_counter() - t1) * 1000.0
     return dets, detect_ms, locate_ms
 
@@ -663,12 +665,15 @@ def render_detection_view(
     grid_cells: set[tuple[int, int]] | None = None,
     max_width: int = 1280,
     grid_cache: GridCache | None = None,
+    out_margin: float = 45.0,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     # Draw on preview-sized frame (much cheaper than annotating 2880px then resize).
     view = resize_for_preview(frame, max_width)
     scale = view.shape[1] / float(frame.shape[1]) if frame.shape[1] else 1.0
     draw_dets = scale_detections_for_preview(dets, scale)
-    vis, cells, logs = annotate_and_cells(view, draw_dets, h_mat, valid_xmin)
+    vis, cells, logs = annotate_and_cells(
+        view, draw_dets, h_mat, valid_xmin, out_margin=out_margin
+    )
     display_cells = grid_cells if grid_cells is not None else cells
     if grid_cache is not None:
         grid = grid_cache.get(display_cells, valid_xmin)
@@ -733,6 +738,13 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="cells with X right-edge <= this are marked low-confidence/desk gray; "
         "0 disables desk zone (full grid). Use 170 to restore old desk mask.",
+    )
+    p.add_argument(
+        "--out-margin",
+        type=float,
+        default=45.0,
+        help="cm: if foot world point is only this far outside the grid, "
+        "snap into the nearest edge cell instead of marking OUT (default 45=1 tile)",
     )
     p.add_argument("--max-width", type=int, default=1280)
     p.add_argument("--out", default=str(DEFAULT_OUT))
@@ -873,6 +885,11 @@ def main() -> None:
         print(f"跳幀：每 {args.stride} 幀才跑 YOLO，中間幀沿用上次偵測／ID。")
     if args.cell_hold > 1:
         print(f"防抖：格子需連續 {args.cell_hold} 次偵測結果一致才會點亮／熄滅。")
+    if args.out_margin > 0:
+        print(
+            f"OUT 容差：世界座標超出格子 ≤ {args.out_margin:g} cm 時夾回邊緣格"
+            "（--out-margin 0 關閉）。"
+        )
     if not args.no_timing:
         print("計時：顯示於格子上方（detect=辨識，locate=定位）。")
 
@@ -887,6 +904,7 @@ def main() -> None:
         track=args.track and not is_image,
         tracker=str(tracker_path),
         imgsz=args.imgsz,
+        out_margin=args.out_margin,
     )
     grid_cache = GridCache()
 
@@ -902,6 +920,7 @@ def main() -> None:
             cached=False,
             max_width=args.max_width,
             grid_cache=grid_cache,
+            out_margin=args.out_margin,
         )
         if not args.quiet:
             for line in logs:
@@ -1036,6 +1055,7 @@ def main() -> None:
                 grid_cells=confirmed_cells,
                 max_width=args.max_width,
                 grid_cache=grid_cache,
+                out_margin=args.out_margin,
             )
             if run_detect and not args.quiet:
                 id_key = tuple(

@@ -99,11 +99,27 @@ def imwrite_unicode(path: Path, image: np.ndarray) -> None:
     buf.tofile(str(path))
 
 
-def world_to_cell(x: float, y: float) -> tuple[int, int] | None:
-    """Return (col, row) 0-based, or None if outside grid."""
-    if x < X_EDGES[0] or x > X_EDGES[-1] or y < Y_EDGES[0] or y > Y_EDGES[-1]:
+def world_to_cell(
+    x: float,
+    y: float,
+    margin_cm: float = 0.0,
+) -> tuple[int, int] | None:
+    """Return (col, row) 0-based, or None if outside grid.
+
+    ``margin_cm``: if the point is only slightly outside the rectangle
+    [0,530]×[0,540] (Homography / foot noise near edges), clamp into the
+    nearest in-grid coordinate and still return a cell. Far outliers stay OUT.
+    """
+    x0, x1 = X_EDGES[0], X_EDGES[-1]
+    y0, y1 = Y_EDGES[0], Y_EDGES[-1]
+    m = max(0.0, float(margin_cm))
+    if x < x0 - m or x > x1 + m or y < y0 - m or y > y1 + m:
         return None
-    # right/bottom edge belongs to last cell
+    # Soft edge: snap barely-outside points onto the grid boundary interior.
+    eps = 1e-3
+    x = min(max(x, x0), x1 - eps)
+    y = min(max(y, y0), y1 - eps)
+
     col = None
     for i in range(len(X_EDGES) - 1):
         if X_EDGES[i] <= x <= X_EDGES[i + 1] or (
