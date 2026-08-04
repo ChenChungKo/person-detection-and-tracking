@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -36,11 +37,36 @@ from grid_occupancy import (
     world_to_cell,
 )
 from latest_frame import LatestFrameCapture
+from stable_id import StableIdMapper
 
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "test" / "static_frame.jpg"
 DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
 DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "detect_grid_preview.jpg"
 DEFAULT_TRACKER = Path(__file__).resolve().parent / "trackers" / "bytetrack_stable.yaml"
+
+
+def format_id_list(ids: tuple[int, ...]) -> str:
+    return ",".join(f"ID{i}" for i in ids) if ids else "—"
+
+
+def log_id_change(
+    frame_idx: int,
+    fps: float,
+    t0: float,
+    prev: tuple[int, ...] | None,
+    curr: tuple[int, ...],
+) -> None:
+    """Print when the set of active stable IDs changes."""
+    wall = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    elapsed = time.perf_counter() - t0
+    video_t = frame_idx / fps if fps > 1e-6 else 0.0
+    prev_s = format_id_list(prev) if prev is not None else "(start)"
+    curr_s = format_id_list(curr)
+    print(
+        f"[ID-CHANGE] {wall}  elapsed={elapsed:7.2f}s  "
+        f"video={video_t:7.2f}s  frame={frame_idx:5d}  {prev_s} → {curr_s}",
+        flush=True,
+    )
 
 
 def resize_for_preview(frame: np.ndarray, max_width: int) -> np.ndarray:
@@ -403,251 +429,6 @@ class CellStabilizer:
         return set(self._confirmed)
 
 
-class StableIdMapper:
-    """Remap volatile tracker IDs using floor motion limits + appearance.
-
-    Does NOT assume \"there is only one person\". A lost ID is reused only when
-    a new detection is both:
-      1) reachable in floor space given elapsed time and max walking speed, and
-      2) similar in appearance (YOLO26 Re-ID embedding by default; HSV fallback).
-
-    New tracks must appear for ``min_hits`` consecutive mapper updates before
-    they receive a stable ID (and are shown), so one-frame FPs do not steal IDs.
-    Stable IDs are never recycled in-session: a leaver may return and rematch
-    to the same ID via floor distance + appearance.
-    """
-
-    def __init__(
-        self,
-        max_dist_cm: float = 320.0,
-        max_gap_frames: int = 250,
-        max_speed_cm_s: float = 180.0,
-        appear_thresh: float = 0.50,
-        fps: float = 20.0,
-        single_person: bool = False,
-        min_hits: int = 3,
-        encoder=None,
-    ) -> None:
-        self.max_dist_cm = max_dist_cm
-        self.max_gap_frames = max_gap_frames
-        self.max_speed_cm_s = max_speed_cm_s
-        self.appear_thresh = appear_thresh
-        self.fps = max(1.0, fps)
-        self.single_person = single_person  # optional demo-only; default off
-        self.min_hits = max(1, int(min_hits))
-        self.encoder = encoder
-        self._raw_to_stable: dict[int, int] = {}
-        self._stable: dict[int, dict] = {}  # sid -> frame, wx, wy, feat
-        self._raw_hits: dict[int, int] = {}
-        self._raw_last_frame: dict[int, int] = {}
-        self._next_id = 1
-
-    def _expire(self, frame_idx: int) -> None:
-        # Keep stable ID records for the whole session so a returning person
-        # can rematch; do not recycle numbers. Only drop stale *pending* hits
-        # and break raw→stable links for tracker IDs not seen recently.
-        stale_raw = [
-            raw
-            for raw, last in self._raw_last_frame.items()
-            if frame_idx - int(last) > self.max_gap_frames
-        ]
-        for raw in stale_raw:
-            self._raw_hits.pop(raw, None)
-            self._raw_last_frame.pop(raw, None)
-            self._raw_to_stable.pop(raw, None)
-
-    def _alloc_stable_id(self) -> int:
-        sid = self._next_id
-        self._next_id += 1
-        return sid
-
-    @staticmethod
-    def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
-        return float(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5)
-
-    @staticmethod
-    def appearance_feat(
-        frame: np.ndarray,
-        xyxy: tuple[int, int, int, int],
-        encoder=None,
-    ) -> np.ndarray | None:
-        """Appearance vector: Re-ID embedding if encoder given, else HSV torso hist."""
-        if encoder is not None:
-            return encoder.embed_xyxy(frame, xyxy)
-        h, w = frame.shape[:2]
-        x1, y1, x2, y2 = xyxy
-        x1, y1 = max(0, int(x1)), max(0, int(y1))
-        x2, y2 = min(w - 1, int(x2)), min(h - 1, int(y2))
-        if x2 - x1 < 8 or y2 - y1 < 16:
-            return None
-        # Focus on torso (skip head/feet) — more stable for clothing cue.
-        y_a = y1 + int(0.20 * (y2 - y1))
-        y_b = y1 + int(0.75 * (y2 - y1))
-        x_a = x1 + int(0.15 * (x2 - x1))
-        x_b = x1 + int(0.85 * (x2 - x1))
-        crop = frame[y_a:y_b, x_a:x_b]
-        if crop.size == 0:
-            return None
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-        hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
-        n = float(np.linalg.norm(hist))
-        if n < 1e-6:
-            return None
-        return hist / n
-
-    @staticmethod
-    def _appear_sim(a: np.ndarray | None, b: np.ndarray | None) -> float:
-        if a is None or b is None:
-            return 0.0
-        return float(np.dot(a, b))
-
-    def _reach_limit_cm(self, gap_frames: int) -> float:
-        gap_s = max(0, gap_frames) / self.fps
-        # reachable distance + small localization slack
-        return min(self.max_dist_cm, self.max_speed_cm_s * gap_s + 60.0)
-
-    def apply(
-        self,
-        dets: list[dict],
-        frame_idx: int,
-        frame: np.ndarray | None = None,
-    ) -> list[dict]:
-        self._expire(frame_idx)
-        if not dets:
-            return dets
-
-        work = list(dets)
-        # Demo-only shortcut (explicit --single-person). Off by default.
-        if self.single_person and len(work) > 1:
-            if self._stable:
-                sid, meta = max(self._stable.items(), key=lambda kv: kv[1]["frame"])
-                anchor = (float(meta["wx"]), float(meta["wy"]))
-                work = [min(work, key=lambda d: self._dist(d.get("world", (1e9, 1e9)), anchor))]
-            else:
-                work = [max(work, key=lambda d: float(d.get("conf", 0.0)))]
-
-        feats: list[np.ndarray | None] = []
-        for det in work:
-            if frame is None:
-                feats.append(None)
-            else:
-                feats.append(
-                    self.appearance_feat(frame, det["xyxy"], encoder=self.encoder)
-                )
-
-        assigned: dict[int, int] = {}
-        used_sids: set[int] = set()
-
-        # 1) Keep raw tracker ID links while that raw ID is still alive.
-        for i, det in enumerate(work):
-            raw = det.get("track_id")
-            if raw is None:
-                continue
-            sid = self._raw_to_stable.get(int(raw))
-            if sid is not None and sid in self._stable and sid not in used_sids:
-                assigned[i] = sid
-                used_sids.add(sid)
-
-        # 2) Rematch by motion reachability + appearance (no one-person prior).
-        unmatched_i = [i for i in range(len(work)) if i not in assigned]
-        candidates = [sid for sid in self._stable if sid not in used_sids]
-        pairs: list[tuple[float, int, int]] = []
-        for i in unmatched_i:
-            world = work[i].get("world")
-            if world is None:
-                continue
-            for sid in candidates:
-                meta = self._stable[sid]
-                gap = frame_idx - int(meta["frame"])
-                dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
-                limit = self._reach_limit_cm(gap)
-                if self.single_person and len(work) == 1 and len(candidates) == 1:
-                    limit = max(limit, self.max_dist_cm)
-                if dist > limit:
-                    continue
-                sim = self._appear_sim(feats[i], meta.get("feat"))
-                # Short gap + close on floor: motion alone is enough.
-                short_close = gap <= 15 and dist <= 100.0
-                if not short_close and sim < self.appear_thresh:
-                    continue
-                # Lower cost is better: prefer closer + more similar.
-                cost = dist / max(limit, 1.0) + (1.0 - sim)
-                pairs.append((cost, i, sid))
-        pairs.sort()
-        for _cost, i, sid in pairs:
-            if i in assigned or sid in used_sids:
-                continue
-            assigned[i] = sid
-            used_sids.add(sid)
-
-        # 3) Confirm new tracks before issuing a recycled stable ID.
-        out: list[dict] = []
-        seen_raw: set[int] = set()
-        for i, det in enumerate(work):
-            d = dict(det)
-            raw = d.get("track_id")
-            if raw is not None:
-                raw = int(raw)
-                seen_raw.add(raw)
-                self._raw_last_frame[raw] = frame_idx
-
-            if i in assigned:
-                sid = assigned[i]
-            elif (
-                self.single_person
-                and len(work) == 1
-                and len(self._stable) == 1
-                and not used_sids
-            ):
-                sid = next(iter(self._stable))
-            else:
-                # Probation: need several consecutive hits before first ID.
-                if raw is None:
-                    # No tracker id (image / --no-track path): show immediately.
-                    hits = self.min_hits
-                else:
-                    prev_last = self._raw_last_frame.get(raw)
-                    # If this raw was missing last update, restart probation
-                    # (handled by only incrementing when continuously seen via
-                    # consecutive apply calls that include this raw).
-                    hits = self._raw_hits.get(raw, 0) + 1
-                    self._raw_hits[raw] = hits
-                if hits < self.min_hits:
-                    continue
-                sid = self._alloc_stable_id()
-
-            if raw is not None:
-                self._raw_to_stable[raw] = sid
-                self._raw_hits[raw] = max(self._raw_hits.get(raw, 0), self.min_hits)
-            wx, wy = d.get("world", (0.0, 0.0))
-            prev = self._stable.get(sid, {})
-            feat = feats[i]
-            old = prev.get("feat")
-            if feat is not None and old is not None:
-                feat = 0.8 * old + 0.2 * feat
-                n = float(np.linalg.norm(feat))
-                if n > 1e-6:
-                    feat = feat / n
-            elif feat is None:
-                feat = old
-            self._stable[sid] = {
-                "frame": frame_idx,
-                "wx": float(wx),
-                "wy": float(wy),
-                "feat": feat,
-            }
-            d["raw_track_id"] = raw
-            d["track_id"] = sid
-            out.append(d)
-
-        # Reset hit streak for raw IDs not in this update (broken continuity).
-        for raw in list(self._raw_hits.keys()):
-            if raw not in seen_raw and raw not in self._raw_to_stable:
-                self._raw_hits[raw] = 0
-        return out
-
-
 def detect_and_locate(
     frame: np.ndarray,
     model: YOLO,
@@ -869,7 +650,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--quiet",
         action="store_true",
-        help="do not print per-detection lines (less console lag)",
+        help="do not print per-detection lines (ID change log still prints unless --no-log-id)",
+    )
+    p.add_argument(
+        "--log-id",
+        dest="log_id",
+        action="store_true",
+        default=True,
+        help="print ID set changes with timestamps (default on)",
+    )
+    p.add_argument(
+        "--no-log-id",
+        dest="log_id",
+        action="store_false",
+        help="disable ID-change timestamp logs",
     )
     p.add_argument(
         "--single-person",
@@ -881,33 +675,44 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--id-max-dist",
         type=float,
-        default=320.0,
+        default=400.0,
         help="cap on floor rematch distance (cm)",
     )
     p.add_argument(
         "--id-max-gap",
         type=int,
-        default=250,
-        help="max frames to remember a stable ID after last sighting",
+        default=400,
+        help="max frames before dropping pending raw-ID hit counters",
     )
     p.add_argument(
         "--id-max-speed",
         type=float,
-        default=180.0,
+        default=200.0,
         help="max walk speed (cm/s) used to limit rematch distance by time gap",
     )
     p.add_argument(
         "--appear-thresh",
         type=float,
-        default=0.45,
-        help="min appearance cosine similarity (0-1) to reuse an ID after tracker switch",
+        default=0.28,
+        help="Re-ID cosine thresh to reuse an existing ID (primary; leave-time independent)",
     )
     p.add_argument(
         "--min-hits",
         type=int,
-        default=3,
-        help="new person must appear this many detect runs before getting an ID "
-        "(hides one-frame false positives; default 3)",
+        default=5,
+        help="frames that must FAIL gallery match before minting a NEW ID (default 5)",
+    )
+    p.add_argument(
+        "--id-coast",
+        type=int,
+        default=60,
+        help="keep last IDs for this many frames when detection briefly drops (default 60)",
+    )
+    p.add_argument(
+        "--id-sticky",
+        type=int,
+        default=45,
+        help="short-gap motion fallback only when Re-ID is weak (default 45)",
     )
     p.add_argument(
         "--reid",
@@ -1090,6 +895,8 @@ def main() -> None:
         single_person=args.single_person,
         min_hits=args.min_hits,
         encoder=reid_encoder,
+        coast_frames=args.id_coast,
+        sticky_frames=args.id_sticky,
     )
     if args.track:
         if args.single_person:
@@ -1097,14 +904,17 @@ def main() -> None:
         else:
             appear_mode = "Re-ID" if reid_encoder is not None else "HSV"
             print(
-                f"ID 穩定層：移動距離上限 + {appear_mode}"
-                f"（appear≥{args.appear_thresh:.2f}，max_speed={args.id_max_speed:.0f}cm/s，"
-                f"min_hits={args.min_hits}）"
+                f"ID 穩定層：{appear_mode} 圖庫為主（離開多久皆可接回）；"
+                f"appear≥{args.appear_thresh:.2f}，"
+                f"新 ID 需連續 {args.min_hits} 次對不上圖庫才發號；"
+                f"同分時優先較舊 ID。"
             )
         print(
             f"誤檢過濾：conf≥{args.conf}，min_bottom={args.min_bottom_ratio}，"
             f"min_aspect={args.min_aspect}，min_h={args.min_h_ratio}"
         )
+        if args.log_id:
+            print("ID 變化會印 [ID-CHANGE]（時刻 / elapsed / video / frame）。")
 
     try:
         frame_idx = 0
@@ -1112,6 +922,7 @@ def main() -> None:
         last_timing: tuple[float, float] | None = None
         last_id_key: tuple[int, ...] | None = None
         t_play0 = time.perf_counter()
+        log_fps = video_fps if (is_file_video or use_latest) else 20.0
         while True:
             if reader is not None:
                 ok, frame = reader.read()
@@ -1166,16 +977,16 @@ def main() -> None:
                 grid_cache=grid_cache,
                 out_margin=args.out_margin,
             )
-            if run_detect and not args.quiet:
+            if run_detect and det_kw.get("track") and args.log_id:
                 id_key = tuple(
                     sorted(d["track_id"] for d in last_dets if d.get("track_id") is not None)
                 )
-                if id_key != last_id_key or logs:
-                    if id_key != last_id_key:
-                        print(f"[frame {frame_idx}] active IDs: {list(id_key) if id_key else '—'}")
-                        last_id_key = id_key
-                    for line in logs:
-                        print(line)
+                if id_key != last_id_key:
+                    log_id_change(frame_idx, log_fps, t_play0, last_id_key, id_key)
+                    last_id_key = id_key
+            if run_detect and not args.quiet:
+                for line in logs:
+                    print(line)
             show_fixed_window(cam_win, vis)
             show_grid_window(grid_win, grid)
 
