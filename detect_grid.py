@@ -715,6 +715,22 @@ def parse_args() -> argparse.Namespace:
         help="short-gap motion fallback only when Re-ID is weak (default 45)",
     )
     p.add_argument(
+        "--max-prototypes",
+        type=int,
+        default=4,
+        help="appearance looks kept per ID (jacket on/off etc.; default 4)",
+    )
+    p.add_argument(
+        "--gallery-dir",
+        default=str(Path(__file__).resolve().parent / "test" / "reid_gallery"),
+        help="save per-ID appearance crop images here (cleared each run)",
+    )
+    p.add_argument(
+        "--no-gallery-dump",
+        action="store_true",
+        help="do not save appearance gallery crop images",
+    )
+    p.add_argument(
         "--reid",
         dest="reid",
         action="store_true",
@@ -897,6 +913,8 @@ def main() -> None:
         encoder=reid_encoder,
         coast_frames=args.id_coast,
         sticky_frames=args.id_sticky,
+        max_prototypes=args.max_prototypes,
+        gallery_dir=None if args.no_gallery_dump else args.gallery_dir,
     )
     if args.track:
         if args.single_person:
@@ -906,9 +924,12 @@ def main() -> None:
             print(
                 f"ID 穩定層：{appear_mode} 圖庫為主（離開多久皆可接回）；"
                 f"appear≥{args.appear_thresh:.2f}，"
+                f"每人最多 {args.max_prototypes} 種外貌原型（換裝可並存）；"
                 f"新 ID 需連續 {args.min_hits} 次對不上圖庫才發號；"
                 f"同分時優先較舊 ID。"
             )
+        if not args.no_gallery_dump:
+            print(f"外貌圖庫裁切圖：{args.gallery_dir}（每次重跑會清空重存）")
         print(
             f"誤檢過濾：conf≥{args.conf}，min_bottom={args.min_bottom_ratio}，"
             f"min_aspect={args.min_aspect}，min_h={args.min_h_ratio}"

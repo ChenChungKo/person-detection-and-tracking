@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -10,10 +13,12 @@ class StableIdMapper:
     """Remap ByteTrack IDs using a session appearance gallery.
 
     Leave duration is unrestricted within one run. Reappearing people are
-    rebound by Re-ID/HSV similarity. A **new** ID is issued only after several
-    confirmed hits still fail the gallery (avoids one bad crop creating ID2/ID3
-    that later pollutes matching). Among several gallery hits, the **oldest**
-    ID wins so duplicates collapse toward the first identity.
+    rebound by Re-ID/HSV similarity. Each person keeps **multiple appearance
+    prototypes** (e.g. with / without jacket) so clothing change during a
+    continuous track still rematches after leave/re-enter.
+
+    A **new** ID is issued only after several confirmed hits still fail the
+    gallery. Among several gallery hits, the **oldest** ID wins.
     """
 
     def __init__(
@@ -29,6 +34,10 @@ class StableIdMapper:
         coast_frames: int = 60,
         sticky_frames: int = 45,
         soft_appear_thresh: float | None = None,
+        max_prototypes: int = 4,
+        proto_new_thresh: float | None = None,
+        gallery_dir: str | Path | None = None,
+        gallery_latest_every: int = 20,
     ) -> None:
         self.max_dist_cm = max_dist_cm
         self.max_gap_frames = max_gap_frames
@@ -44,6 +53,14 @@ class StableIdMapper:
         self.encoder = encoder
         self.coast_frames = max(0, int(coast_frames))
         self.sticky_frames = max(0, int(sticky_frames))
+        self.max_prototypes = max(1, int(max_prototypes))
+        # If current look is below this vs all stored looks → add a new prototype
+        # (clothing change), instead of only EMA-washing the old jacket look away.
+        self.proto_new_thresh = (
+            appear_thresh + 0.08 if proto_new_thresh is None else proto_new_thresh
+        )
+        self.gallery_latest_every = max(1, int(gallery_latest_every))
+        self.gallery_dir = Path(gallery_dir) if gallery_dir else None
         self._raw_to_stable: dict[int, int] = {}
         self._stable: dict[int, dict] = {}
         self._raw_hits: dict[int, int] = {}
@@ -53,6 +70,11 @@ class StableIdMapper:
         self._next_id = 1
         self._last_out: list[dict] = []
         self._last_out_frame = 0
+        self._gallery_latest_at: dict[int, int] = {}
+        if self.gallery_dir is not None:
+            if self.gallery_dir.exists():
+                shutil.rmtree(self.gallery_dir)
+            self.gallery_dir.mkdir(parents=True, exist_ok=True)
 
     def _expire(self, frame_idx: int) -> None:
         stale_raw = [
@@ -122,6 +144,88 @@ class StableIdMapper:
         n = float(np.linalg.norm(feat))
         return feat / n if n > 1e-6 else old
 
+    def _proto_list(self, meta: dict) -> list[np.ndarray]:
+        protos = meta.get("feats")
+        if isinstance(protos, list) and protos:
+            return [p for p in protos if p is not None]
+        feat = meta.get("feat")
+        return [feat] if feat is not None else []
+
+    def _best_proto_sim(self, feat: np.ndarray | None, meta: dict) -> float:
+        if feat is None:
+            return 0.0
+        best = 0.0
+        for p in self._proto_list(meta):
+            best = max(best, self._appear_sim(feat, p))
+        return best
+
+    def _update_prototypes(
+        self, meta: dict, new_feat: np.ndarray | None
+    ) -> tuple[dict, int | None, bool]:
+        """EMA nearest prototype, or append a new look on clothing change.
+
+        Returns (meta, proto_index_to_snapshot, is_new_or_replaced).
+        """
+        if new_feat is None:
+            return meta, None, False
+        protos = list(self._proto_list(meta))
+        if not protos:
+            meta["feats"] = [new_feat]
+            meta["feat"] = new_feat
+            return meta, 0, True
+
+        sims = [self._appear_sim(new_feat, p) for p in protos]
+        best_i = int(np.argmax(sims))
+        best_sim = float(sims[best_i])
+
+        if best_sim >= self.proto_new_thresh:
+            protos[best_i] = self._blend_feat(protos[best_i], new_feat, alpha=0.85)
+            snap_i, is_new = best_i, False
+        else:
+            # Appearance shifted a lot (e.g. jacket off) while still same track:
+            # keep the old look AND store the new one.
+            if len(protos) < self.max_prototypes:
+                protos.append(new_feat)
+                snap_i, is_new = len(protos) - 1, True
+            else:
+                # Replace the prototype least similar to the new look.
+                worst_i = int(np.argmin(sims))
+                protos[worst_i] = new_feat
+                snap_i, is_new = worst_i, True
+
+        meta["feats"] = protos
+        meta["feat"] = protos[best_i] if best_sim >= self.proto_new_thresh else protos[-1]
+        return meta, snap_i, is_new
+
+    @staticmethod
+    def _crop_person(
+        frame: np.ndarray, xyxy: tuple[int, int, int, int]
+    ) -> np.ndarray | None:
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in xyxy]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+        if x2 - x1 < 8 or y2 - y1 < 16:
+            return None
+        return frame[y1:y2, x1:x2].copy()
+
+    def _save_gallery_image(
+        self,
+        sid: int,
+        name: str,
+        frame: np.ndarray | None,
+        xyxy: tuple[int, int, int, int] | None,
+    ) -> None:
+        if self.gallery_dir is None or frame is None or xyxy is None:
+            return
+        crop = self._crop_person(frame, xyxy)
+        if crop is None:
+            return
+        folder = self.gallery_dir / f"ID{sid:03d}"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        cv2.imwrite(str(path), crop)
+
     def _reach_limit_cm(self, gap_frames: int) -> float:
         gap_s = max(0, gap_frames) / self.fps
         return min(self.max_dist_cm, self.max_speed_cm_s * gap_s + 80.0)
@@ -129,17 +233,16 @@ class StableIdMapper:
     def _gallery_hits(
         self, feat: np.ndarray | None, used_sids: set[int], thresh: float
     ) -> list[tuple[float, int]]:
-        """Return [(sim, sid), ...] with sim >= thresh, oldest sid preferred later."""
+        """Return [(sim, sid), ...] with max-over-prototypes sim >= thresh."""
         hits: list[tuple[float, int]] = []
         if feat is None:
             return hits
         for sid, meta in self._stable.items():
             if sid in used_sids:
                 continue
-            sim = self._appear_sim(feat, meta.get("feat"))
+            sim = self._best_proto_sim(feat, meta)
             if sim >= thresh:
                 hits.append((sim, sid))
-        # Highest sim first; tie → older (smaller) sid.
         hits.sort(key=lambda t: (-t[0], t[1]))
         return hits
 
@@ -149,7 +252,6 @@ class StableIdMapper:
         hits = self._gallery_hits(feat, used_sids, thresh)
         if not hits:
             return None, -1.0
-        # Among near-best sims, prefer oldest ID to collapse duplicates.
         best_sim = hits[0][0]
         near = [sid for sim, sid in hits if sim >= best_sim - 0.03]
         sid = min(near)
@@ -206,7 +308,7 @@ class StableIdMapper:
             gal_sid, gal_sim = self._pick_gallery_id(
                 feats[i], used_sids - {sid}, self.appear_thresh
             )
-            cur_sim = self._appear_sim(feats[i], self._stable[sid].get("feat"))
+            cur_sim = self._best_proto_sim(feats[i], self._stable[sid])
             if (
                 gal_sid is not None
                 and gal_sid < sid
@@ -224,7 +326,7 @@ class StableIdMapper:
         for i in range(len(work)):
             if i in assigned:
                 continue
-            sid, sim = self._pick_gallery_id(feats[i], used_sids, self.appear_thresh)
+            sid, _sim = self._pick_gallery_id(feats[i], used_sids, self.appear_thresh)
             if sid is not None:
                 assigned[i] = sid
                 used_sids.add(sid)
@@ -270,27 +372,23 @@ class StableIdMapper:
             if i in assigned:
                 sid = assigned[i]
             else:
-                # Soft gallery: probably same person → bind, never mint new yet.
                 probe = feats[i]
                 if raw is not None and raw in self._pending_feat:
                     probe = self._pending_feat[raw]
-                soft_sid, soft_sim = self._pick_gallery_id(
+                soft_sid, _soft_sim = self._pick_gallery_id(
                     probe, used_sids, self.soft_appear_thresh
                 )
                 if soft_sid is not None:
                     sid = soft_sid
                 else:
-                    # Need several misses against gallery before a brand-new ID.
                     if raw is None:
                         hits = self.min_hits
                     else:
                         hits = self._raw_hits.get(raw, 0) + 1
                         self._raw_hits[raw] = hits
                     if hits < self.min_hits:
-                        # Not confirmed as new — hide this frame (coast may cover).
                         continue
-                    # Final gallery check with accumulated pending feat.
-                    final_sid, final_sim = self._pick_gallery_id(
+                    final_sid, _final_sim = self._pick_gallery_id(
                         probe, used_sids, self.soft_appear_thresh
                     )
                     if final_sid is not None:
@@ -303,15 +401,20 @@ class StableIdMapper:
                 self._raw_hits[raw] = max(self._raw_hits.get(raw, 0), self.min_hits)
                 self._pending_feat.pop(raw, None)
             wx, wy = d.get("world", (0.0, 0.0))
-            prev = self._stable.get(sid, {})
-            feat = self._blend_feat(prev.get("feat"), feats[i], alpha=0.85)
-            self._stable[sid] = {
-                "frame": frame_idx,
-                "wx": float(wx),
-                "wy": float(wy),
-                "feat": feat,
-            }
+            prev = dict(self._stable.get(sid, {}))
+            prev, snap_i, is_new_proto = self._update_prototypes(prev, feats[i])
+            prev["frame"] = frame_idx
+            prev["wx"] = float(wx)
+            prev["wy"] = float(wy)
+            self._stable[sid] = prev
             used_sids.add(sid)
+            xyxy = d.get("xyxy")
+            if is_new_proto and snap_i is not None:
+                self._save_gallery_image(sid, f"proto_{snap_i}.jpg", frame, xyxy)
+            last_g = self._gallery_latest_at.get(sid, -10**9)
+            if frame_idx - last_g >= self.gallery_latest_every:
+                self._save_gallery_image(sid, "latest.jpg", frame, xyxy)
+                self._gallery_latest_at[sid] = frame_idx
             d["raw_track_id"] = raw
             d["track_id"] = sid
             out.append(d)
