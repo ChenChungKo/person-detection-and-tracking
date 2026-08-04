@@ -1,8 +1,8 @@
-# Indoor CCTV: long re-find window; prefer reactivating over new IDs
+# Indoor CCTV: fewer false tracks; longer re-find for real persons
 tracker_type: bytetrack
-track_high_thresh: 0.2
-track_low_thresh: 0.05
-new_track_thresh: 0.55
-track_buffer: 180
+track_high_thresh: 0.35
+track_low_thresh: 0.1
+new_track_thresh: 0.65
+track_buffer: 120
 match_thresh: 0.8
 fuse_score: True

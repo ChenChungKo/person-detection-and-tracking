@@ -145,19 +145,26 @@ python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --
 
 - **不預設假設畫面只有同一人**；`--single-person` 僅供 demo，預設關閉  
 - 畫面標籤**只顯示 `ID1` / `ID2`…**（格子座標改寫在 console）  
-- Tracker 設定：`trackers/bytetrack_stable.yaml`  
+- **誤檢抑制**：人框幾何過濾（拒螢幕／過短框）、`conf` 預設 0.50、新目標需連續 `--min-hits 3` 次才發 ID／顯示（避免一閃誤檢佔號）  
+- **ID 不回收**：號碼只往上加；離開的人靠地板距離＋外貌接回原 ID（同一程式執行期間記住）  
+- **外貌**：預設 **YOLO26 Re-ID**（`yolo26n-reid.onnx`，首次自動下載）；`--no-reid` 才退回 HSV 衣服顏色  
+- Tracker 設定：`trackers/bytetrack_stable.yaml`（可改 `--tracker trackers/botsort_reid.yaml` 讓短時追蹤也用 Re-ID）  
 - 本機 `.mp4` 預設**即時跟播**（推論慢會丟幀）；要逐幀慢播加 `--no-realtime`  
 - 關閉追蹤：`--no-track`
 
 ```powershell
 python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet
-# 較嚴格才接回舊 ID（較易發新號）
-python detect_grid.py --source test/test.mp4 --appear-thresh 0.65 --quiet
+# RTSP
+python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref auto --cell-hold 2 --quiet
+# 較強 Re-ID / 短時追蹤也開 Re-ID
+python detect_grid.py --source test/test.mp4 --reid-model yolo26s-reid.onnx --tracker trackers/botsort_reid.yaml --quiet
+# 退回舊的 HSV 顏色
+python detect_grid.py --source test/test.mp4 --no-reid --quiet
 ```
 
-常用參數：`--appear-thresh`（外貌門檻）、`--id-max-speed`（cm/s）、`--id-max-dist` / `--id-max-gap`。
+常用參數：`--reid-model`、`--appear-thresh`、`--conf`、`--min-hits`、`--out-margin`。
 
-深度學習 Person Re-ID（跨長時間／換裝）仍列為後續工作。
+換裝／極端光照仍可能失敗；更重的跨鏡頭 Re-ID 訓練可視需求再加。
 
 ### RTSP 降延遲（自動啟用）
 
@@ -210,8 +217,8 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 |------|------|
 | Homography | **v2** 棋盤格（`calibration/homography.json`＝v2） |
 | 格子範圍 | **全格**（`--valid-xmin 0`，不畫左側桌區灰格） |
-| 偵測 | `yolo26s.pt`、`--ref auto` |
-| 追蹤 | **ByteTrack** + 地板距離／外貌接回 ID（預設開；畫面只顯示 `ID`） |
+| 偵測 | `yolo26s.pt`、`--ref auto`、`--conf 0.50` |
+| 追蹤 | **ByteTrack** + 地板距離／**YOLO26 Re-ID** 接回 ID；`--min-hits 3` |
 | 即時／效能 | 預設 `--stride 2` + 本機影片即時丟幀；關追蹤可 `--stride 3` |
 
 建議指令：
@@ -252,9 +259,9 @@ v1 對照：
 
 ## 狀態備註（2026-07-31）
 
-- 已完成：YOLO26 偵測、**ByteTrack + 地板移動距離／外貌相似接回 ID**（預設不假設單人；畫面只顯示 ID）、影片／RTSP 腳點格子定位、Homography **v1（手動）／v2（棋盤格）**、全格顯示、RTSP 降延遲、跳幀、本機即時跟播、格子防抖、點擊量測真實誤差  
+- 已完成：YOLO26 偵測、**ByteTrack + 地板距離／YOLO26 Re-ID 接回 ID**（預設不假設單人、ID 不回收、畫面只顯示 ID）、誤檢過濾、影片／RTSP 腳點格子定位、Homography **v1（手動）／v2（棋盤格）**、全格顯示、RTSP 降延遲、跳幀、本機即時跟播、格子防抖、OUT 容差、點擊量測真實誤差  
 - 目前最佳：見上方「目前最佳設定」  
-- 未完成／暫緩：深度學習 Person Re-ID、鏡頭畸變校正接入管線  
+- 未完成／暫緩：換裝／跨鏡頭專用 Re-ID 微調、鏡頭畸變校正接入管線  
 
 ## 文件
 

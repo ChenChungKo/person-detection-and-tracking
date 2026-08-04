@@ -175,26 +175,20 @@ def extract_foot_detections(
             continue
         x1, y1, x2, y2 = boxes.xyxy[i].tolist()
         track_id = int(boxes.id[i].item()) if has_ids else None
-        # Tracked boxes: keep ID continuity; only drop tiny junk.
-        # Untracked detect: keep stricter desk/monitor FP filter.
-        if track_id is None:
-            if not is_plausible_person_box(
-                x1,
-                y1,
-                x2,
-                y2,
-                frame_h,
-                frame_w,
-                min_h_ratio=min_h_ratio,
-                min_aspect=min_aspect,
-                min_bottom_ratio=min_bottom_ratio,
-            ):
-                continue
-        else:
-            bw = max(1.0, x2 - x1)
-            bh = max(1.0, y2 - y1)
-            if bh < 0.04 * frame_h or (bw * bh) < 0.002 * frame_w * frame_h:
-                continue
+        # Same geometry gate for detect and track — tracked FPs (monitor/chair)
+        # used to skip this and steal stable IDs.
+        if not is_plausible_person_box(
+            x1,
+            y1,
+            x2,
+            y2,
+            frame_h,
+            frame_w,
+            min_h_ratio=min_h_ratio,
+            min_aspect=min_aspect,
+            min_bottom_ratio=min_bottom_ratio,
+        ):
+            continue
         ref_x, ref_y, used = estimate_ref_point(
             x1, y1, x2, y2, frame_h, mode, aspect, truncate_ratio
         )
@@ -415,7 +409,12 @@ class StableIdMapper:
     Does NOT assume \"there is only one person\". A lost ID is reused only when
     a new detection is both:
       1) reachable in floor space given elapsed time and max walking speed, and
-      2) similar in appearance (HSV histogram of the torso crop).
+      2) similar in appearance (YOLO26 Re-ID embedding by default; HSV fallback).
+
+    New tracks must appear for ``min_hits`` consecutive mapper updates before
+    they receive a stable ID (and are shown), so one-frame FPs do not steal IDs.
+    Stable IDs are never recycled in-session: a leaver may return and rematch
+    to the same ID via floor distance + appearance.
     """
 
     def __init__(
@@ -426,6 +425,8 @@ class StableIdMapper:
         appear_thresh: float = 0.50,
         fps: float = 20.0,
         single_person: bool = False,
+        min_hits: int = 3,
+        encoder=None,
     ) -> None:
         self.max_dist_cm = max_dist_cm
         self.max_gap_frames = max_gap_frames
@@ -433,29 +434,46 @@ class StableIdMapper:
         self.appear_thresh = appear_thresh
         self.fps = max(1.0, fps)
         self.single_person = single_person  # optional demo-only; default off
+        self.min_hits = max(1, int(min_hits))
+        self.encoder = encoder
         self._raw_to_stable: dict[int, int] = {}
         self._stable: dict[int, dict] = {}  # sid -> frame, wx, wy, feat
+        self._raw_hits: dict[int, int] = {}
+        self._raw_last_frame: dict[int, int] = {}
         self._next_id = 1
 
     def _expire(self, frame_idx: int) -> None:
-        dead = [
-            sid
-            for sid, meta in self._stable.items()
-            if frame_idx - int(meta["frame"]) > self.max_gap_frames
+        # Keep stable ID records for the whole session so a returning person
+        # can rematch; do not recycle numbers. Only drop stale *pending* hits
+        # and break raw→stable links for tracker IDs not seen recently.
+        stale_raw = [
+            raw
+            for raw, last in self._raw_last_frame.items()
+            if frame_idx - int(last) > self.max_gap_frames
         ]
-        for sid in dead:
-            self._stable.pop(sid, None)
-        self._raw_to_stable = {
-            raw: sid for raw, sid in self._raw_to_stable.items() if sid in self._stable
-        }
+        for raw in stale_raw:
+            self._raw_hits.pop(raw, None)
+            self._raw_last_frame.pop(raw, None)
+            self._raw_to_stable.pop(raw, None)
+
+    def _alloc_stable_id(self) -> int:
+        sid = self._next_id
+        self._next_id += 1
+        return sid
 
     @staticmethod
     def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
         return float(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5)
 
     @staticmethod
-    def appearance_feat(frame: np.ndarray, xyxy: tuple[int, int, int, int]) -> np.ndarray | None:
-        """Compact torso color histogram (no learned Re-ID model required)."""
+    def appearance_feat(
+        frame: np.ndarray,
+        xyxy: tuple[int, int, int, int],
+        encoder=None,
+    ) -> np.ndarray | None:
+        """Appearance vector: Re-ID embedding if encoder given, else HSV torso hist."""
+        if encoder is not None:
+            return encoder.embed_xyxy(frame, xyxy)
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = xyxy
         x1, y1 = max(0, int(x1)), max(0, int(y1))
@@ -514,7 +532,9 @@ class StableIdMapper:
             if frame is None:
                 feats.append(None)
             else:
-                feats.append(self.appearance_feat(frame, det["xyxy"]))
+                feats.append(
+                    self.appearance_feat(frame, det["xyxy"], encoder=self.encoder)
+                )
 
         assigned: dict[int, int] = {}
         used_sids: set[int] = set()
@@ -561,11 +581,17 @@ class StableIdMapper:
             assigned[i] = sid
             used_sids.add(sid)
 
-        # 3) New IDs for genuine new persons / failed rematch.
+        # 3) Confirm new tracks before issuing a recycled stable ID.
         out: list[dict] = []
+        seen_raw: set[int] = set()
         for i, det in enumerate(work):
             d = dict(det)
             raw = d.get("track_id")
+            if raw is not None:
+                raw = int(raw)
+                seen_raw.add(raw)
+                self._raw_last_frame[raw] = frame_idx
+
             if i in assigned:
                 sid = assigned[i]
             elif (
@@ -576,11 +602,24 @@ class StableIdMapper:
             ):
                 sid = next(iter(self._stable))
             else:
-                sid = self._next_id
-                self._next_id += 1
+                # Probation: need several consecutive hits before first ID.
+                if raw is None:
+                    # No tracker id (image / --no-track path): show immediately.
+                    hits = self.min_hits
+                else:
+                    prev_last = self._raw_last_frame.get(raw)
+                    # If this raw was missing last update, restart probation
+                    # (handled by only incrementing when continuously seen via
+                    # consecutive apply calls that include this raw).
+                    hits = self._raw_hits.get(raw, 0) + 1
+                    self._raw_hits[raw] = hits
+                if hits < self.min_hits:
+                    continue
+                sid = self._alloc_stable_id()
 
             if raw is not None:
-                self._raw_to_stable[int(raw)] = sid
+                self._raw_to_stable[raw] = sid
+                self._raw_hits[raw] = max(self._raw_hits.get(raw, 0), self.min_hits)
             wx, wy = d.get("world", (0.0, 0.0))
             prev = self._stable.get(sid, {})
             feat = feats[i]
@@ -601,6 +640,11 @@ class StableIdMapper:
             d["raw_track_id"] = raw
             d["track_id"] = sid
             out.append(d)
+
+        # Reset hit streak for raw IDs not in this update (broken continuity).
+        for raw in list(self._raw_hits.keys()):
+            if raw not in seen_raw and raw not in self._raw_to_stable:
+                self._raw_hits[raw] = 0
         return out
 
 
@@ -651,6 +695,24 @@ def detect_and_locate(
         wx, wy = image_to_world(h_mat, fx, fy)
         det["world"] = (wx, wy)
         det["cell"] = world_to_cell(wx, wy, margin_cm=out_margin)
+    # Drop floating FPs: box sits mid-frame but Homography shoots far outside.
+    frame_h = float(frame.shape[0])
+    cleaned: list[dict] = []
+    for det in dets:
+        _x1, _y1, _x2, y2 = det["xyxy"]
+        cell = det.get("cell")
+        wx, wy = det["world"]
+        far_out = cell is None and (
+            wy < -out_margin * 2
+            or wx < -out_margin * 2
+            or wx > 530.0 + out_margin * 2
+            or wy > 540.0 + out_margin * 2
+        )
+        elevated = y2 < 0.50 * frame_h
+        if far_out and elevated:
+            continue
+        cleaned.append(det)
+    dets = cleaned
     locate_ms = (time.perf_counter() - t1) * 1000.0
     return dets, detect_ms, locate_ms
 
@@ -705,7 +767,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--source", default=str(DEFAULT_IMAGE))
     p.add_argument("--calib", default=str(DEFAULT_CALIB))
     p.add_argument("--model", default="yolo26s.pt", help="Ultralytics detect weights (e.g. yolo26n/s/m.pt)")
-    p.add_argument("--conf", type=float, default=0.45, help="higher reduces desk/monitor FPs")
+    p.add_argument("--conf", type=float, default=0.50, help="higher reduces desk/monitor FPs")
     p.add_argument(
         "--ref",
         choices=["auto", "foot", "head_drop"],
@@ -724,13 +786,13 @@ def parse_args() -> argparse.Namespace:
         default=1.6,
         help="auto switches to head_drop when bbox_h/bbox_w < this",
     )
-    p.add_argument("--min-h-ratio", type=float, default=0.12, help="min box height / frame height")
-    p.add_argument("--min-aspect", type=float, default=1.15, help="min box height / width")
+    p.add_argument("--min-h-ratio", type=float, default=0.14, help="min box height / frame height")
+    p.add_argument("--min-aspect", type=float, default=1.25, help="min box height / width")
     p.add_argument(
         "--min-bottom-ratio",
         type=float,
-        default=0.28,
-        help="reject boxes whose bottom is above this frame-height ratio",
+        default=0.35,
+        help="reject boxes whose bottom is above this frame-height ratio (monitors)",
     )
     p.add_argument(
         "--valid-xmin",
@@ -837,8 +899,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--appear-thresh",
         type=float,
-        default=0.50,
-        help="min appearance similarity (0-1) to reuse an ID after tracker switch",
+        default=0.45,
+        help="min appearance cosine similarity (0-1) to reuse an ID after tracker switch",
+    )
+    p.add_argument(
+        "--min-hits",
+        type=int,
+        default=3,
+        help="new person must appear this many detect runs before getting an ID "
+        "(hides one-frame false positives; default 3)",
+    )
+    p.add_argument(
+        "--reid",
+        dest="reid",
+        action="store_true",
+        default=True,
+        help="use YOLO26 Re-ID embeddings for appearance (default on)",
+    )
+    p.add_argument(
+        "--no-reid",
+        dest="reid",
+        action="store_false",
+        help="fall back to HSV clothing histogram instead of Re-ID",
+    )
+    p.add_argument(
+        "--reid-model",
+        default="yolo26n-reid.onnx",
+        help="Ultralytics Re-ID model (e.g. yolo26n-reid.onnx / yolo26s-reid.onnx)",
     )
     return p.parse_args()
 
@@ -980,6 +1067,20 @@ def main() -> None:
 
     stabilizer = CellStabilizer(args.cell_hold)
     confirmed_cells: set[tuple[int, int]] = set()
+
+    reid_encoder = None
+    if args.track and args.reid:
+        try:
+            from reid_encoder import PersonReIDEncoder, resolve_reid_model
+
+            model_name = resolve_reid_model(args.reid_model)
+            print(f"載入 Re-ID：{model_name} …")
+            reid_encoder = PersonReIDEncoder(model_name)
+            print("Re-ID 就緒（外貌比對改用深度特徵，不再用 HSV 顏色）。")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Re-ID 載入失敗，改回 HSV：{exc}")
+            reid_encoder = None
+
     id_mapper = StableIdMapper(
         max_dist_cm=args.id_max_dist,
         max_gap_frames=args.id_max_gap,
@@ -987,15 +1088,23 @@ def main() -> None:
         appear_thresh=args.appear_thresh,
         fps=video_fps if is_file_video or use_latest else 20.0,
         single_person=args.single_person,
+        min_hits=args.min_hits,
+        encoder=reid_encoder,
     )
     if args.track:
         if args.single_person:
             print("ID 穩定層：單人強制接回（demo，非真實辨識）")
         else:
+            appear_mode = "Re-ID" if reid_encoder is not None else "HSV"
             print(
-                f"ID 穩定層：移動距離上限 + 外貌相似"
-                f"（appear≥{args.appear_thresh:.2f}，max_speed={args.id_max_speed:.0f}cm/s）"
+                f"ID 穩定層：移動距離上限 + {appear_mode}"
+                f"（appear≥{args.appear_thresh:.2f}，max_speed={args.id_max_speed:.0f}cm/s，"
+                f"min_hits={args.min_hits}）"
             )
+        print(
+            f"誤檢過濾：conf≥{args.conf}，min_bottom={args.min_bottom_ratio}，"
+            f"min_aspect={args.min_aspect}，min_h={args.min_h_ratio}"
+        )
 
     try:
         frame_idx = 0
