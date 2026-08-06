@@ -111,60 +111,30 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 
 ## 偵測 + 定位（腳點 → 格子）
 
-以 bbox 底邊中點為腳點；桌旁被擋時可用 `--ref auto` / `--ref head_drop`。
+以 bbox 底邊中點為腳點；桌旁被擋時可用 `--ref auto` / `--ref head_drop`。  
+測試影片：`test/test.mp4`。按 `q` 結束，`s` 存圖。
 
-**目前建議先用本機影片驗證定位**（較穩）：
+### 人物 ID（Stable-ID）
 
-```powershell
-python detect_grid.py --source test/test.mp4 --ref auto
-python detect_grid.py --source test/test.mp4 --ref foot
-python detect_grid.py --source test/test.mp4 --no-track --stride 3
-```
+管線：`YOLO26` → **ByteTrack**（短追蹤）→ **Stable-ID**（gallery 外貌 + 地板距離接回；同幀不共用 ID）。
 
-RTSP 即時範例：
-
-```powershell
-# 偵測 + 定位 + ID（預設）
-python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto --cell-hold 2
-
-# 只要定位、可跳幀加速
-python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto --no-track --stride 3 --cell-hold 2
-```
-
-- 畫面：人框 + 腳點 + **僅顯示 `ID`**（預設開追蹤；`--no-track` 關閉）；超出範圍才標 `ID OUT`
-- `OUT`：腳點世界座標遠超格子才標；預設允許 **45 cm** 邊界容差（`--out-margin`，約一格），避免 Homography／腳點誤差在邊緣誤判  
-- 格子視窗：右上角固定顯示上次 `detect`／`locate` 耗時（沒偵測到人也會保留上一次數值，不會消失／閃爍）
-- 按 `q` 結束，`s` 存圖  
-- **即時格子定位準度仍待修正**（本機影片較穩）
-
-測試影片：`test/test.mp4`
-
-### 人物 ID 追蹤（預設開啟）
-
-管線：`YOLO26 detect` → **ByteTrack**（短時關聯）→ **穩定 ID 層**（ByteTrack 換號後，用「可走到的地板距離 + 外貌相似」決定是否接回舊 ID）。
-
-- **不預設假設畫面只有同一人**；`--single-person` 僅供 demo，預設關閉  
-- 畫面標籤**只顯示 `ID1` / `ID2`…**（格子座標改寫在 console）  
-- **誤檢抑制**：人框幾何過濾（拒螢幕／過短框）、`conf` 預設 0.50、新目標需連續 `--min-hits 3` 次才發 ID／顯示（避免一閃誤檢佔號）  
-- **ID 不回收**：號碼只往上加；離開的人靠地板距離＋外貌接回原 ID（同一程式執行期間記住）  
-- **外貌**：預設 **YOLO26 Re-ID**（`yolo26n-reid.onnx`，首次自動下載）；`--no-reid` 才退回 HSV 衣服顏色  
-- Tracker 設定：`trackers/bytetrack_stable.yaml`（可改 `--tracker trackers/botsort_reid.yaml` 讓短時追蹤也用 Re-ID）  
-- 本機 `.mp4` 預設**即時跟播**（推論慢會丟幀）；要逐幀慢播加 `--no-realtime`  
-- 關閉追蹤：`--no-track`
+| 項目 | 說明 |
+|------|------|
+| Re-ID | `--reid-model osnet_ain`（建議）／`osnet`／`osnet_ibn`／YOLO26-ReID ONNX |
+| Gallery | `test/reid_gallery/ID00x/`（`first`／`latest`；雙人近距離時可能暫不寫圖） |
+| 發新號 | 須連續失敗 gallery（`--min-hits` 預設 8）才 mint，減少亂發 ID3／ID4 |
+| 顯示 | 畫面只標 `ID1`…；`--id-coast` 預設短，避免人走後框殘留 |
 
 ```powershell
-python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet
+# 建議（單人／test.mp4 較穩）
+python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --stride 2 --log-id
+
 # RTSP
-python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref auto --cell-hold 2 --quiet
-# 較強 Re-ID / 短時追蹤也開 Re-ID
-python detect_grid.py --source test/test.mp4 --reid-model yolo26s-reid.onnx --tracker trackers/botsort_reid.yaml --quiet
-# 退回舊的 HSV 顏色
-python detect_grid.py --source test/test.mp4 --no-reid --quiet
+$env:OPENCV_FFMPEG_CAPTURE_OPTIONS = "rtsp_transport;tcp"
+python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --stride 2
 ```
 
-常用參數：`--reid-model`、`--appear-thresh`、`--conf`、`--min-hits`、`--out-margin`。
-
-換裝／極端光照仍可能失敗；更重的跨鏡頭 Re-ID 訓練可視需求再加。
+BoT-SORT（`--tracker trackers/botsort_reid.yaml`）短追蹤只用 YOLO-ReID ONNX；Stable-ID 仍可用 `osnet_ain`。不要把 OSNet `.pth` 寫進 BoT-SORT yaml。
 
 ### RTSP 降延遲（自動啟用）
 
@@ -209,30 +179,20 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 - 這裡的「N 次」以**偵測次數**計算（跟 `--stride` 搭配時，只算真正跑 YOLO 的那幀，不受跳幀影響其穩定邏輯）
 - `export_demo_video.py` 也支援同名的 `--stride` / `--cell-hold`
 
-## 目前最佳設定（2026-07-31）
-
-經 RTSP／影片實測後，**目前建議預設組合**：
+## 目前建議設定（2026-08-06）
 
 | 項目 | 設定 |
 |------|------|
-| Homography | **v2** 棋盤格（`calibration/homography.json`＝v2） |
-| 格子範圍 | **全格**（`--valid-xmin 0`，不畫左側桌區灰格） |
-| 偵測 | `yolo26s.pt`、`--ref auto`、`--conf 0.50` |
-| 追蹤 | **ByteTrack** + 地板距離／**YOLO26 Re-ID** 接回 ID；`--min-hits 3` |
-| 即時／效能 | 預設 `--stride 2` + 本機影片即時丟幀；關追蹤可 `--stride 3` |
-
-建議指令：
+| Homography | **v2**（`calibration/homography.json`） |
+| 偵測 | `yolo26s.pt`、`--ref auto`、`--conf 0.50`、`--cell-hold 2` |
+| ID | ByteTrack + Stable-ID；`--reid-model osnet_ain`；`--min-hits 8`；`--appear-thresh 0.34` |
+| 效能 | `--stride 2`（OSNet 時建議）；跳幀框外推；本機影片即時跟播 |
 
 ```powershell
-# 偵測 + 定位 + ID（較順：跳幀＋即時跟播）
-python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet
-
-# 只要定位、不要 ID
-python detect_grid.py --source test/test.mp4 --ref auto --no-track --stride 3 --cell-hold 2
-python detect_grid.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" --ref auto --no-track --stride 3 --cell-hold 2
+python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --stride 2 --log-id
 ```
 
-舊版手動校正仍保留：`--calib calibration/homography_v1_manual.json`；舊桌區灰格：`--valid-xmin 170`。
+舊校正：`--calib calibration/homography_v1_manual.json`；舊桌區灰格：`--valid-xmin 170`。
 
 ## Demo 影片（左：偵測，右：格子）
 
@@ -257,11 +217,18 @@ v1 對照：
 
 （舊檔 `demo_detect_grid.webp` 仍保留，內容等同當時的預設 demo。）
 
-## 狀態備註（2026-07-31）
+## 狀態（2026-08-06）
 
-- 已完成：YOLO26 偵測、**ByteTrack + 地板距離／YOLO26 Re-ID 接回 ID**（預設不假設單人、ID 不回收、畫面只顯示 ID）、誤檢過濾、影片／RTSP 腳點格子定位、Homography **v1（手動）／v2（棋盤格）**、全格顯示、RTSP 降延遲、跳幀、本機即時跟播、格子防抖、OUT 容差、點擊量測真實誤差  
-- 目前最佳：見上方「目前最佳設定」  
-- 未完成／暫緩：換裝／跨鏡頭專用 Re-ID 微調、鏡頭畸變校正接入管線  
+**已完成**
+- YOLO26 偵測 + Homography v1／v2 腳點格子定位、RTSP 降延遲、跳幀、格子防抖  
+- Stable-ID：gallery 外貌接回、多外貌 prototype、OSNet／OSNet-AIN／OSNet-IBN  
+- 圖庫防混人、較短 box coast（人離開後框不長留）  
+- 單人／`test.mp4`：ID 大致穩定可用  
+
+**尚未解決**
+- 雙人／多人近距離：仍可能漏检造成 `ID1,ID2 ↔ ID2` 閃爍  
+- 近鏡頭大框易吃到另一人 → 圖庫可能拒寫或外貌混淆  
+- 換裝、跨鏡頭、畸變校正接入管線  
 
 ## 文件
 
