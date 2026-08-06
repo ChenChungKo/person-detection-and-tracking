@@ -4,3 +4,9 @@ ultralytics==8.4.95
 pillow==12.3.0
 onnxruntime>=1.17.0
 onnx>=1.15.0
+# OSNet Re-ID (optional backend via --reid-model osnet)
+torchreid>=0.2.5
+scipy>=1.11.0
+gdown>=5.0.0
+huggingface_hub>=0.20.0
+tensorboard>=2.14.0

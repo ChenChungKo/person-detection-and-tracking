@@ -4,7 +4,9 @@
 .venv/
 venv/
 *.pt
+*.pth
 *.onnx
+models/osnet/
 *.mp4
 !test/test.mp4
 !test/demo_detect_grid.mp4

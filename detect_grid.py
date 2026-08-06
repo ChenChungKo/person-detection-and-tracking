@@ -116,32 +116,37 @@ def estimate_ref_point(
 ) -> tuple[float, float, str]:
     """Return (ref_x, ref_y, used_mode).
 
-    - foot: bbox bottom-center (true when ankles visible)
-    - head_drop: from head (bbox top-center) drop down by estimated full-body height
-      in image pixels, then apply floor Homography on that estimated ground pixel
-    - auto: use head_drop when bbox looks truncated (short height vs width)
+    - foot: bbox bottom-center (true when ankles visible; also best for seated)
+    - head_drop: from head drop by estimated *standing* height — only when the
+      person is cut off by the bottom of the frame
+    - auto: head_drop only if box looks truncated **and** touches frame bottom;
+      mid-frame short boxes (typical sitting) keep foot = bbox bottom, otherwise
+      Homography shoots into the aisle behind the chair
     """
     cx = 0.5 * (x1 + x2)
     bw = max(1.0, x2 - x1)
     bh = max(1.0, y2 - y1)
     head_x, head_y = cx, float(y1)
     foot_x, foot_y = cx, float(y2)
+    y_max = float(frame_h - 1)
 
     looks_truncated = (bh / bw) < truncate_ratio
+    # Standing person cut by bottom edge — not a seated torso floating mid-frame.
+    cut_by_bottom = y2 >= 0.90 * frame_h
 
     if mode == "foot":
-        return foot_x, min(foot_y, float(frame_h - 1)), "foot"
+        return foot_x, min(foot_y, y_max), "foot"
     if mode == "head_drop":
         est_h = bw * aspect
         est_foot_y = head_y + est_h
-        return head_x, min(est_foot_y, float(frame_h - 1)), "head_drop"
+        return head_x, min(est_foot_y, y_max), "head_drop"
 
-    # auto
-    if looks_truncated:
+    # auto: never extrapolate standing height for seated / mid-frame boxes.
+    if looks_truncated and cut_by_bottom:
         est_h = bw * aspect
         est_foot_y = max(foot_y, head_y + est_h)
-        return head_x, min(est_foot_y, float(frame_h - 1)), "head_drop"
-    return foot_x, min(foot_y, float(frame_h - 1)), "foot"
+        return head_x, min(est_foot_y, y_max), "head_drop"
+    return foot_x, min(foot_y, y_max), "foot"
 
 
 def is_plausible_person_box(
@@ -357,37 +362,77 @@ def annotate_and_cells(
     return vis, cells, logs
 
 
+def occupancy_from_dets(
+    dets: list[dict],
+    allowed_cells: set[tuple[int, int]] | None = None,
+) -> dict[tuple[int, int], list[int]]:
+    """Map floor cell -> stable track IDs currently standing there."""
+    occ: dict[tuple[int, int], list[int]] = {}
+    for det in dets:
+        cell = det.get("cell")
+        tid = det.get("track_id")
+        if cell is None or tid is None:
+            continue
+        cell_t = (int(cell[0]), int(cell[1]))
+        if allowed_cells is not None and cell_t not in allowed_cells:
+            continue
+        occ.setdefault(cell_t, []).append(int(tid))
+    for cell, ids in occ.items():
+        occ[cell] = sorted(set(ids))
+    return occ
+
+
+def occupancy_key(
+    occ: dict[tuple[int, int], list[int]],
+) -> frozenset[tuple[tuple[int, int], frozenset[int]]]:
+    return frozenset((cell, frozenset(ids)) for cell, ids in occ.items())
+
+
 class GridCache:
-    """Avoid redrawing the floor grid when occupied cells are unchanged."""
+    """Avoid redrawing the floor grid when occupancy / IDs are unchanged."""
 
     def __init__(self) -> None:
-        self._cells: set[tuple[int, int]] | None = None
+        self._key: frozenset[tuple[tuple[int, int], frozenset[int]]] | None = None
         self._valid_xmin: float | None = None
         self._base: np.ndarray | None = None
 
-    def get(self, cells: set[tuple[int, int]], valid_xmin: float) -> np.ndarray:
+    def get(
+        self,
+        occupancy: dict[tuple[int, int], list[int]],
+        valid_xmin: float,
+    ) -> np.ndarray:
+        key = occupancy_key(occupancy)
         if (
             self._base is not None
-            and self._cells == cells
+            and self._key == key
             and self._valid_xmin == valid_xmin
         ):
             return self._base.copy()
-        img = draw_multi_grid(cells, valid_xmin)
-        self._cells = set(cells)
+        img = draw_occupancy_grid(occupancy, valid_xmin)
+        self._key = key
         self._valid_xmin = valid_xmin
         self._base = img
         return img.copy()
 
 
+def draw_occupancy_grid(
+    occupancy: dict[tuple[int, int], list[int]],
+    valid_xmin: float,
+) -> np.ndarray:
+    """Light occupied cells and label each with person ID(s)."""
+    return draw_grid(None, valid_x_min=valid_xmin, occupancy=occupancy)
+
+
 def draw_multi_grid(cells: set[tuple[int, int]], valid_xmin: float) -> np.ndarray:
-    """Light all occupied cells (draw base then overlay each)."""
+    """Light all occupied cells (no ID labels; kept for simple callers)."""
+    occ = {cell: [] for cell in cells}
+    # Empty ID list still lights via active-style path — use dummy? draw_grid
+    # only colors by occupancy when ids non-empty. Fall back to old merge.
     if not cells:
         return draw_grid(None, valid_x_min=valid_xmin)
-    # draw by temporarily activating one-by-one on copies then merge max brightness
     base = draw_grid(None, valid_x_min=valid_xmin)
     for cell in cells:
         lit = draw_grid(cell, valid_x_min=valid_xmin)
-        # where lit cell is yellow-ish, keep it
         mask = np.any(lit != base, axis=2)
         base[mask] = lit[mask]
     return base
@@ -509,6 +554,7 @@ def render_detection_view(
     max_width: int = 1280,
     grid_cache: GridCache | None = None,
     out_margin: float = 45.0,
+    grid_occupancy: dict[tuple[int, int], list[int]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     # Draw on preview-sized frame (much cheaper than annotating 2880px then resize).
     view = resize_for_preview(frame, max_width)
@@ -518,10 +564,17 @@ def render_detection_view(
         view, draw_dets, h_mat, valid_xmin, out_margin=out_margin
     )
     display_cells = grid_cells if grid_cells is not None else cells
-    if grid_cache is not None:
-        grid = grid_cache.get(display_cells, valid_xmin)
+    if grid_occupancy is not None:
+        occupancy = dict(grid_occupancy)
     else:
-        grid = draw_multi_grid(display_cells, valid_xmin)
+        occupancy = occupancy_from_dets(dets, allowed_cells=display_cells)
+    for cell in display_cells:
+        occupancy.setdefault(cell, [])
+
+    if grid_cache is not None:
+        grid = grid_cache.get(occupancy, valid_xmin)
+    else:
+        grid = draw_occupancy_grid(occupancy, valid_xmin)
 
     if timing is not None:
         detect_ms, locate_ms = timing
@@ -553,7 +606,8 @@ def parse_args() -> argparse.Namespace:
         "--ref",
         choices=["auto", "foot", "head_drop"],
         default="auto",
-        help="auto: foot when bbox looks full; head_drop when likely truncated",
+        help="auto: foot by default; head_drop only if truncated AND cut by frame bottom "
+        "(sitting uses bbox bottom — avoids aisle foot drift)",
     )
     p.add_argument(
         "--aspect",
@@ -567,12 +621,22 @@ def parse_args() -> argparse.Namespace:
         default=1.6,
         help="auto switches to head_drop when bbox_h/bbox_w < this",
     )
-    p.add_argument("--min-h-ratio", type=float, default=0.14, help="min box height / frame height")
-    p.add_argument("--min-aspect", type=float, default=1.25, help="min box height / width")
+    p.add_argument(
+        "--min-h-ratio",
+        type=float,
+        default=0.12,
+        help="min box height / frame height (lower so seated people pass)",
+    )
+    p.add_argument(
+        "--min-aspect",
+        type=float,
+        default=1.15,
+        help="min box height / width (seated torsos are shorter; default 1.15)",
+    )
     p.add_argument(
         "--min-bottom-ratio",
         type=float,
-        default=0.35,
+        default=0.30,
         help="reject boxes whose bottom is above this frame-height ratio (monitors)",
     )
     p.add_argument(
@@ -693,8 +757,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--appear-thresh",
         type=float,
-        default=0.40,
-        help="Re-ID cosine thresh to reuse an existing ID (higher = stricter; default 0.40)",
+        default=0.30,
+        help="Re-ID cosine thresh to reuse an existing ID (default 0.30; "
+        "long leave may use ~0.78x / last-chance ~0.70x). Higher = stricter",
     )
     p.add_argument(
         "--min-hits",
@@ -706,14 +771,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--id-coast",
         type=int,
-        default=60,
-        help="keep last IDs for this many frames when detection briefly drops (default 60)",
+        default=90,
+        help="keep last IDs for this many frames when detection briefly drops (default 90)",
     )
     p.add_argument(
         "--id-sticky",
         type=int,
-        default=45,
-        help="short-gap motion fallback only when Re-ID is weak (default 45)",
+        default=100,
+        help="short-gap occlusion recovery window in frames (default 100 ≈ 5s at 20fps)",
     )
     p.add_argument(
         "--max-prototypes",
@@ -748,7 +813,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reid-model",
         default="yolo26n-reid.onnx",
-        help="Ultralytics Re-ID model (e.g. yolo26n-reid.onnx / yolo26s-reid.onnx)",
+        help="Re-ID model: yolo26n/s-reid.onnx, or osnet / osnet_x1_0 (OSNet MSMT17)",
     )
     return p.parse_args()
 
@@ -899,7 +964,10 @@ def main() -> None:
             model_name = resolve_reid_model(args.reid_model)
             print(f"載入 Re-ID：{model_name} …")
             reid_encoder = PersonReIDEncoder(model_name)
-            print("Re-ID 就緒（外貌比對改用深度特徵，不再用 HSV 顏色）。")
+            print(
+                f"Re-ID 就緒：{reid_encoder.model_name} "
+                f"[backend={reid_encoder.backend}]（深度外貌特徵）。"
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"Re-ID 載入失敗，改回 HSV：{exc}")
             reid_encoder = None
@@ -933,7 +1001,7 @@ def main() -> None:
                 f"appear≥{args.appear_thresh:.2f}，{proto_s}（換裝可並存）；"
                 f"首次發 ID 立即存 first.jpg；"
                 f"新 ID 需連續 {args.min_hits} 次偵測對不上圖庫才發號；"
-                f"同分時優先較舊 ID。"
+                f"同分時優先最近出現過的 ID（避免換裝後被拉回舊號）。"
             )
         if not args.no_gallery_dump:
             print(f"外貌圖庫裁切圖：{args.gallery_dir}（每次重跑會清空重存）")
@@ -943,6 +1011,7 @@ def main() -> None:
         )
         if args.log_id:
             print("ID 變化會印 [ID-CHANGE]（時刻 / elapsed / video / frame）。")
+        print("格子視窗會標示各 ID 所在格（不同人不同底色）。")
 
     try:
         frame_idx = 0

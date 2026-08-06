@@ -19,7 +19,8 @@ class StableIdMapper:
     The first photo for a new ID is saved immediately as ``first.jpg``.
 
     A **new** ID is issued only after several confirmed hits still fail the
-    gallery. Among several gallery hits, the **oldest** ID wins.
+    gallery. Among several near-equal gallery hits, the **most recently seen**
+    ID wins (avoids flipping ID3→ID1 after a clothing-change enrollment).
     """
 
     def __init__(
@@ -44,9 +45,10 @@ class StableIdMapper:
         self.max_gap_frames = max_gap_frames
         self.max_speed_cm_s = max_speed_cm_s
         self.appear_thresh = appear_thresh
-        # Below hard thresh but still "probably same" → wait, do not mint new ID.
+        # Long-leave rematch may use this slightly softer bar (short-leave still
+        # uses appear_thresh + spatial gate so two desks do not merge).
         self.soft_appear_thresh = (
-            appear_thresh * 0.72 if soft_appear_thresh is None else soft_appear_thresh
+            appear_thresh * 0.78 if soft_appear_thresh is None else soft_appear_thresh
         )
         self.fps = max(1.0, fps)
         self.single_person = single_person
@@ -96,6 +98,67 @@ class StableIdMapper:
         sid = self._next_id
         self._next_id += 1
         return sid
+
+    def _freeze_other_galleries(
+        self, new_sid: int, feat: np.ndarray | None
+    ) -> None:
+        """Strip the new outfit look from older IDs and freeze further enrollment.
+
+        Only safe after a *long* leave + real outfit change. Must not run on
+        pillar-occlusion mints (that splits one person into ID1/ID2).
+        """
+        if feat is None:
+            return
+        for sid, meta in list(self._stable.items()):
+            if sid == new_sid:
+                continue
+            protos = list(self._proto_list(meta))
+            if not protos:
+                continue
+            kept = [
+                p for p in protos if self._appear_sim(feat, p) < self.appear_thresh
+            ]
+            if len(kept) == len(protos):
+                continue
+            if not kept:
+                kept = [protos[0]]  # keep original enrollment look
+            meta["feats"] = kept
+            meta["feat"] = kept[0]
+            meta["outfit_frozen"] = True
+            self._stable[sid] = meta
+
+    def _short_gap_recover(
+        self,
+        world: tuple[float, float] | None,
+        frame_idx: int,
+        used_sids: set[int],
+        feat: np.ndarray | None = None,
+    ) -> int | None:
+        """Recover ID after brief track loss (pillar occludes partial bbox)."""
+        if world is None:
+            return None
+        recover_frames = max(int(self.sticky_frames), int(self.fps * 5))
+        best: tuple[int, float, int] | None = None  # gap, dist, sid
+        for sid, meta in self._stable.items():
+            if sid in used_sids:
+                continue
+            gap = frame_idx - int(meta["frame"])
+            if gap < 0 or gap > recover_frames:
+                continue
+            dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
+            # Foot point jumps a lot when half-hidden behind a pillar.
+            limit = max(self._reach_limit_cm(gap), 350.0)
+            if dist > limit:
+                continue
+            if feat is not None:
+                sim = self._best_proto_sim(feat, meta)
+                # Only reject if clearly another person after >1.5s.
+                if sim < 0.10 and gap > int(self.fps * 1.5):
+                    continue
+            cand = (gap, dist, sid)
+            if best is None or cand < best:
+                best = cand
+        return None if best is None else best[2]
 
     @staticmethod
     def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -163,11 +226,16 @@ class StableIdMapper:
         return best
 
     def _update_prototypes(
-        self, meta: dict, new_feat: np.ndarray | None
+        self,
+        meta: dict,
+        new_feat: np.ndarray | None,
+        allow_new: bool = True,
     ) -> tuple[dict, int | None, bool]:
         """EMA nearest prototype, or append a new look on clothing change.
 
         Returns (meta, proto_index_to_snapshot, is_new_or_replaced).
+        When ``allow_new`` is False (gallery rematch), never enroll a divergent
+        stranger look under this ID — only EMA an existing close match.
         """
         if new_feat is None:
             return meta, None, False
@@ -184,18 +252,20 @@ class StableIdMapper:
         if best_sim >= self.proto_new_thresh:
             protos[best_i] = self._blend_feat(protos[best_i], new_feat, alpha=0.85)
             snap_i, is_new = best_i, False
-        else:
-            # Appearance shifted a lot (e.g. jacket off) while still same track:
-            # keep the old look AND store the new one.
+        elif allow_new:
+            # Continuous same track + large look shift (jacket off): add proto.
             unlimited = self.max_prototypes <= 0
             if unlimited or len(protos) < self.max_prototypes:
                 protos.append(new_feat)
                 snap_i, is_new = len(protos) - 1, True
             else:
-                # Optional cap: replace the prototype least similar to the new look.
                 worst_i = int(np.argmin(sims))
                 protos[worst_i] = new_feat
                 snap_i, is_new = worst_i, True
+        else:
+            # Rematch path: do not pollute gallery with a different person.
+            protos[best_i] = self._blend_feat(protos[best_i], new_feat, alpha=0.95)
+            snap_i, is_new = best_i, False
 
         meta["feats"] = protos
         meta["feat"] = protos[best_i] if best_sim >= self.proto_new_thresh else protos[-1]
@@ -258,9 +328,86 @@ class StableIdMapper:
             return None, -1.0
         best_sim = hits[0][0]
         near = [sid for sim, sid in hits if sim >= best_sim - 0.03]
-        sid = min(near)
+        # Prefer the ID seen most recently (clothing-change ID3 over dormant ID1).
+        sid = max(near, key=lambda s: int(self._stable[s]["frame"]))
         sim = max(s for s, i in hits if i == sid)
         return sid, sim
+
+    def _recent_gap_frames(self) -> int:
+        return max(int(self.sticky_frames * 2), int(self.fps * 4))
+
+    def _rematch_allowed(
+        self,
+        sid: int,
+        feat: np.ndarray | None,
+        world: tuple[float, float] | None,
+        frame_idx: int,
+        min_sim: float | None = None,
+        last_chance: bool = False,
+    ) -> bool:
+        """Allow same-person re-entry; block two-person merges.
+
+        - Similarity: ``appear_thresh`` normally; after a longer leave, soft bar.
+        - Spatial: if that ID was seen *recently* but the new foot is too far,
+          reject (different desk / different person). Long leave ignores distance.
+        """
+        if sid not in self._stable:
+            return False
+        meta = self._stable[sid]
+        sim = self._best_proto_sim(feat, meta)
+        gap = frame_idx - int(meta["frame"])
+        recent = self._recent_gap_frames()
+        if min_sim is not None:
+            need = min_sim
+        elif gap > recent:
+            need = (
+                self.appear_thresh * 0.70 if last_chance else self.soft_appear_thresh
+            )
+        else:
+            need = self.appear_thresh
+        if sim < need:
+            return False
+        if world is None:
+            return True
+        if gap <= recent:
+            dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
+            limit = max(self._reach_limit_cm(gap), 150.0)
+            if dist > limit:
+                return False
+        return True
+
+    def _select_rematch(
+        self,
+        feat: np.ndarray | None,
+        world: tuple[float, float] | None,
+        frame_idx: int,
+        used_sids: set[int],
+        last_chance: bool = False,
+    ) -> tuple[int | None, float]:
+        """Best gallery rematch: highest sim, then most recently seen."""
+        recent_shown = {
+            int(d["track_id"])
+            for d in self._last_out
+            if d.get("track_id") is not None
+        }
+        best: tuple[float, float, int, int] | None = None
+        # score, sim, last_frame, sid
+        for sid, meta in self._stable.items():
+            if sid in used_sids:
+                continue
+            if not self._rematch_allowed(
+                sid, feat, world, frame_idx, last_chance=last_chance
+            ):
+                continue
+            sim = self._best_proto_sim(feat, meta)
+            last_f = int(meta["frame"])
+            score = sim + (0.02 if sid in recent_shown else 0.0)
+            cand = (score, sim, last_f, sid)
+            if best is None or cand[:3] > best[:3]:
+                best = cand
+        if best is None:
+            return None, -1.0
+        return best[3], best[1]
 
     def apply(
         self,
@@ -298,9 +445,11 @@ class StableIdMapper:
 
         assigned: dict[int, int] = {}
         used_sids: set[int] = set()
+        from_raw: set[int] = set()  # continuous ByteTrack → may learn new looks
 
-        # 1) Raw ByteTrack continuity, but allow rebind to an *older* gallery ID
-        #    if appearance strongly prefers it (collapse ID2→ID1 duplicates).
+        # 1) Raw ByteTrack continuity — keep the bound stable ID.
+        #    Do not collapse a newly minted outfit ID (e.g. jacket→ID2) back
+        #    into an older ID that already stored a similar look.
         for i, det in enumerate(work):
             raw = det.get("track_id")
             if raw is None:
@@ -309,55 +458,34 @@ class StableIdMapper:
             sid = self._raw_to_stable.get(raw)
             if sid is None or sid not in self._stable or sid in used_sids:
                 continue
-            gal_sid, gal_sim = self._pick_gallery_id(
-                feats[i], used_sids - {sid}, self.appear_thresh
+            assigned[i] = sid
+            used_sids.add(sid)
+            from_raw.add(i)
+
+        # 2) Short-gap recovery (pillar / brief occlusion): keep ID by floor
+        #    proximity even when Re-ID embedding is corrupted by a partial crop.
+        for i in range(len(work)):
+            if i in assigned:
+                continue
+            sid = self._short_gap_recover(
+                work[i].get("world"), frame_idx, used_sids, feats[i]
             )
-            cur_sim = self._best_proto_sim(feats[i], self._stable[sid])
-            if (
-                gal_sid is not None
-                and gal_sid < sid
-                and gal_sim >= self.appear_thresh
-                and gal_sim >= cur_sim - 0.02
-            ):
-                assigned[i] = gal_sid
-                used_sids.add(gal_sid)
-                self._raw_to_stable[raw] = gal_sid
-            else:
-                assigned[i] = sid
-                used_sids.add(sid)
+            if sid is None:
+                continue
+            assigned[i] = sid
+            used_sids.add(sid)
 
-        # 2) Appearance gallery (any leave duration) — primary rule.
+        # 3) Appearance gallery (longer leave / re-entry) + spatial sanity.
         for i in range(len(work)):
             if i in assigned:
                 continue
-            sid, _sim = self._pick_gallery_id(feats[i], used_sids, self.appear_thresh)
-            if sid is not None:
-                assigned[i] = sid
-                used_sids.add(sid)
-
-        # 3) Short-gap motion fallback only.
-        for i in range(len(work)):
-            if i in assigned:
+            sid, _sim = self._select_rematch(
+                feats[i], work[i].get("world"), frame_idx, used_sids
+            )
+            if sid is None:
                 continue
-            world = work[i].get("world")
-            if world is None:
-                continue
-            best = None
-            for sid, meta in self._stable.items():
-                if sid in used_sids:
-                    continue
-                gap = frame_idx - int(meta["frame"])
-                if gap > max(self.sticky_frames, 45):
-                    continue
-                dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
-                limit = self._reach_limit_cm(gap)
-                if dist <= max(limit, 200.0):
-                    cand = (dist, sid)
-                    if best is None or cand < best:
-                        best = cand
-            if best is not None:
-                assigned[i] = best[1]
-                used_sids.add(best[1])
+            assigned[i] = sid
+            used_sids.add(sid)
 
         out: list[dict] = []
         seen_raw: set[int] = set()
@@ -379,26 +507,54 @@ class StableIdMapper:
                 probe = feats[i]
                 if raw is not None and raw in self._pending_feat:
                     probe = self._pending_feat[raw]
-                soft_sid, _soft_sim = self._pick_gallery_id(
-                    probe, used_sids, self.soft_appear_thresh
+                cand_sid, _cand_sim = self._select_rematch(
+                    probe, d.get("world"), frame_idx, used_sids
                 )
-                if soft_sid is not None:
-                    sid = soft_sid
+                if cand_sid is not None:
+                    sid = cand_sid
                 else:
-                    if raw is None:
-                        hits = self.min_hits
-                    else:
-                        hits = self._raw_hits.get(raw, 0) + 1
-                        self._raw_hits[raw] = hits
-                    if hits < self.min_hits:
-                        continue
-                    final_sid, _final_sim = self._pick_gallery_id(
-                        probe, used_sids, self.soft_appear_thresh
+                    # Occlusion last chance before counting toward a new ID.
+                    occ_sid = self._short_gap_recover(
+                        d.get("world"), frame_idx, used_sids, probe
                     )
-                    if final_sid is not None:
-                        sid = final_sid
+                    if occ_sid is not None:
+                        sid = occ_sid
                     else:
-                        sid = self._alloc_stable_id()
+                        if raw is None:
+                            hits = self.min_hits
+                        else:
+                            hits = self._raw_hits.get(raw, 0) + 1
+                            self._raw_hits[raw] = hits
+                        if hits < self.min_hits:
+                            continue
+                        final_sid, _final_sim = self._select_rematch(
+                            probe, d.get("world"), frame_idx, used_sids
+                        )
+                        if final_sid is None:
+                            final_sid, _final_sim = self._select_rematch(
+                                probe,
+                                d.get("world"),
+                                frame_idx,
+                                used_sids,
+                                last_chance=True,
+                            )
+                        if final_sid is None:
+                            final_sid = self._short_gap_recover(
+                                d.get("world"), frame_idx, used_sids, probe
+                            )
+                        if final_sid is not None:
+                            sid = final_sid
+                        else:
+                            sid = self._alloc_stable_id()
+                            # Outfit split only if nobody was around recently
+                            # (not a pillar flicker that just lost ID1).
+                            recent_s = int(self.fps * 6)
+                            had_recent = any(
+                                frame_idx - int(m["frame"]) <= recent_s
+                                for m in self._stable.values()
+                            )
+                            if not had_recent:
+                                self._freeze_other_galleries(sid, feats[i])
 
             if raw is not None:
                 self._raw_to_stable[raw] = sid
@@ -407,7 +563,15 @@ class StableIdMapper:
             wx, wy = d.get("world", (0.0, 0.0))
             is_first_for_sid = sid not in self._stable
             prev = dict(self._stable.get(sid, {}))
-            prev, snap_i, is_new_proto = self._update_prototypes(prev, feats[i])
+            # Only continuous tracks may enroll a brand-new look under an ID.
+            # Frozen galleries (outfit split off to a newer ID) stay closed.
+            allow_new_proto = (
+                (i in from_raw or is_first_for_sid)
+                and not prev.get("outfit_frozen", False)
+            )
+            prev, snap_i, is_new_proto = self._update_prototypes(
+                prev, feats[i], allow_new=allow_new_proto
+            )
             prev["frame"] = frame_idx
             prev["wx"] = float(wx)
             prev["wy"] = float(wy)
