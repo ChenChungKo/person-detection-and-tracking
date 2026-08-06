@@ -1,13 +1,11 @@
 """Export demo video: camera + floor grid side-by-side or stacked.
 
-Usage:
-  python export_demo_video.py
-  python export_demo_video.py --layout horizontal --height 540
-  python export_demo_video.py --layout vertical --width 800
+Usage (current recommended pipeline):
+  python export_demo_video.py --ref auto --cell-hold 2 --reid-model osnet_ain --stride 2 \\
+      --out test/demo_stable_id_osnet_ain.mp4
 
-README 建議用 WebP（比 GIF 小、畫質好）；可用 ffmpeg 從 mp4 轉：
-  ffmpeg -i test/demo_detect_grid.mp4 -vf "fps=12,scale=720:-1" -loop 0 test/demo_detect_grid.webp
-  ffmpeg -i test/demo_detect_grid.mp4 -vf "fps=10,scale=640:-1" test/demo_detect_grid.gif
+README WebP tip:
+  ffmpeg -i test/demo_stable_id_osnet_ain.mp4 -vf "fps=12,scale=960:-1" -loop 0 test/demo_stable_id_osnet_ain.webp
 """
 
 from __future__ import annotations
@@ -22,15 +20,20 @@ from ultralytics import YOLO
 
 from detect_grid import (
     CellStabilizer,
+    DetectionCoaster,
+    GridCache,
     detect_and_locate,
     load_homography,
     render_detection_view,
     resize_for_preview,
 )
+from reid_encoder import PersonReIDEncoder, resolve_reid_model
+from stable_id import StableIdMapper
 
 DEFAULT_SOURCE = Path(__file__).resolve().parent / "test" / "test.mp4"
 DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
-DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "demo_detect_grid.mp4"
+DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "demo_stable_id_osnet_ain.mp4"
+DEFAULT_TRACKER = Path(__file__).resolve().parent / "trackers" / "bytetrack_stable.yaml"
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,19 +41,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--source", default=str(DEFAULT_SOURCE))
     p.add_argument("--calib", default=str(DEFAULT_CALIB))
     p.add_argument("--model", default="yolo26s.pt")
-    p.add_argument("--conf", type=float, default=0.45)
+    p.add_argument("--conf", type=float, default=0.50)
     p.add_argument("--ref", choices=["auto", "foot", "head_drop"], default="auto")
     p.add_argument("--aspect", type=float, default=3.0)
     p.add_argument("--truncate-ratio", type=float, default=1.6)
-    p.add_argument("--min-h-ratio", type=float, default=0.12)
-    p.add_argument("--min-aspect", type=float, default=1.15)
-    p.add_argument("--min-bottom-ratio", type=float, default=0.28)
+    p.add_argument("--min-h-ratio", type=float, default=0.15)
+    p.add_argument("--min-aspect", type=float, default=1.2)
+    p.add_argument("--min-bottom-ratio", type=float, default=0.30)
     p.add_argument(
         "--valid-xmin",
         type=float,
         default=0.0,
         help="desk-zone gray mask threshold in cm; 0 = full grid (no gray)",
     )
+    p.add_argument("--out-margin", type=float, default=45.0)
     p.add_argument(
         "--layout",
         choices=["horizontal", "vertical"],
@@ -64,8 +68,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--stride",
         type=int,
-        default=1,
-        help="run YOLO every N frames; skipped frames reuse last detections",
+        default=2,
+        help="run YOLO every N frames; skipped frames reuse/coast last detections",
     )
     p.add_argument(
         "--cell-hold",
@@ -74,6 +78,22 @@ def parse_args() -> argparse.Namespace:
         help="a cell only lights/clears after N consecutive DETECTION RUNS agree "
         "(counted in stride units, not raw frames); 1 disables debounce",
     )
+    p.add_argument("--no-track", action="store_true", help="disable ByteTrack + Stable-ID")
+    p.add_argument("--tracker", default=str(DEFAULT_TRACKER))
+    p.add_argument(
+        "--reid-model",
+        default="osnet_ain",
+        help="yolo26n-reid.onnx / osnet / osnet_ain / osnet_ibn",
+    )
+    p.add_argument("--appear-thresh", type=float, default=0.34)
+    p.add_argument("--min-hits", type=int, default=8)
+    p.add_argument("--id-coast", type=int, default=8)
+    p.add_argument("--id-sticky", type=int, default=100)
+    p.add_argument(
+        "--gallery-dir",
+        default=str(Path(__file__).resolve().parent / "test" / "reid_gallery_demo"),
+    )
+    p.add_argument("--no-gallery-dump", action="store_true")
     return p.parse_args()
 
 
@@ -130,6 +150,7 @@ def main() -> None:
     if args.stride < 1:
         raise SystemExit("--stride 必須 >= 1")
 
+    use_track = not args.no_track
     det_kw = dict(
         conf=args.conf,
         ref=args.ref,
@@ -138,10 +159,32 @@ def main() -> None:
         min_h_ratio=args.min_h_ratio,
         min_aspect=args.min_aspect,
         min_bottom_ratio=args.min_bottom_ratio,
+        track=use_track,
+        tracker=args.tracker,
+        imgsz=640,
+        out_margin=args.out_margin,
     )
+
+    id_mapper: StableIdMapper | None = None
+    if use_track:
+        print(f"載入 Re-ID：{args.reid_model} …")
+        enc = PersonReIDEncoder(resolve_reid_model(args.reid_model))
+        gallery = None if args.no_gallery_dump else args.gallery_dir
+        id_mapper = StableIdMapper(
+            appear_thresh=args.appear_thresh,
+            fps=fps,
+            min_hits=args.min_hits,
+            encoder=enc,
+            coast_frames=args.id_coast,
+            sticky_frames=args.id_sticky,
+            gallery_dir=gallery,
+        )
+        print(f"Re-ID 就緒：{enc.model_name}")
 
     stabilizer = CellStabilizer(args.cell_hold)
     confirmed_cells: set[tuple[int, int]] = set()
+    box_coaster = DetectionCoaster()
+    grid_cache = GridCache()
 
     writer: cv2.VideoWriter | None = None
     n = 0
@@ -151,8 +194,12 @@ def main() -> None:
     detect_runs = 0
     t0 = time.perf_counter()
     layout_desc = f"height={args.height}" if args.layout == "horizontal" else f"width={args.width}"
+    track_note = "，Stable-ID+osnet" if use_track else "，no-track"
     stride_note = f"，stride={args.stride}" if args.stride > 1 else ""
-    print(f"匯出中：{source.name} → {out_path}（約 {total} 幀，{args.layout}，{layout_desc}{stride_note}）")
+    print(
+        f"匯出中：{source.name} → {out_path}"
+        f"（約 {total} 幀，{args.layout}，{layout_desc}{stride_note}{track_note}）"
+    )
 
     try:
         while True:
@@ -166,20 +213,28 @@ def main() -> None:
                 last_dets, detect_ms, locate_ms = detect_and_locate(
                     frame, model, h_mat, **det_kw
                 )
+                if id_mapper is not None:
+                    last_dets = id_mapper.apply(last_dets, frame_idx, frame=frame)
+                box_coaster.observe(last_dets, frame_idx)
                 last_timing = None if args.no_timing else (detect_ms, locate_ms)
                 detect_runs += 1
                 raw_cells = {d["cell"] for d in last_dets if d.get("cell") is not None}
                 confirmed_cells = stabilizer.update(raw_cells)
+                draw_dets = last_dets
+            else:
+                draw_dets = box_coaster.extrapolate(last_dets, frame_idx)
 
             timing = last_timing if not args.no_timing else None
             vis, grid, _logs = render_detection_view(
                 frame,
-                last_dets,
+                draw_dets,
                 h_mat,
                 args.valid_xmin,
                 timing=timing,
                 cached=not run_detect,
                 grid_cells=confirmed_cells,
+                grid_cache=grid_cache,
+                out_margin=args.out_margin,
             )
             # Horizontal: keep full-res cam so the README embed fills the column width
             if args.layout == "horizontal":
@@ -201,7 +256,7 @@ def main() -> None:
             writer.write(stacked)
             n += 1
             if n % 50 == 0 or (total and n == total):
-                print(f"  {n}/{total or '?'} 幀")
+                print(f"  {n}/{total or '?'} 幀", flush=True)
     finally:
         cap.release()
         if writer is not None:

@@ -196,26 +196,21 @@ python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --
 
 ## Demo 影片（左：偵測，右：格子）
 
-皆由同一支 `test/test.mp4` 匯出（`--stride 3 --cell-hold 2 --valid-xmin 0`），僅 Homography 版本不同：
+**目前主 demo（Stable-ID + OSNet-AIN）**，由 `test/test.mp4` 匯出：
+
+```powershell
+python export_demo_video.py --source test/test.mp4 --ref auto --cell-hold 2 --reid-model osnet_ain --stride 2 --out test/demo_stable_id_osnet_ain.mp4
+```
 
 | 版本 | 影片 | WebP |
 |------|------|------|
-| **v1** 手動點選 | `test/demo_v1_manual.mp4` | `test/demo_v1_manual.webp` |
-| **v2** 棋盤格（目前預設／最佳） | `test/demo_v2_chessboard.mp4` | `test/demo_v2_chessboard.webp` |
-
-README 主圖使用 **v2**：
-
-<p align="center">
-  <img src="test/demo_v2_chessboard.webp" width="100%" alt="Demo v2：左偵測、右格子"/>
-</p>
-
-v1 對照：
+| **Stable-ID + OSNet-AIN**（目前） | `test/demo_stable_id_osnet_ain.mp4` | `test/demo_stable_id_osnet_ain.webp` |
+| Homography **v2**（舊，僅定位） | `test/demo_v2_chessboard.mp4` | `test/demo_v2_chessboard.webp` |
+| Homography **v1** | `test/demo_v1_manual.mp4` | `test/demo_v1_manual.webp` |
 
 <p align="center">
-  <img src="test/demo_v1_manual.webp" width="100%" alt="Demo v1：左偵測、右格子"/>
+  <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：Stable-ID + OSNet-AIN，左偵測右格子"/>
 </p>
-
-（舊檔 `demo_detect_grid.webp` 仍保留，內容等同當時的預設 demo。）
 
 ## 狀態（2026-08-06）
 

@@ -12,6 +12,8 @@ models/osnet/
 !test/demo_detect_grid.mp4
 !test/demo_v1_manual.mp4
 !test/demo_v2_chessboard.mp4
+!test/demo_stable_id_osnet_ain.mp4
+test/reid_gallery_demo/
 .DS_Store
 Thumbs.db
 test/reid_gallery/
