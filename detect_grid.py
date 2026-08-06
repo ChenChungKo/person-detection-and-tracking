@@ -693,14 +693,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--appear-thresh",
         type=float,
-        default=0.28,
-        help="Re-ID cosine thresh to reuse an existing ID (primary; leave-time independent)",
+        default=0.40,
+        help="Re-ID cosine thresh to reuse an existing ID (higher = stricter; default 0.40)",
     )
     p.add_argument(
         "--min-hits",
         type=int,
-        default=5,
-        help="frames that must FAIL gallery match before minting a NEW ID (default 5)",
+        default=3,
+        help="detect-runs that must FAIL gallery before minting a NEW ID "
+        "(default 3; with --stride 2 ≈ 0.3s at 20fps)",
     )
     p.add_argument(
         "--id-coast",
@@ -717,8 +718,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-prototypes",
         type=int,
-        default=4,
-        help="appearance looks kept per ID (jacket on/off etc.; default 4)",
+        default=0,
+        help="max appearance looks per ID (0 = unlimited; default 0). "
+        "New looks are added only when appearance shifts a lot",
     )
     p.add_argument(
         "--gallery-dir",
@@ -841,8 +843,8 @@ def main() -> None:
             raise SystemExit(f"無法讀取影像：{source}")
         vis, grid = process_frame(frame)
         while True:
-            show_fixed_window(cam_win, vis)
-            show_grid_window(grid_win, grid)
+            if not show_fixed_window(cam_win, vis) or not show_grid_window(grid_win, grid):
+                break
             key = cv2.waitKey(20) & 0xFF
             if key == ord("s"):
                 imwrite_unicode(Path(args.out), vis)
@@ -921,11 +923,16 @@ def main() -> None:
             print("ID 穩定層：單人強制接回（demo，非真實辨識）")
         else:
             appear_mode = "Re-ID" if reid_encoder is not None else "HSV"
+            proto_s = (
+                "不限外貌原型數"
+                if args.max_prototypes <= 0
+                else f"每人最多 {args.max_prototypes} 種外貌原型"
+            )
             print(
                 f"ID 穩定層：{appear_mode} 圖庫為主（離開多久皆可接回）；"
-                f"appear≥{args.appear_thresh:.2f}，"
-                f"每人最多 {args.max_prototypes} 種外貌原型（換裝可並存）；"
-                f"新 ID 需連續 {args.min_hits} 次對不上圖庫才發號；"
+                f"appear≥{args.appear_thresh:.2f}，{proto_s}（換裝可並存）；"
+                f"首次發 ID 立即存 first.jpg；"
+                f"新 ID 需連續 {args.min_hits} 次偵測對不上圖庫才發號；"
                 f"同分時優先較舊 ID。"
             )
         if not args.no_gallery_dump:
@@ -1008,8 +1015,8 @@ def main() -> None:
             if run_detect and not args.quiet:
                 for line in logs:
                     print(line)
-            show_fixed_window(cam_win, vis)
-            show_grid_window(grid_win, grid)
+            if not show_fixed_window(cam_win, vis) or not show_grid_window(grid_win, grid):
+                break
 
             if use_realtime:
                 # If we are ahead of the timeline, wait a bit.

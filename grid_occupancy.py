@@ -218,23 +218,35 @@ def draw_grid(
     return _pil_to_bgr(img)
 
 
-def show_grid_window(win: str, grid_bgr: np.ndarray) -> None:
+def show_grid_window(win: str, grid_bgr: np.ndarray) -> bool:
     """Show grid at 1:1 pixel size to avoid OpenCV upscale blur."""
-    show_fixed_window(win, grid_bgr)
+    return show_fixed_window(win, grid_bgr)
 
 
-def show_fixed_window(win: str, image_bgr: np.ndarray) -> None:
-    """Show image with window size locked to the image pixel size."""
+def show_fixed_window(win: str, image_bgr: np.ndarray) -> bool:
+    """Show image with window size locked to the image pixel size.
+
+    Returns False if the window was closed (so callers can exit cleanly).
+    """
     h, w = image_bgr.shape[:2]
     if not hasattr(show_fixed_window, "_ready"):
         show_fixed_window._ready = set()  # type: ignore[attr-defined]
     ready: set[str] = show_fixed_window._ready  # type: ignore[attr-defined]
-    if win not in ready:
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        ready.add(win)
-    # Keep size fixed every frame (matches preview pixels; ignores manual drag)
-    cv2.resizeWindow(win, w, h)
-    cv2.imshow(win, image_bgr)
+    try:
+        if win not in ready:
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            ready.add(win)
+        # Keep size fixed every frame (matches preview pixels; ignores manual drag)
+        cv2.resizeWindow(win, w, h)
+        cv2.imshow(win, image_bgr)
+        # Closed via title-bar X → property becomes negative.
+        if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+            ready.discard(win)
+            return False
+    except cv2.error:
+        ready.discard(win)
+        return False
+    return True
 
 
 def resize_for_preview(frame: np.ndarray, max_width: int) -> tuple[np.ndarray, float]:

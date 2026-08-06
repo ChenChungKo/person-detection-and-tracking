@@ -14,8 +14,9 @@ class StableIdMapper:
 
     Leave duration is unrestricted within one run. Reappearing people are
     rebound by Re-ID/HSV similarity. Each person keeps **multiple appearance
-    prototypes** (e.g. with / without jacket) so clothing change during a
-    continuous track still rematches after leave/re-enter.
+    prototypes** (unlimited by default; e.g. with / without jacket) so clothing
+    change during a continuous track still rematches after leave/re-enter.
+    The first photo for a new ID is saved immediately as ``first.jpg``.
 
     A **new** ID is issued only after several confirmed hits still fail the
     gallery. Among several gallery hits, the **oldest** ID wins.
@@ -34,7 +35,7 @@ class StableIdMapper:
         coast_frames: int = 60,
         sticky_frames: int = 45,
         soft_appear_thresh: float | None = None,
-        max_prototypes: int = 4,
+        max_prototypes: int = 0,
         proto_new_thresh: float | None = None,
         gallery_dir: str | Path | None = None,
         gallery_latest_every: int = 20,
@@ -53,7 +54,8 @@ class StableIdMapper:
         self.encoder = encoder
         self.coast_frames = max(0, int(coast_frames))
         self.sticky_frames = max(0, int(sticky_frames))
-        self.max_prototypes = max(1, int(max_prototypes))
+        # 0 / negative = unlimited prototypes (new looks keep appending).
+        self.max_prototypes = int(max_prototypes)
         # If current look is below this vs all stored looks → add a new prototype
         # (clothing change), instead of only EMA-washing the old jacket look away.
         self.proto_new_thresh = (
@@ -71,6 +73,7 @@ class StableIdMapper:
         self._last_out: list[dict] = []
         self._last_out_frame = 0
         self._gallery_latest_at: dict[int, int] = {}
+        self._gallery_first_saved: set[int] = set()
         if self.gallery_dir is not None:
             if self.gallery_dir.exists():
                 shutil.rmtree(self.gallery_dir)
@@ -184,11 +187,12 @@ class StableIdMapper:
         else:
             # Appearance shifted a lot (e.g. jacket off) while still same track:
             # keep the old look AND store the new one.
-            if len(protos) < self.max_prototypes:
+            unlimited = self.max_prototypes <= 0
+            if unlimited or len(protos) < self.max_prototypes:
                 protos.append(new_feat)
                 snap_i, is_new = len(protos) - 1, True
             else:
-                # Replace the prototype least similar to the new look.
+                # Optional cap: replace the prototype least similar to the new look.
                 worst_i = int(np.argmin(sims))
                 protos[worst_i] = new_feat
                 snap_i, is_new = worst_i, True
@@ -401,6 +405,7 @@ class StableIdMapper:
                 self._raw_hits[raw] = max(self._raw_hits.get(raw, 0), self.min_hits)
                 self._pending_feat.pop(raw, None)
             wx, wy = d.get("world", (0.0, 0.0))
+            is_first_for_sid = sid not in self._stable
             prev = dict(self._stable.get(sid, {}))
             prev, snap_i, is_new_proto = self._update_prototypes(prev, feats[i])
             prev["frame"] = frame_idx
@@ -409,7 +414,14 @@ class StableIdMapper:
             self._stable[sid] = prev
             used_sids.add(sid)
             xyxy = d.get("xyxy")
-            if is_new_proto and snap_i is not None:
+            # First time this stable ID is created: always snapshot one photo.
+            if is_first_for_sid and sid not in self._gallery_first_saved:
+                self._save_gallery_image(sid, "first.jpg", frame, xyxy)
+                self._save_gallery_image(sid, "proto_0.jpg", frame, xyxy)
+                self._save_gallery_image(sid, "latest.jpg", frame, xyxy)
+                self._gallery_first_saved.add(sid)
+                self._gallery_latest_at[sid] = frame_idx
+            elif is_new_proto and snap_i is not None:
                 self._save_gallery_image(sid, f"proto_{snap_i}.jpg", frame, xyxy)
             last_g = self._gallery_latest_at.get(sid, -10**9)
             if frame_idx - last_g >= self.gallery_latest_every:
