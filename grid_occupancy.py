@@ -160,22 +160,17 @@ def id_fill_color(track_id: int) -> tuple[int, int, int]:
     return palette[(max(1, int(track_id)) - 1) % len(palette)]
 
 
-def draw_grid(
-    active: tuple[int, int] | None,
-    valid_x_min: float = 0.0,
-    cell_px: int = 72,
-    occupancy: dict[tuple[int, int], list[int]] | None = None,
-) -> np.ndarray:
-    """Draw grid with Pillow (sharp text/lines on Windows).
+# Cached empty board (axes + title) so 2-person redraws stay cheap.
+_EMPTY_GRID_CACHE: dict[tuple[float, int], Image.Image] = {}
 
-    ``occupancy`` maps (col, row) -> list of track IDs to show in-cell
-    (e.g. who is standing where). When set, those cells are lit and labeled.
-    """
+
+def _empty_grid_image(valid_x_min: float, cell_px: int) -> Image.Image:
+    key = (float(valid_x_min), int(cell_px))
+    cached = _EMPTY_GRID_CACHE.get(key)
+    if cached is not None:
+        return cached.copy()
+
     font, font_title = _load_fonts()
-    try:
-        font_id = ImageFont.truetype(str(Path(r"C:\Windows\Fonts\msyhbd.ttc")), 20)
-    except OSError:
-        font_id = font_title
     n_cols = len(X_EDGES) - 1
     n_rows = len(Y_EDGES) - 1
     margin_l, margin_t = 96, 52
@@ -185,39 +180,25 @@ def draw_grid(
 
     img = Image.new("RGB", (w, h), (245, 245, 245))
     draw = ImageDraw.Draw(img)
-
     purple = (140, 60, 160)
-    desk = (210, 210, 210)  # X < valid_xmin low-confidence / desk zone (disabled if <= 0)
-    lit = (255, 220, 0)  # occupied cell (no ID)
+    desk = (210, 210, 210)
     white = (255, 255, 255)
-    occ = occupancy or {}
 
     for j in range(n_rows):
         for i in range(n_cols):
             x0 = margin_l + i * cell_px
             y0 = margin_t + j * cell_px
-            x1 = x0 + cell_px
-            y1 = y0 + cell_px
-            # occupancy key present → cell occupied; value may be [] (no ID yet).
-            has_occ = (i, j) in occ
-            ids = sorted({int(t) for t in occ.get((i, j), [])}) if has_occ else []
-            if valid_x_min > 0 and X_EDGES[i + 1] <= valid_x_min and not has_occ:
-                fill = desk
-            elif ids:
-                fill = id_fill_color(ids[0])
-            elif has_occ or (active is not None and active == (i, j)):
-                fill = lit
-            else:
-                fill = white
-            draw.rectangle((x0, y0, x1 - 1, y1 - 1), fill=fill, outline=purple, width=2)
-            if ids:
-                label = "\n".join(f"ID{t}" for t in ids[:3])
-                if len(ids) > 3:
-                    label += f"\n+{len(ids) - 3}"
-                # Center-ish label inside the cell.
-                tx = x0 + 8
-                ty = y0 + max(4, (cell_px - 22 * min(len(ids), 3)) // 2)
-                draw.text((tx, ty), label, fill=(20, 20, 20), font=font_id)
+            fill = (
+                desk
+                if valid_x_min > 0 and X_EDGES[i + 1] <= valid_x_min
+                else white
+            )
+            draw.rectangle(
+                (x0, y0, x0 + cell_px - 1, y0 + cell_px - 1),
+                fill=fill,
+                outline=purple,
+                width=2,
+            )
 
     for i, xv in enumerate(X_EDGES):
         px = margin_l + i * cell_px
@@ -246,6 +227,71 @@ def draw_grid(
             fill=(90, 90, 90),
             font=font,
         )
+    _EMPTY_GRID_CACHE[key] = img
+    return img.copy()
+
+
+def draw_grid(
+    active: tuple[int, int] | None,
+    valid_x_min: float = 0.0,
+    cell_px: int = 72,
+    occupancy: dict[tuple[int, int], list[int]] | None = None,
+) -> np.ndarray:
+    """Draw grid with Pillow (sharp text/lines on Windows).
+
+    ``occupancy`` maps (col, row) -> list of track IDs to show in-cell
+    (e.g. who is standing where). When set, those cells are lit and labeled.
+    """
+    font, font_title = _load_fonts()
+    try:
+        font_id = ImageFont.truetype(str(Path(r"C:\Windows\Fonts\msyhbd.ttc")), 20)
+    except OSError:
+        font_id = font_title
+    n_cols = len(X_EDGES) - 1
+    n_rows = len(Y_EDGES) - 1
+    margin_l, margin_t = 96, 52
+    margin_r, margin_b = 28, 64
+    w = margin_l + n_cols * cell_px + margin_r
+    h = margin_t + n_rows * cell_px + margin_b
+
+    img = _empty_grid_image(valid_x_min, cell_px)
+    draw = ImageDraw.Draw(img)
+
+    purple = (140, 60, 160)
+    lit = (255, 220, 0)  # click / active preview only (no person ID yet)
+    occ = occupancy or {}
+
+    # Only repaint occupied / active cells (cheap when 1–2 people).
+    cells_to_paint: set[tuple[int, int]] = set(occ)
+    if active is not None:
+        cells_to_paint.add(active)
+    for i, j in cells_to_paint:
+        if not (0 <= i < n_cols and 0 <= j < n_rows):
+            continue
+        x0 = margin_l + i * cell_px
+        y0 = margin_t + j * cell_px
+        ids = sorted({int(t) for t in occ.get((i, j), [])})
+        if ids:
+            fill = id_fill_color(ids[0])
+        elif active is not None and active == (i, j):
+            # Manual click preview — not a tracked person.
+            fill = lit
+        else:
+            # Occupied but no ID yet: do not paint yellow (avoids ID flash).
+            continue
+        draw.rectangle(
+            (x0, y0, x0 + cell_px - 1, y0 + cell_px - 1),
+            fill=fill,
+            outline=purple,
+            width=2,
+        )
+        if ids:
+            label = "\n".join(f"ID{t}" for t in ids[:3])
+            if len(ids) > 3:
+                label += f"\n+{len(ids) - 3}"
+            tx = x0 + 8
+            ty = y0 + max(4, (cell_px - 22 * min(len(ids), 3)) // 2)
+            draw.text((tx, ty), label, fill=(20, 20, 20), font=font_id)
     parts = [
         f"ID{tid}@({c},{r})"
         for (c, r), ids in sorted(occ.items())

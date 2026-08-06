@@ -156,26 +156,35 @@ def is_plausible_person_box(
     y2: float,
     frame_h: int,
     frame_w: int,
-    min_h_ratio: float = 0.12,
-    min_aspect: float = 1.15,
+    min_h_ratio: float = 0.15,
+    min_aspect: float = 1.2,
     min_bottom_ratio: float = 0.28,
+    max_aspect: float = 3.8,
 ) -> bool:
-    """Reject common desk/monitor false positives.
+    """Keep only YOLO boxes that look like a full person (not a hand/monitor).
 
-    Monitors often yield small, squarish boxes floating mid-frame.
-    Real people (even seated) tend to be taller than wide and reach lower in the image.
+    Re-ID and gallery both use this same box: if it is not a whole person,
+    it must not enter tracking / feature compare / ID photo dump.
     """
     bw = max(1.0, x2 - x1)
     bh = max(1.0, y2 - y1)
     if bh < min_h_ratio * frame_h:
         return False
-    if (bh / bw) < min_aspect:
+    if bh < 160:  # absolute floor on high-res RTSP (rejects wrist/hand FPs)
+        return False
+    if bw < max(70, 0.04 * frame_w):
+        return False
+    aspect = bh / bw
+    if aspect < min_aspect:
+        return False
+    # Pencil-thin vertical strips (edge of body / chair leg) — not a person.
+    if aspect > max_aspect:
         return False
     # box bottom should not sit high in the frame (typical monitor FP region)
     if y2 < min_bottom_ratio * frame_h:
         return False
     # discard tiny area relative to frame
-    if (bw * bh) < 0.005 * frame_w * frame_h:
+    if (bw * bh) < 0.010 * frame_w * frame_h:
         return False
     return True
 
@@ -188,8 +197,8 @@ def extract_foot_detections(
     mode: str = "auto",
     aspect: float = 3.0,
     truncate_ratio: float = 1.6,
-    min_h_ratio: float = 0.12,
-    min_aspect: float = 1.15,
+    min_h_ratio: float = 0.15,
+    min_aspect: float = 1.2,
     min_bottom_ratio: float = 0.28,
 ) -> list[dict]:
     """Return person ground-ref points from YOLO detect/track boxes."""
@@ -257,6 +266,64 @@ def scale_detections_for_preview(detections: list[dict], scale: float) -> list[d
             d["head"] = (hx * scale, hy * scale)
         out.append(d)
     return out
+
+
+class DetectionCoaster:
+    """Extrapolate boxes on skipped frames so overlays keep up with motion."""
+
+    def __init__(self) -> None:
+        self._hist: dict[int, list[tuple[int, float, float, float, float]]] = {}
+
+    def observe(self, dets: list[dict], frame_idx: int) -> None:
+        for det in dets:
+            tid = det.get("track_id")
+            if tid is None:
+                continue
+            tid = int(tid)
+            x1, y1, x2, y2 = det["xyxy"]
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            hist = self._hist.setdefault(tid, [])
+            hist.append((frame_idx, cx, cy, float(x2 - x1), float(y2 - y1)))
+            del hist[:-3]
+
+    def extrapolate(self, dets: list[dict], frame_idx: int) -> list[dict]:
+        out: list[dict] = []
+        for det in dets:
+            d = dict(det)
+            tid = d.get("track_id")
+            if tid is None:
+                out.append(d)
+                continue
+            hist = self._hist.get(int(tid), [])
+            if len(hist) < 2:
+                out.append(d)
+                continue
+            (_f0, cx0, cy0, _w0, _h0) = hist[-2]
+            (f1, cx1, cy1, w1, h1) = hist[-1]
+            dt = max(1, f1 - hist[-2][0])
+            steps = frame_idx - f1
+            if steps <= 0:
+                out.append(d)
+                continue
+            steps = min(int(steps), 6)
+            vcx = (cx1 - cx0) / dt
+            vcy = (cy1 - cy0) / dt
+            cx = cx1 + vcx * steps
+            cy = cy1 + vcy * steps
+            x1 = int(round(cx - 0.5 * w1))
+            y1 = int(round(cy - 0.5 * h1))
+            x2 = int(round(cx + 0.5 * w1))
+            y2 = int(round(cy + 0.5 * h1))
+            d["xyxy"] = (x1, y1, x2, y2)
+            if "foot" in d:
+                fx, fy = d["foot"]
+                d["foot"] = (fx + vcx * steps, fy + vcy * steps)
+            if "head" in d:
+                hx, hy = d["head"]
+                d["head"] = (hx + vcx * steps, hy + vcy * steps)
+            out.append(d)
+        return out
 
 
 def put_label(
@@ -567,9 +634,9 @@ def render_detection_view(
     if grid_occupancy is not None:
         occupancy = dict(grid_occupancy)
     else:
+        # Only light cells that already have a stable ID → ID color from frame 1
+        # (no empty-occupancy yellow flash before ID assignment).
         occupancy = occupancy_from_dets(dets, allowed_cells=display_cells)
-    for cell in display_cells:
-        occupancy.setdefault(cell, [])
 
     if grid_cache is not None:
         grid = grid_cache.get(occupancy, valid_xmin)
@@ -624,14 +691,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--min-h-ratio",
         type=float,
-        default=0.12,
-        help="min box height / frame height (lower so seated people pass)",
+        default=0.15,
+        help="min box height / frame height; rejects hand/partial FPs before Re-ID",
     )
     p.add_argument(
         "--min-aspect",
         type=float,
-        default=1.15,
-        help="min box height / width (seated torsos are shorter; default 1.15)",
+        default=1.2,
+        help="min box height / width (full person taller than wide)",
     )
     p.add_argument(
         "--min-bottom-ratio",
@@ -757,22 +824,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--appear-thresh",
         type=float,
-        default=0.30,
-        help="Re-ID cosine thresh to reuse an existing ID (default 0.30; "
-        "long leave may use ~0.78x / last-chance ~0.70x). Higher = stricter",
+        default=0.34,
+        help="Re-ID cosine thresh to reuse an existing ID (default 0.34; higher = stricter)",
     )
     p.add_argument(
         "--min-hits",
         type=int,
-        default=3,
+        default=8,
         help="detect-runs that must FAIL gallery before minting a NEW ID "
-        "(default 3; with --stride 2 ≈ 0.3s at 20fps)",
+        "(default 8; with --stride 2 ≈ 0.8s — reduces spurious ID3/ID4)",
     )
     p.add_argument(
         "--id-coast",
         type=int,
-        default=90,
-        help="keep last IDs for this many frames when detection briefly drops (default 90)",
+        default=8,
+        help="briefly keep last boxes when ALL detections drop "
+        "(default 8 ≈ 0.4s at 20fps; was 90 and looked like ghost boxes after leave). "
+        "ID rematch after longer gaps uses --id-sticky / gallery, not this",
     )
     p.add_argument(
         "--id-sticky",
@@ -813,7 +881,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reid-model",
         default="yolo26n-reid.onnx",
-        help="Re-ID model: yolo26n/s-reid.onnx, or osnet / osnet_x1_0 (OSNet MSMT17)",
+        help="Re-ID model: yolo26n/s-reid.onnx, or osnet / osnet_ain / osnet_ain_x1_0 / osnet_ibn",
     )
     return p.parse_args()
 
@@ -955,6 +1023,7 @@ def main() -> None:
 
     stabilizer = CellStabilizer(args.cell_hold)
     confirmed_cells: set[tuple[int, int]] = set()
+    box_coaster = DetectionCoaster()
 
     reid_encoder = None
     if args.track and args.reid:
@@ -968,6 +1037,19 @@ def main() -> None:
                 f"Re-ID 就緒：{reid_encoder.model_name} "
                 f"[backend={reid_encoder.backend}]（深度外貌特徵）。"
             )
+            # Keep YOLO denser so boxes track motion; Re-ID is already lazy.
+            import sys
+
+            stride_set = any(
+                a == "--stride" or a.startswith("--stride=") for a in sys.argv[1:]
+            )
+            if reid_encoder.backend == "osnet":
+                if not stride_set:
+                    args.stride = 2
+                print(
+                    f"OSNet：YOLO 每 {args.stride} 幀更新框"
+                    "（跳幀會預測框位置；要更跟手可改 --stride 1）。"
+                )
         except Exception as exc:  # noqa: BLE001
             print(f"Re-ID 載入失敗，改回 HSV：{exc}")
             reid_encoder = None
@@ -997,14 +1079,16 @@ def main() -> None:
                 else f"每人最多 {args.max_prototypes} 種外貌原型"
             )
             print(
-                f"ID 穩定層：{appear_mode} 圖庫為主（離開多久皆可接回）；"
-                f"appear≥{args.appear_thresh:.2f}，{proto_s}（換裝可並存）；"
-                f"首次發 ID 立即存 first.jpg；"
-                f"新 ID 需連續 {args.min_hits} 次偵測對不上圖庫才發號；"
-                f"同分時優先最近出現過的 ID（避免換裝後被拉回舊號）。"
+                f"ID 穩定層：{appear_mode}｜YOLO框人 → temp 比對過去 ID 照片 → "
+                f"命中沿用／連續追蹤換裝則存新照／都沒中才發新 ID；"
+                f"appear≥{args.appear_thresh:.2f}，{proto_s}；"
+                f"新 ID 需連續 {args.min_hits} 次仍對不上圖庫才發號。"
             )
         if not args.no_gallery_dump:
-            print(f"外貌圖庫裁切圖：{args.gallery_dir}（每次重跑會清空重存）")
+            print(
+                f"外貌圖庫：{args.gallery_dir}（ID***/；temp/current.jpg=當前比對圖；"
+                f"每次重跑清空）"
+            )
         print(
             f"誤檢過濾：conf≥{args.conf}，min_bottom={args.min_bottom_ratio}，"
             f"min_aspect={args.min_aspect}，min_h={args.min_h_ratio}"
@@ -1058,13 +1142,18 @@ def main() -> None:
                 )
                 if det_kw.get("track"):
                     last_dets = id_mapper.apply(last_dets, frame_idx, frame=frame)
+                box_coaster.observe(last_dets, frame_idx)
                 last_timing = None if args.no_timing else (detect_ms, locate_ms)
                 raw_cells = {d["cell"] for d in last_dets if d.get("cell") is not None}
                 confirmed_cells = stabilizer.update(raw_cells)
+                draw_dets = last_dets
+            else:
+                # Predict box motion on skipped frames so overlay keeps up.
+                draw_dets = box_coaster.extrapolate(last_dets, frame_idx)
             timing = last_timing if not args.no_timing else None
             vis, grid, logs = render_detection_view(
                 frame,
-                last_dets,
+                draw_dets,
                 h_mat,
                 args.valid_xmin,
                 timing=timing,

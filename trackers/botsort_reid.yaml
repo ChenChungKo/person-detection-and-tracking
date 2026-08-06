@@ -1,5 +1,8 @@
 # BoT-SORT + ReID (optional). Use with:
 #   python detect_grid.py --tracker trackers/botsort_reid.yaml ...
+#
+# Ultralytics BoT-SORT only accepts YOLO/ONNX ReID assets here (not OSNet .pth).
+# Stable-ID layer can still use --reid-model osnet_ain separately.
 tracker_type: botsort
 track_high_thresh: 0.35
 track_low_thresh: 0.1

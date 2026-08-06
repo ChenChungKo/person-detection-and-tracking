@@ -1,4 +1,4 @@
-"""Person Re-ID embedding helper (YOLO26-ReID or OSNet)."""
+"""Person Re-ID embedding helper (YOLO26-ReID or OSNet / OSNet-AIN)."""
 
 from __future__ import annotations
 
@@ -9,48 +9,126 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 OSNET_DIR = ROOT / "models" / "osnet"
-# KaiyangZhou OSNet trained on MSMT17 (Hugging Face mirror).
 OSNET_HF_REPO = "kaiyangzhou/osnet"
-OSNET_HF_FILE = (
-    "osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_"
-    "b64_fb10_softmax_labelsmooth_flip_jitter.pth"
-)
-OSNET_LOCAL = OSNET_DIR / "osnet_x1_0_msmt17.pth"
 
-# Aliases accepted by --reid-model
-OSNET_ALIASES = {
-    "osnet",
-    "osnet_x1_0",
-    "osnet-x1-0",
-    "osnet_msmt17",
-    "osnet_x1_0_msmt17",
+# alias -> (torchreid model_name, HF filename, local cache name)
+OSNET_VARIANTS: dict[str, tuple[str, str, str]] = {
+    "osnet": (
+        "osnet_x1_0",
+        "osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_"
+        "b64_fb10_softmax_labelsmooth_flip_jitter.pth",
+        "osnet_x1_0_msmt17.pth",
+    ),
+    "osnet_x1_0": (
+        "osnet_x1_0",
+        "osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_"
+        "b64_fb10_softmax_labelsmooth_flip_jitter.pth",
+        "osnet_x1_0_msmt17.pth",
+    ),
+    "osnet-x1-0": (
+        "osnet_x1_0",
+        "osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_"
+        "b64_fb10_softmax_labelsmooth_flip_jitter.pth",
+        "osnet_x1_0_msmt17.pth",
+    ),
+    "osnet_msmt17": (
+        "osnet_x1_0",
+        "osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_"
+        "b64_fb10_softmax_labelsmooth_flip_jitter.pth",
+        "osnet_x1_0_msmt17.pth",
+    ),
+    "osnet_x1_0_msmt17": (
+        "osnet_x1_0",
+        "osnet_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_"
+        "b64_fb10_softmax_labelsmooth_flip_jitter.pth",
+        "osnet_x1_0_msmt17.pth",
+    ),
+    # OSNet-AIN: better domain generalization (clothing / camera shift).
+    "osnet_ain": (
+        "osnet_ain_x1_0",
+        "osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_"
+        "softmax_labsmth_flip_jitter.pth",
+        "osnet_ain_x1_0_msmt17.pth",
+    ),
+    "osnet_ain_x1_0": (
+        "osnet_ain_x1_0",
+        "osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_"
+        "softmax_labsmth_flip_jitter.pth",
+        "osnet_ain_x1_0_msmt17.pth",
+    ),
+    "osnet-ain": (
+        "osnet_ain_x1_0",
+        "osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_"
+        "softmax_labsmth_flip_jitter.pth",
+        "osnet_ain_x1_0_msmt17.pth",
+    ),
+    "osnet_ain_x1_0_msmt17": (
+        "osnet_ain_x1_0",
+        "osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_"
+        "softmax_labsmth_flip_jitter.pth",
+        "osnet_ain_x1_0_msmt17.pth",
+    ),
+    # OSNet-IBN MSMT17 (also stronger generalization).
+    "osnet_ibn": (
+        "osnet_ibn_x1_0",
+        "osnet_ibn_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_"
+        "b64_fb10_softmax_labelsmooth_flip_jitter.pth",
+        "osnet_ibn_x1_0_msmt17.pth",
+    ),
+    "osnet_ibn_x1_0": (
+        "osnet_ibn_x1_0",
+        "osnet_ibn_x1_0_msmt17_combineall_256x128_amsgrad_ep150_stp60_lr0.0015_"
+        "b64_fb10_softmax_labelsmooth_flip_jitter.pth",
+        "osnet_ibn_x1_0_msmt17.pth",
+    ),
 }
 
 
+def _normalize_key(name: str) -> str:
+    return Path(name).name.lower().replace(".pth", "").replace(".pt", "").replace(".tar", "")
+
+
 def _is_osnet_name(name: str) -> bool:
-    key = Path(name).name.lower().replace(".pth", "").replace(".pt", "")
-    if key in OSNET_ALIASES:
+    key = _normalize_key(name)
+    if key in OSNET_VARIANTS:
         return True
     return "osnet" in key
 
 
-def ensure_osnet_weights(path: Path | None = None) -> Path:
+def _resolve_variant(name: str) -> tuple[str, str, str]:
+    """Return (torchreid_model_name, hf_filename, local_filename)."""
+    key = _normalize_key(name)
+    if key in OSNET_VARIANTS:
+        return OSNET_VARIANTS[key]
+    # Explicit weight path: infer architecture from filename.
+    lower = key
+    if "ain" in lower:
+        return OSNET_VARIANTS["osnet_ain_x1_0"]
+    if "ibn" in lower:
+        return OSNET_VARIANTS["osnet_ibn_x1_0"]
+    return OSNET_VARIANTS["osnet_x1_0"]
+
+
+def ensure_osnet_weights(
+    variant: str = "osnet_x1_0",
+    path: Path | None = None,
+) -> Path:
     """Return local OSNet weight path; download from Hugging Face if missing."""
-    out = path or OSNET_LOCAL
-    out = Path(out)
+    arch, hf_file, local_name = _resolve_variant(variant)
+    out = Path(path) if path is not None else (OSNET_DIR / local_name)
     if out.exists() and out.stat().st_size > 1_000_000:
         return out
     out.parent.mkdir(parents=True, exist_ok=True)
     from huggingface_hub import hf_hub_download
     import shutil
 
-    cached = hf_hub_download(repo_id=OSNET_HF_REPO, filename=OSNET_HF_FILE)
+    cached = hf_hub_download(repo_id=OSNET_HF_REPO, filename=hf_file)
     shutil.copy2(cached, out)
     return out
 
 
 class PersonReIDEncoder:
-    """Crop → L2-normalized embedding (YOLO26-ReID ONNX or OSNet)."""
+    """Crop → L2-normalized embedding (YOLO26-ReID ONNX or OSNet family)."""
 
     def __init__(self, model: str = "yolo26n-reid.onnx", device: str | None = None) -> None:
         self.model_name = model
@@ -72,23 +150,22 @@ class PersonReIDEncoder:
             self._encoder = ReID(model, device=device)
 
     def _init_osnet(self, model: str) -> None:
-        # Prefer explicit path; else download MSMT17 checkpoint.
+        arch, _hf, _local = _resolve_variant(model)
         p = Path(model)
         if p.suffix.lower() in {".pth", ".pt", ".tar"} and p.exists():
             weight = p
         else:
-            weight = ensure_osnet_weights()
+            weight = ensure_osnet_weights(variant=model)
 
-        # Import FeatureExtractor without relying on broken torchreid.utils alias.
         from torchreid.reid.utils import FeatureExtractor
 
         self._extractor = FeatureExtractor(
-            model_name="osnet_x1_0",
+            model_name=arch,
             model_path=str(weight),
             device=self.device,
             verbose=False,
         )
-        self.model_name = f"osnet_x1_0 ({weight.name})"
+        self.model_name = f"{arch} ({weight.name})"
 
     def embed_xyxy(
         self,
@@ -130,7 +207,6 @@ class PersonReIDEncoder:
         crop_bgr = frame[y1:y2, x1:x2]
         if crop_bgr.size == 0:
             return None
-        # FeatureExtractor / PIL expect RGB.
         crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
         try:
             tensor = self._extractor([crop_rgb])
@@ -153,8 +229,61 @@ def resolve_reid_model(name: str) -> str:
         p = Path(name)
         if p.suffix.lower() in {".pth", ".pt", ".tar"} and p.exists():
             return str(p)
-        return "osnet_x1_0"
+        arch, _hf, _local = _resolve_variant(name)
+        return arch
     p = Path(name)
     if p.exists():
         return str(p)
     return name
+
+
+def _botsort_encoder_from_person_reid(enc: PersonReIDEncoder):
+    """Adapt PersonReIDEncoder to Ultralytics BoT-SORT ``(img, xywh_dets)`` API."""
+
+    def encoder(img: np.ndarray, dets: np.ndarray) -> list[np.ndarray | None]:
+        out: list[np.ndarray | None] = []
+        if dets is None or len(dets) == 0:
+            return out
+        for det in dets:
+            cx, cy, bw, bh = [float(v) for v in det[:4]]
+            x1 = int(round(cx - 0.5 * bw))
+            y1 = int(round(cy - 0.5 * bh))
+            x2 = int(round(cx + 0.5 * bw))
+            y2 = int(round(cy + 0.5 * bh))
+            feat = enc.embed_xyxy(img, (x1, y1, x2, y2))
+            out.append(None if feat is None else np.asarray(feat, dtype=np.float32))
+        return out
+
+    return encoder
+
+
+def patch_ultralytics_botsort_reid(
+    shared: PersonReIDEncoder | None = None,
+) -> None:
+    """Let BoT-SORT ``model: osnet_ain`` use our torchreid OSNet encoder.
+
+    Ultralytics ReID only loads YOLO/ONNX via AutoBackend; OSNet ``.pth`` needs
+    this bridge. Call once before the first ``model.track(...)``.
+    """
+    from ultralytics.trackers.utils import reid as reid_mod
+
+    if getattr(reid_mod, "_5gjump_osnet_patched", False):
+        # Refresh shared encoder if provided later.
+        if shared is not None:
+            reid_mod._5gjump_shared_encoder = shared
+        return
+
+    _orig = reid_mod.build_encoder
+    reid_mod._5gjump_shared_encoder = shared
+
+    def build_encoder(with_reid: bool, model, device=None):
+        if with_reid and model is not None and _is_osnet_name(str(model)):
+            shared_enc = getattr(reid_mod, "_5gjump_shared_encoder", None)
+            if shared_enc is not None and shared_enc.backend == "osnet":
+                return _botsort_encoder_from_person_reid(shared_enc)
+            enc = PersonReIDEncoder(str(model), device=device)
+            return _botsort_encoder_from_person_reid(enc)
+        return _orig(with_reid, model, device)
+
+    reid_mod.build_encoder = build_encoder
+    reid_mod._5gjump_osnet_patched = True
