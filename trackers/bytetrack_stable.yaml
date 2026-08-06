@@ -1,8 +1,10 @@
-# Indoor CCTV: long re-find window; prefer reactivating over new IDs
+# Indoor CCTV: fewer false tracks; longer re-find for real persons
 tracker_type: bytetrack
-track_high_thresh: 0.2
-track_low_thresh: 0.05
-new_track_thresh: 0.55
-track_buffer: 180
+track_high_thresh: 0.35
+track_low_thresh: 0.1
+new_track_thresh: 0.65
+# Short buffer: long holds made boxes linger after people left the frame.
+# Stable-ID gallery / sticky recovers identity after longer occlusions.
+track_buffer: 30
 match_thresh: 0.8
 fuse_score: True

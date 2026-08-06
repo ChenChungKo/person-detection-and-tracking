@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -36,11 +37,36 @@ from grid_occupancy import (
     world_to_cell,
 )
 from latest_frame import LatestFrameCapture
+from stable_id import StableIdMapper
 
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "test" / "static_frame.jpg"
 DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
 DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "detect_grid_preview.jpg"
 DEFAULT_TRACKER = Path(__file__).resolve().parent / "trackers" / "bytetrack_stable.yaml"
+
+
+def format_id_list(ids: tuple[int, ...]) -> str:
+    return ",".join(f"ID{i}" for i in ids) if ids else "—"
+
+
+def log_id_change(
+    frame_idx: int,
+    fps: float,
+    t0: float,
+    prev: tuple[int, ...] | None,
+    curr: tuple[int, ...],
+) -> None:
+    """Print when the set of active stable IDs changes."""
+    wall = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    elapsed = time.perf_counter() - t0
+    video_t = frame_idx / fps if fps > 1e-6 else 0.0
+    prev_s = format_id_list(prev) if prev is not None else "(start)"
+    curr_s = format_id_list(curr)
+    print(
+        f"[ID-CHANGE] {wall}  elapsed={elapsed:7.2f}s  "
+        f"video={video_t:7.2f}s  frame={frame_idx:5d}  {prev_s} → {curr_s}",
+        flush=True,
+    )
 
 
 def resize_for_preview(frame: np.ndarray, max_width: int) -> np.ndarray:
@@ -90,32 +116,37 @@ def estimate_ref_point(
 ) -> tuple[float, float, str]:
     """Return (ref_x, ref_y, used_mode).
 
-    - foot: bbox bottom-center (true when ankles visible)
-    - head_drop: from head (bbox top-center) drop down by estimated full-body height
-      in image pixels, then apply floor Homography on that estimated ground pixel
-    - auto: use head_drop when bbox looks truncated (short height vs width)
+    - foot: bbox bottom-center (true when ankles visible; also best for seated)
+    - head_drop: from head drop by estimated *standing* height — only when the
+      person is cut off by the bottom of the frame
+    - auto: head_drop only if box looks truncated **and** touches frame bottom;
+      mid-frame short boxes (typical sitting) keep foot = bbox bottom, otherwise
+      Homography shoots into the aisle behind the chair
     """
     cx = 0.5 * (x1 + x2)
     bw = max(1.0, x2 - x1)
     bh = max(1.0, y2 - y1)
     head_x, head_y = cx, float(y1)
     foot_x, foot_y = cx, float(y2)
+    y_max = float(frame_h - 1)
 
     looks_truncated = (bh / bw) < truncate_ratio
+    # Standing person cut by bottom edge — not a seated torso floating mid-frame.
+    cut_by_bottom = y2 >= 0.90 * frame_h
 
     if mode == "foot":
-        return foot_x, min(foot_y, float(frame_h - 1)), "foot"
+        return foot_x, min(foot_y, y_max), "foot"
     if mode == "head_drop":
         est_h = bw * aspect
         est_foot_y = head_y + est_h
-        return head_x, min(est_foot_y, float(frame_h - 1)), "head_drop"
+        return head_x, min(est_foot_y, y_max), "head_drop"
 
-    # auto
-    if looks_truncated:
+    # auto: never extrapolate standing height for seated / mid-frame boxes.
+    if looks_truncated and cut_by_bottom:
         est_h = bw * aspect
         est_foot_y = max(foot_y, head_y + est_h)
-        return head_x, min(est_foot_y, float(frame_h - 1)), "head_drop"
-    return foot_x, min(foot_y, float(frame_h - 1)), "foot"
+        return head_x, min(est_foot_y, y_max), "head_drop"
+    return foot_x, min(foot_y, y_max), "foot"
 
 
 def is_plausible_person_box(
@@ -125,26 +156,35 @@ def is_plausible_person_box(
     y2: float,
     frame_h: int,
     frame_w: int,
-    min_h_ratio: float = 0.12,
-    min_aspect: float = 1.15,
+    min_h_ratio: float = 0.15,
+    min_aspect: float = 1.2,
     min_bottom_ratio: float = 0.28,
+    max_aspect: float = 3.8,
 ) -> bool:
-    """Reject common desk/monitor false positives.
+    """Keep only YOLO boxes that look like a full person (not a hand/monitor).
 
-    Monitors often yield small, squarish boxes floating mid-frame.
-    Real people (even seated) tend to be taller than wide and reach lower in the image.
+    Re-ID and gallery both use this same box: if it is not a whole person,
+    it must not enter tracking / feature compare / ID photo dump.
     """
     bw = max(1.0, x2 - x1)
     bh = max(1.0, y2 - y1)
     if bh < min_h_ratio * frame_h:
         return False
-    if (bh / bw) < min_aspect:
+    if bh < 160:  # absolute floor on high-res RTSP (rejects wrist/hand FPs)
+        return False
+    if bw < max(70, 0.04 * frame_w):
+        return False
+    aspect = bh / bw
+    if aspect < min_aspect:
+        return False
+    # Pencil-thin vertical strips (edge of body / chair leg) — not a person.
+    if aspect > max_aspect:
         return False
     # box bottom should not sit high in the frame (typical monitor FP region)
     if y2 < min_bottom_ratio * frame_h:
         return False
     # discard tiny area relative to frame
-    if (bw * bh) < 0.005 * frame_w * frame_h:
+    if (bw * bh) < 0.010 * frame_w * frame_h:
         return False
     return True
 
@@ -157,8 +197,8 @@ def extract_foot_detections(
     mode: str = "auto",
     aspect: float = 3.0,
     truncate_ratio: float = 1.6,
-    min_h_ratio: float = 0.12,
-    min_aspect: float = 1.15,
+    min_h_ratio: float = 0.15,
+    min_aspect: float = 1.2,
     min_bottom_ratio: float = 0.28,
 ) -> list[dict]:
     """Return person ground-ref points from YOLO detect/track boxes."""
@@ -175,26 +215,20 @@ def extract_foot_detections(
             continue
         x1, y1, x2, y2 = boxes.xyxy[i].tolist()
         track_id = int(boxes.id[i].item()) if has_ids else None
-        # Tracked boxes: keep ID continuity; only drop tiny junk.
-        # Untracked detect: keep stricter desk/monitor FP filter.
-        if track_id is None:
-            if not is_plausible_person_box(
-                x1,
-                y1,
-                x2,
-                y2,
-                frame_h,
-                frame_w,
-                min_h_ratio=min_h_ratio,
-                min_aspect=min_aspect,
-                min_bottom_ratio=min_bottom_ratio,
-            ):
-                continue
-        else:
-            bw = max(1.0, x2 - x1)
-            bh = max(1.0, y2 - y1)
-            if bh < 0.04 * frame_h or (bw * bh) < 0.002 * frame_w * frame_h:
-                continue
+        # Same geometry gate for detect and track — tracked FPs (monitor/chair)
+        # used to skip this and steal stable IDs.
+        if not is_plausible_person_box(
+            x1,
+            y1,
+            x2,
+            y2,
+            frame_h,
+            frame_w,
+            min_h_ratio=min_h_ratio,
+            min_aspect=min_aspect,
+            min_bottom_ratio=min_bottom_ratio,
+        ):
+            continue
         ref_x, ref_y, used = estimate_ref_point(
             x1, y1, x2, y2, frame_h, mode, aspect, truncate_ratio
         )
@@ -232,6 +266,64 @@ def scale_detections_for_preview(detections: list[dict], scale: float) -> list[d
             d["head"] = (hx * scale, hy * scale)
         out.append(d)
     return out
+
+
+class DetectionCoaster:
+    """Extrapolate boxes on skipped frames so overlays keep up with motion."""
+
+    def __init__(self) -> None:
+        self._hist: dict[int, list[tuple[int, float, float, float, float]]] = {}
+
+    def observe(self, dets: list[dict], frame_idx: int) -> None:
+        for det in dets:
+            tid = det.get("track_id")
+            if tid is None:
+                continue
+            tid = int(tid)
+            x1, y1, x2, y2 = det["xyxy"]
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            hist = self._hist.setdefault(tid, [])
+            hist.append((frame_idx, cx, cy, float(x2 - x1), float(y2 - y1)))
+            del hist[:-3]
+
+    def extrapolate(self, dets: list[dict], frame_idx: int) -> list[dict]:
+        out: list[dict] = []
+        for det in dets:
+            d = dict(det)
+            tid = d.get("track_id")
+            if tid is None:
+                out.append(d)
+                continue
+            hist = self._hist.get(int(tid), [])
+            if len(hist) < 2:
+                out.append(d)
+                continue
+            (_f0, cx0, cy0, _w0, _h0) = hist[-2]
+            (f1, cx1, cy1, w1, h1) = hist[-1]
+            dt = max(1, f1 - hist[-2][0])
+            steps = frame_idx - f1
+            if steps <= 0:
+                out.append(d)
+                continue
+            steps = min(int(steps), 6)
+            vcx = (cx1 - cx0) / dt
+            vcy = (cy1 - cy0) / dt
+            cx = cx1 + vcx * steps
+            cy = cy1 + vcy * steps
+            x1 = int(round(cx - 0.5 * w1))
+            y1 = int(round(cy - 0.5 * h1))
+            x2 = int(round(cx + 0.5 * w1))
+            y2 = int(round(cy + 0.5 * h1))
+            d["xyxy"] = (x1, y1, x2, y2)
+            if "foot" in d:
+                fx, fy = d["foot"]
+                d["foot"] = (fx + vcx * steps, fy + vcy * steps)
+            if "head" in d:
+                hx, hy = d["head"]
+                d["head"] = (hx + vcx * steps, hy + vcy * steps)
+            out.append(d)
+        return out
 
 
 def put_label(
@@ -337,37 +429,77 @@ def annotate_and_cells(
     return vis, cells, logs
 
 
+def occupancy_from_dets(
+    dets: list[dict],
+    allowed_cells: set[tuple[int, int]] | None = None,
+) -> dict[tuple[int, int], list[int]]:
+    """Map floor cell -> stable track IDs currently standing there."""
+    occ: dict[tuple[int, int], list[int]] = {}
+    for det in dets:
+        cell = det.get("cell")
+        tid = det.get("track_id")
+        if cell is None or tid is None:
+            continue
+        cell_t = (int(cell[0]), int(cell[1]))
+        if allowed_cells is not None and cell_t not in allowed_cells:
+            continue
+        occ.setdefault(cell_t, []).append(int(tid))
+    for cell, ids in occ.items():
+        occ[cell] = sorted(set(ids))
+    return occ
+
+
+def occupancy_key(
+    occ: dict[tuple[int, int], list[int]],
+) -> frozenset[tuple[tuple[int, int], frozenset[int]]]:
+    return frozenset((cell, frozenset(ids)) for cell, ids in occ.items())
+
+
 class GridCache:
-    """Avoid redrawing the floor grid when occupied cells are unchanged."""
+    """Avoid redrawing the floor grid when occupancy / IDs are unchanged."""
 
     def __init__(self) -> None:
-        self._cells: set[tuple[int, int]] | None = None
+        self._key: frozenset[tuple[tuple[int, int], frozenset[int]]] | None = None
         self._valid_xmin: float | None = None
         self._base: np.ndarray | None = None
 
-    def get(self, cells: set[tuple[int, int]], valid_xmin: float) -> np.ndarray:
+    def get(
+        self,
+        occupancy: dict[tuple[int, int], list[int]],
+        valid_xmin: float,
+    ) -> np.ndarray:
+        key = occupancy_key(occupancy)
         if (
             self._base is not None
-            and self._cells == cells
+            and self._key == key
             and self._valid_xmin == valid_xmin
         ):
             return self._base.copy()
-        img = draw_multi_grid(cells, valid_xmin)
-        self._cells = set(cells)
+        img = draw_occupancy_grid(occupancy, valid_xmin)
+        self._key = key
         self._valid_xmin = valid_xmin
         self._base = img
         return img.copy()
 
 
+def draw_occupancy_grid(
+    occupancy: dict[tuple[int, int], list[int]],
+    valid_xmin: float,
+) -> np.ndarray:
+    """Light occupied cells and label each with person ID(s)."""
+    return draw_grid(None, valid_x_min=valid_xmin, occupancy=occupancy)
+
+
 def draw_multi_grid(cells: set[tuple[int, int]], valid_xmin: float) -> np.ndarray:
-    """Light all occupied cells (draw base then overlay each)."""
+    """Light all occupied cells (no ID labels; kept for simple callers)."""
+    occ = {cell: [] for cell in cells}
+    # Empty ID list still lights via active-style path — use dummy? draw_grid
+    # only colors by occupancy when ids non-empty. Fall back to old merge.
     if not cells:
         return draw_grid(None, valid_x_min=valid_xmin)
-    # draw by temporarily activating one-by-one on copies then merge max brightness
     base = draw_grid(None, valid_x_min=valid_xmin)
     for cell in cells:
         lit = draw_grid(cell, valid_x_min=valid_xmin)
-        # where lit cell is yellow-ish, keep it
         mask = np.any(lit != base, axis=2)
         base[mask] = lit[mask]
     return base
@@ -407,201 +539,6 @@ class CellStabilizer:
                 self._on_streak.pop(cell, None)
                 self._off_streak.pop(cell, None)
         return set(self._confirmed)
-
-
-class StableIdMapper:
-    """Remap volatile tracker IDs using floor motion limits + appearance.
-
-    Does NOT assume \"there is only one person\". A lost ID is reused only when
-    a new detection is both:
-      1) reachable in floor space given elapsed time and max walking speed, and
-      2) similar in appearance (HSV histogram of the torso crop).
-    """
-
-    def __init__(
-        self,
-        max_dist_cm: float = 320.0,
-        max_gap_frames: int = 250,
-        max_speed_cm_s: float = 180.0,
-        appear_thresh: float = 0.50,
-        fps: float = 20.0,
-        single_person: bool = False,
-    ) -> None:
-        self.max_dist_cm = max_dist_cm
-        self.max_gap_frames = max_gap_frames
-        self.max_speed_cm_s = max_speed_cm_s
-        self.appear_thresh = appear_thresh
-        self.fps = max(1.0, fps)
-        self.single_person = single_person  # optional demo-only; default off
-        self._raw_to_stable: dict[int, int] = {}
-        self._stable: dict[int, dict] = {}  # sid -> frame, wx, wy, feat
-        self._next_id = 1
-
-    def _expire(self, frame_idx: int) -> None:
-        dead = [
-            sid
-            for sid, meta in self._stable.items()
-            if frame_idx - int(meta["frame"]) > self.max_gap_frames
-        ]
-        for sid in dead:
-            self._stable.pop(sid, None)
-        self._raw_to_stable = {
-            raw: sid for raw, sid in self._raw_to_stable.items() if sid in self._stable
-        }
-
-    @staticmethod
-    def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
-        return float(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5)
-
-    @staticmethod
-    def appearance_feat(frame: np.ndarray, xyxy: tuple[int, int, int, int]) -> np.ndarray | None:
-        """Compact torso color histogram (no learned Re-ID model required)."""
-        h, w = frame.shape[:2]
-        x1, y1, x2, y2 = xyxy
-        x1, y1 = max(0, int(x1)), max(0, int(y1))
-        x2, y2 = min(w - 1, int(x2)), min(h - 1, int(y2))
-        if x2 - x1 < 8 or y2 - y1 < 16:
-            return None
-        # Focus on torso (skip head/feet) — more stable for clothing cue.
-        y_a = y1 + int(0.20 * (y2 - y1))
-        y_b = y1 + int(0.75 * (y2 - y1))
-        x_a = x1 + int(0.15 * (x2 - x1))
-        x_b = x1 + int(0.85 * (x2 - x1))
-        crop = frame[y_a:y_b, x_a:x_b]
-        if crop.size == 0:
-            return None
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
-        hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
-        n = float(np.linalg.norm(hist))
-        if n < 1e-6:
-            return None
-        return hist / n
-
-    @staticmethod
-    def _appear_sim(a: np.ndarray | None, b: np.ndarray | None) -> float:
-        if a is None or b is None:
-            return 0.0
-        return float(np.dot(a, b))
-
-    def _reach_limit_cm(self, gap_frames: int) -> float:
-        gap_s = max(0, gap_frames) / self.fps
-        # reachable distance + small localization slack
-        return min(self.max_dist_cm, self.max_speed_cm_s * gap_s + 60.0)
-
-    def apply(
-        self,
-        dets: list[dict],
-        frame_idx: int,
-        frame: np.ndarray | None = None,
-    ) -> list[dict]:
-        self._expire(frame_idx)
-        if not dets:
-            return dets
-
-        work = list(dets)
-        # Demo-only shortcut (explicit --single-person). Off by default.
-        if self.single_person and len(work) > 1:
-            if self._stable:
-                sid, meta = max(self._stable.items(), key=lambda kv: kv[1]["frame"])
-                anchor = (float(meta["wx"]), float(meta["wy"]))
-                work = [min(work, key=lambda d: self._dist(d.get("world", (1e9, 1e9)), anchor))]
-            else:
-                work = [max(work, key=lambda d: float(d.get("conf", 0.0)))]
-
-        feats: list[np.ndarray | None] = []
-        for det in work:
-            if frame is None:
-                feats.append(None)
-            else:
-                feats.append(self.appearance_feat(frame, det["xyxy"]))
-
-        assigned: dict[int, int] = {}
-        used_sids: set[int] = set()
-
-        # 1) Keep raw tracker ID links while that raw ID is still alive.
-        for i, det in enumerate(work):
-            raw = det.get("track_id")
-            if raw is None:
-                continue
-            sid = self._raw_to_stable.get(int(raw))
-            if sid is not None and sid in self._stable and sid not in used_sids:
-                assigned[i] = sid
-                used_sids.add(sid)
-
-        # 2) Rematch by motion reachability + appearance (no one-person prior).
-        unmatched_i = [i for i in range(len(work)) if i not in assigned]
-        candidates = [sid for sid in self._stable if sid not in used_sids]
-        pairs: list[tuple[float, int, int]] = []
-        for i in unmatched_i:
-            world = work[i].get("world")
-            if world is None:
-                continue
-            for sid in candidates:
-                meta = self._stable[sid]
-                gap = frame_idx - int(meta["frame"])
-                dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
-                limit = self._reach_limit_cm(gap)
-                if self.single_person and len(work) == 1 and len(candidates) == 1:
-                    limit = max(limit, self.max_dist_cm)
-                if dist > limit:
-                    continue
-                sim = self._appear_sim(feats[i], meta.get("feat"))
-                # Short gap + close on floor: motion alone is enough.
-                short_close = gap <= 15 and dist <= 100.0
-                if not short_close and sim < self.appear_thresh:
-                    continue
-                # Lower cost is better: prefer closer + more similar.
-                cost = dist / max(limit, 1.0) + (1.0 - sim)
-                pairs.append((cost, i, sid))
-        pairs.sort()
-        for _cost, i, sid in pairs:
-            if i in assigned or sid in used_sids:
-                continue
-            assigned[i] = sid
-            used_sids.add(sid)
-
-        # 3) New IDs for genuine new persons / failed rematch.
-        out: list[dict] = []
-        for i, det in enumerate(work):
-            d = dict(det)
-            raw = d.get("track_id")
-            if i in assigned:
-                sid = assigned[i]
-            elif (
-                self.single_person
-                and len(work) == 1
-                and len(self._stable) == 1
-                and not used_sids
-            ):
-                sid = next(iter(self._stable))
-            else:
-                sid = self._next_id
-                self._next_id += 1
-
-            if raw is not None:
-                self._raw_to_stable[int(raw)] = sid
-            wx, wy = d.get("world", (0.0, 0.0))
-            prev = self._stable.get(sid, {})
-            feat = feats[i]
-            old = prev.get("feat")
-            if feat is not None and old is not None:
-                feat = 0.8 * old + 0.2 * feat
-                n = float(np.linalg.norm(feat))
-                if n > 1e-6:
-                    feat = feat / n
-            elif feat is None:
-                feat = old
-            self._stable[sid] = {
-                "frame": frame_idx,
-                "wx": float(wx),
-                "wy": float(wy),
-                "feat": feat,
-            }
-            d["raw_track_id"] = raw
-            d["track_id"] = sid
-            out.append(d)
-        return out
 
 
 def detect_and_locate(
@@ -651,6 +588,24 @@ def detect_and_locate(
         wx, wy = image_to_world(h_mat, fx, fy)
         det["world"] = (wx, wy)
         det["cell"] = world_to_cell(wx, wy, margin_cm=out_margin)
+    # Drop floating FPs: box sits mid-frame but Homography shoots far outside.
+    frame_h = float(frame.shape[0])
+    cleaned: list[dict] = []
+    for det in dets:
+        _x1, _y1, _x2, y2 = det["xyxy"]
+        cell = det.get("cell")
+        wx, wy = det["world"]
+        far_out = cell is None and (
+            wy < -out_margin * 2
+            or wx < -out_margin * 2
+            or wx > 530.0 + out_margin * 2
+            or wy > 540.0 + out_margin * 2
+        )
+        elevated = y2 < 0.50 * frame_h
+        if far_out and elevated:
+            continue
+        cleaned.append(det)
+    dets = cleaned
     locate_ms = (time.perf_counter() - t1) * 1000.0
     return dets, detect_ms, locate_ms
 
@@ -666,6 +621,7 @@ def render_detection_view(
     max_width: int = 1280,
     grid_cache: GridCache | None = None,
     out_margin: float = 45.0,
+    grid_occupancy: dict[tuple[int, int], list[int]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     # Draw on preview-sized frame (much cheaper than annotating 2880px then resize).
     view = resize_for_preview(frame, max_width)
@@ -675,10 +631,17 @@ def render_detection_view(
         view, draw_dets, h_mat, valid_xmin, out_margin=out_margin
     )
     display_cells = grid_cells if grid_cells is not None else cells
-    if grid_cache is not None:
-        grid = grid_cache.get(display_cells, valid_xmin)
+    if grid_occupancy is not None:
+        occupancy = dict(grid_occupancy)
     else:
-        grid = draw_multi_grid(display_cells, valid_xmin)
+        # Only light cells that already have a stable ID → ID color from frame 1
+        # (no empty-occupancy yellow flash before ID assignment).
+        occupancy = occupancy_from_dets(dets, allowed_cells=display_cells)
+
+    if grid_cache is not None:
+        grid = grid_cache.get(occupancy, valid_xmin)
+    else:
+        grid = draw_occupancy_grid(occupancy, valid_xmin)
 
     if timing is not None:
         detect_ms, locate_ms = timing
@@ -705,12 +668,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--source", default=str(DEFAULT_IMAGE))
     p.add_argument("--calib", default=str(DEFAULT_CALIB))
     p.add_argument("--model", default="yolo26s.pt", help="Ultralytics detect weights (e.g. yolo26n/s/m.pt)")
-    p.add_argument("--conf", type=float, default=0.45, help="higher reduces desk/monitor FPs")
+    p.add_argument("--conf", type=float, default=0.50, help="higher reduces desk/monitor FPs")
     p.add_argument(
         "--ref",
         choices=["auto", "foot", "head_drop"],
         default="auto",
-        help="auto: foot when bbox looks full; head_drop when likely truncated",
+        help="auto: foot by default; head_drop only if truncated AND cut by frame bottom "
+        "(sitting uses bbox bottom — avoids aisle foot drift)",
     )
     p.add_argument(
         "--aspect",
@@ -724,13 +688,23 @@ def parse_args() -> argparse.Namespace:
         default=1.6,
         help="auto switches to head_drop when bbox_h/bbox_w < this",
     )
-    p.add_argument("--min-h-ratio", type=float, default=0.12, help="min box height / frame height")
-    p.add_argument("--min-aspect", type=float, default=1.15, help="min box height / width")
+    p.add_argument(
+        "--min-h-ratio",
+        type=float,
+        default=0.15,
+        help="min box height / frame height; rejects hand/partial FPs before Re-ID",
+    )
+    p.add_argument(
+        "--min-aspect",
+        type=float,
+        default=1.2,
+        help="min box height / width (full person taller than wide)",
+    )
     p.add_argument(
         "--min-bottom-ratio",
         type=float,
-        default=0.28,
-        help="reject boxes whose bottom is above this frame-height ratio",
+        default=0.30,
+        help="reject boxes whose bottom is above this frame-height ratio (monitors)",
     )
     p.add_argument(
         "--valid-xmin",
@@ -807,7 +781,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--quiet",
         action="store_true",
-        help="do not print per-detection lines (less console lag)",
+        help="do not print per-detection lines (ID change log still prints unless --no-log-id)",
+    )
+    p.add_argument(
+        "--log-id",
+        dest="log_id",
+        action="store_true",
+        default=True,
+        help="print ID set changes with timestamps (default on)",
+    )
+    p.add_argument(
+        "--no-log-id",
+        dest="log_id",
+        action="store_false",
+        help="disable ID-change timestamp logs",
     )
     p.add_argument(
         "--single-person",
@@ -819,26 +806,82 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--id-max-dist",
         type=float,
-        default=320.0,
+        default=400.0,
         help="cap on floor rematch distance (cm)",
     )
     p.add_argument(
         "--id-max-gap",
         type=int,
-        default=250,
-        help="max frames to remember a stable ID after last sighting",
+        default=400,
+        help="max frames before dropping pending raw-ID hit counters",
     )
     p.add_argument(
         "--id-max-speed",
         type=float,
-        default=180.0,
+        default=200.0,
         help="max walk speed (cm/s) used to limit rematch distance by time gap",
     )
     p.add_argument(
         "--appear-thresh",
         type=float,
-        default=0.50,
-        help="min appearance similarity (0-1) to reuse an ID after tracker switch",
+        default=0.34,
+        help="Re-ID cosine thresh to reuse an existing ID (default 0.34; higher = stricter)",
+    )
+    p.add_argument(
+        "--min-hits",
+        type=int,
+        default=8,
+        help="detect-runs that must FAIL gallery before minting a NEW ID "
+        "(default 8; with --stride 2 ≈ 0.8s — reduces spurious ID3/ID4)",
+    )
+    p.add_argument(
+        "--id-coast",
+        type=int,
+        default=8,
+        help="briefly keep last boxes when ALL detections drop "
+        "(default 8 ≈ 0.4s at 20fps; was 90 and looked like ghost boxes after leave). "
+        "ID rematch after longer gaps uses --id-sticky / gallery, not this",
+    )
+    p.add_argument(
+        "--id-sticky",
+        type=int,
+        default=100,
+        help="short-gap occlusion recovery window in frames (default 100 ≈ 5s at 20fps)",
+    )
+    p.add_argument(
+        "--max-prototypes",
+        type=int,
+        default=0,
+        help="max appearance looks per ID (0 = unlimited; default 0). "
+        "New looks are added only when appearance shifts a lot",
+    )
+    p.add_argument(
+        "--gallery-dir",
+        default=str(Path(__file__).resolve().parent / "test" / "reid_gallery"),
+        help="save per-ID appearance crop images here (cleared each run)",
+    )
+    p.add_argument(
+        "--no-gallery-dump",
+        action="store_true",
+        help="do not save appearance gallery crop images",
+    )
+    p.add_argument(
+        "--reid",
+        dest="reid",
+        action="store_true",
+        default=True,
+        help="use YOLO26 Re-ID embeddings for appearance (default on)",
+    )
+    p.add_argument(
+        "--no-reid",
+        dest="reid",
+        action="store_false",
+        help="fall back to HSV clothing histogram instead of Re-ID",
+    )
+    p.add_argument(
+        "--reid-model",
+        default="yolo26n-reid.onnx",
+        help="Re-ID model: yolo26n/s-reid.onnx, or osnet / osnet_ain / osnet_ain_x1_0 / osnet_ibn",
     )
     return p.parse_args()
 
@@ -933,8 +976,8 @@ def main() -> None:
             raise SystemExit(f"無法讀取影像：{source}")
         vis, grid = process_frame(frame)
         while True:
-            show_fixed_window(cam_win, vis)
-            show_grid_window(grid_win, grid)
+            if not show_fixed_window(cam_win, vis) or not show_grid_window(grid_win, grid):
+                break
             key = cv2.waitKey(20) & 0xFF
             if key == ord("s"):
                 imwrite_unicode(Path(args.out), vis)
@@ -980,6 +1023,37 @@ def main() -> None:
 
     stabilizer = CellStabilizer(args.cell_hold)
     confirmed_cells: set[tuple[int, int]] = set()
+    box_coaster = DetectionCoaster()
+
+    reid_encoder = None
+    if args.track and args.reid:
+        try:
+            from reid_encoder import PersonReIDEncoder, resolve_reid_model
+
+            model_name = resolve_reid_model(args.reid_model)
+            print(f"載入 Re-ID：{model_name} …")
+            reid_encoder = PersonReIDEncoder(model_name)
+            print(
+                f"Re-ID 就緒：{reid_encoder.model_name} "
+                f"[backend={reid_encoder.backend}]（深度外貌特徵）。"
+            )
+            # Keep YOLO denser so boxes track motion; Re-ID is already lazy.
+            import sys
+
+            stride_set = any(
+                a == "--stride" or a.startswith("--stride=") for a in sys.argv[1:]
+            )
+            if reid_encoder.backend == "osnet":
+                if not stride_set:
+                    args.stride = 2
+                print(
+                    f"OSNet：YOLO 每 {args.stride} 幀更新框"
+                    "（跳幀會預測框位置；要更跟手可改 --stride 1）。"
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Re-ID 載入失敗，改回 HSV：{exc}")
+            reid_encoder = None
+
     id_mapper = StableIdMapper(
         max_dist_cm=args.id_max_dist,
         max_gap_frames=args.id_max_gap,
@@ -987,15 +1061,41 @@ def main() -> None:
         appear_thresh=args.appear_thresh,
         fps=video_fps if is_file_video or use_latest else 20.0,
         single_person=args.single_person,
+        min_hits=args.min_hits,
+        encoder=reid_encoder,
+        coast_frames=args.id_coast,
+        sticky_frames=args.id_sticky,
+        max_prototypes=args.max_prototypes,
+        gallery_dir=None if args.no_gallery_dump else args.gallery_dir,
     )
     if args.track:
         if args.single_person:
             print("ID 穩定層：單人強制接回（demo，非真實辨識）")
         else:
-            print(
-                f"ID 穩定層：移動距離上限 + 外貌相似"
-                f"（appear≥{args.appear_thresh:.2f}，max_speed={args.id_max_speed:.0f}cm/s）"
+            appear_mode = "Re-ID" if reid_encoder is not None else "HSV"
+            proto_s = (
+                "不限外貌原型數"
+                if args.max_prototypes <= 0
+                else f"每人最多 {args.max_prototypes} 種外貌原型"
             )
+            print(
+                f"ID 穩定層：{appear_mode}｜YOLO框人 → temp 比對過去 ID 照片 → "
+                f"命中沿用／連續追蹤換裝則存新照／都沒中才發新 ID；"
+                f"appear≥{args.appear_thresh:.2f}，{proto_s}；"
+                f"新 ID 需連續 {args.min_hits} 次仍對不上圖庫才發號。"
+            )
+        if not args.no_gallery_dump:
+            print(
+                f"外貌圖庫：{args.gallery_dir}（ID***/；temp/current.jpg=當前比對圖；"
+                f"每次重跑清空）"
+            )
+        print(
+            f"誤檢過濾：conf≥{args.conf}，min_bottom={args.min_bottom_ratio}，"
+            f"min_aspect={args.min_aspect}，min_h={args.min_h_ratio}"
+        )
+        if args.log_id:
+            print("ID 變化會印 [ID-CHANGE]（時刻 / elapsed / video / frame）。")
+        print("格子視窗會標示各 ID 所在格（不同人不同底色）。")
 
     try:
         frame_idx = 0
@@ -1003,6 +1103,7 @@ def main() -> None:
         last_timing: tuple[float, float] | None = None
         last_id_key: tuple[int, ...] | None = None
         t_play0 = time.perf_counter()
+        log_fps = video_fps if (is_file_video or use_latest) else 20.0
         while True:
             if reader is not None:
                 ok, frame = reader.read()
@@ -1041,13 +1142,18 @@ def main() -> None:
                 )
                 if det_kw.get("track"):
                     last_dets = id_mapper.apply(last_dets, frame_idx, frame=frame)
+                box_coaster.observe(last_dets, frame_idx)
                 last_timing = None if args.no_timing else (detect_ms, locate_ms)
                 raw_cells = {d["cell"] for d in last_dets if d.get("cell") is not None}
                 confirmed_cells = stabilizer.update(raw_cells)
+                draw_dets = last_dets
+            else:
+                # Predict box motion on skipped frames so overlay keeps up.
+                draw_dets = box_coaster.extrapolate(last_dets, frame_idx)
             timing = last_timing if not args.no_timing else None
             vis, grid, logs = render_detection_view(
                 frame,
-                last_dets,
+                draw_dets,
                 h_mat,
                 args.valid_xmin,
                 timing=timing,
@@ -1057,18 +1163,18 @@ def main() -> None:
                 grid_cache=grid_cache,
                 out_margin=args.out_margin,
             )
-            if run_detect and not args.quiet:
+            if run_detect and det_kw.get("track") and args.log_id:
                 id_key = tuple(
                     sorted(d["track_id"] for d in last_dets if d.get("track_id") is not None)
                 )
-                if id_key != last_id_key or logs:
-                    if id_key != last_id_key:
-                        print(f"[frame {frame_idx}] active IDs: {list(id_key) if id_key else '—'}")
-                        last_id_key = id_key
-                    for line in logs:
-                        print(line)
-            show_fixed_window(cam_win, vis)
-            show_grid_window(grid_win, grid)
+                if id_key != last_id_key:
+                    log_id_change(frame_idx, log_fps, t_play0, last_id_key, id_key)
+                    last_id_key = id_key
+            if run_detect and not args.quiet:
+                for line in logs:
+                    print(line)
+            if not show_fixed_window(cam_win, vis) or not show_grid_window(grid_win, grid):
+                break
 
             if use_realtime:
                 # If we are ahead of the timeline, wait a bit.
