@@ -227,5 +227,6 @@ python export_demo_video.py --source test/test.mp4 --ref auto --cell-hold 2 --re
 
 ## 文件
 
+- [8/7](PPT%20report/報告8_7.pdf)
 - [7/24](PPT%20report/報告7_24.pdf)
 - [7/10](PPT%20report/報告7_10.pdf)
