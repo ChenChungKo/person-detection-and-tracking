@@ -842,13 +842,13 @@ def parse_args() -> argparse.Namespace:
         dest="realtime",
         action="store_true",
         default=True,
-        help="for local video: skip frames to keep near realtime (default on)",
+        help="for local video: cap playback near source fps without dropping track frames",
     )
     p.add_argument(
         "--no-realtime",
         dest="realtime",
         action="store_false",
-        help="process every frame even if playback becomes slow-motion",
+        help="do not pace local playback (fixed tracking frames are unchanged)",
     )
     p.add_argument(
         "--quiet",
@@ -1122,8 +1122,8 @@ def main() -> None:
     use_realtime = bool(args.realtime and is_file_video)
     if use_realtime:
         print(
-            f"本機影片：即時跟播（約 {video_fps:.1f} fps）；"
-            "推論慢會自動丟幀。完整逐幀請加 --no-realtime"
+            f"本機影片：以約 {video_fps:.1f} fps 為播放上限；"
+            "推論慢時播放會變慢，但不丟追蹤幀。"
         )
 
     stabilizer = CellStabilizer(args.cell_hold)
@@ -1209,7 +1209,20 @@ def main() -> None:
             print("ID 變化會印 [ID-CHANGE]（時刻 / elapsed / video / frame）。")
         print("格子視窗會標示各 ID 所在格（不同人不同底色）。")
 
-    worker = AsyncTrackWorker(model, h_mat, det_kw, id_mapper if args.track else None)
+    # Local files must be reproducible: process the fixed stride frames
+    # synchronously so BoT-SORT always sees 1, 1+stride, 1+2*stride, ...
+    # RTSP remains asynchronous/latest-frame because low live latency matters
+    # more than replay determinism there.
+    worker = (
+        None
+        if is_file_video
+        else AsyncTrackWorker(model, h_mat, det_kw, id_mapper if args.track else None)
+    )
+    if is_file_video:
+        print(
+            f"本機影片：固定取樣第 1、{1 + args.stride}、"
+            f"{1 + 2 * args.stride}…幀；同一影片重跑使用相同追蹤幀。"
+        )
     try:
         frame_idx = 0
         last_dets: list[dict] = []
@@ -1229,30 +1242,31 @@ def main() -> None:
                     continue
                 frame_idx += 1
             else:
-                if use_realtime:
-                    # Drop frames so wall-clock stays near video timeline.
-                    target = int((time.perf_counter() - t_play0) * video_fps) + 1
-                    while frame_idx + 1 < target:
-                        if not cap.grab():
-                            ok, frame = False, None
-                            break
-                        frame_idx += 1
-                    else:
-                        ok, frame = cap.read()
-                        if ok:
-                            frame_idx += 1
-                else:
-                    ok, frame = cap.read()
-                    if ok:
-                        frame_idx += 1
+                ok, frame = cap.read()
+                if ok:
+                    frame_idx += 1
                 if not ok or frame is None:
                     print("讀取結束或失敗。")
                     break
 
             run_detect = frame_idx == 1 or (frame_idx - 1) % args.stride == 0
-            if run_detect:
-                worker.try_submit(frame, frame_idx)
-            dets, timing, det_idx = worker.snapshot()
+            if is_file_video:
+                if run_detect:
+                    dets, detect_ms, locate_ms = detect_and_locate(
+                        frame, model, h_mat, **det_kw
+                    )
+                    if det_kw.get("track"):
+                        dets = id_mapper.apply(dets, frame_idx, frame=frame)
+                    timing = (detect_ms, locate_ms)
+                    det_idx = frame_idx
+                else:
+                    dets = last_dets
+                    timing = last_timing
+                    det_idx = last_obs_idx
+            else:
+                if run_detect:
+                    worker.try_submit(frame, frame_idx)
+                dets, timing, det_idx = worker.snapshot()
             if det_idx != last_obs_idx:
                 last_obs_idx = det_idx
                 last_dets = dets
@@ -1271,6 +1285,18 @@ def main() -> None:
                     if id_key != last_id_key:
                         log_id_change(det_idx, log_fps, t_play0, last_id_key, id_key)
                         last_id_key = id_key
+            # Full-resolution resize + annotation + two GUI windows are
+            # expensive on this 2880x1620 CPU-only setup. Keep every tracking
+            # frame, but render a deterministic ~9 fps preview between them.
+            # This changes display smoothness only, never the BoT-SORT input.
+            render_frame = (
+                not is_file_video
+                or run_detect
+                or frame_idx == 1
+                or (frame_idx - 1) % 3 == 0
+            )
+            if not render_frame:
+                continue
             draw_dets = (
                 box_coaster.extrapolate(last_dets, frame_idx) if last_dets else last_dets
             )
@@ -1308,7 +1334,8 @@ def main() -> None:
             elif key in (ord("q"), 27):
                 break
     finally:
-        worker.stop()
+        if worker is not None:
+            worker.stop()
         if reader is not None:
             reader.release()
         else:
