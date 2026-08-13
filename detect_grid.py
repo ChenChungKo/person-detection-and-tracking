@@ -80,6 +80,20 @@ def resize_for_preview(frame: np.ndarray, max_width: int) -> np.ndarray:
     return cv2.resize(frame, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
+def stack_demo_views(camera: np.ndarray, grid: np.ndarray, height: int = 720) -> np.ndarray:
+    """Place camera and floor-grid views side by side for video export."""
+
+    def fit_height(image: np.ndarray) -> np.ndarray:
+        h, w = image.shape[:2]
+        width = max(1, int(round(w * height / float(h))))
+        return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+
+    left = fit_height(camera)
+    right = fit_height(grid)
+    separator = np.full((height, 2, 3), (40, 40, 40), dtype=np.uint8)
+    return np.hstack((left, separator, right))
+
+
 def load_homography(path: Path) -> np.ndarray:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return np.array(payload["homography"], dtype=np.float64)
@@ -794,6 +808,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-width", type=int, default=1280)
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument(
+        "--save-video",
+        default=None,
+        help="save camera + grid preview as an MP4 using this exact tracking run",
+    )
+    p.add_argument(
+        "--no-show",
+        action="store_true",
+        help="do not open preview windows (useful with --save-video)",
+    )
+    p.add_argument(
         "--no-timing",
         action="store_true",
         help="hide detect/locate timing on the Grid window",
@@ -1223,6 +1247,11 @@ def main() -> None:
             f"本機影片：固定取樣第 1、{1 + args.stride}、"
             f"{1 + 2 * args.stride}…幀；同一影片重跑使用相同追蹤幀。"
         )
+    save_path = Path(args.save_video).resolve() if args.save_video else None
+    video_writer: cv2.VideoWriter | None = None
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"錄製展示影片：{save_path}")
     try:
         frame_idx = 0
         last_dets: list[dict] = []
@@ -1290,7 +1319,8 @@ def main() -> None:
             # frame, but render a deterministic ~9 fps preview between them.
             # This changes display smoothness only, never the BoT-SORT input.
             render_frame = (
-                not is_file_video
+                save_path is not None
+                or not is_file_video
                 or run_detect
                 or frame_idx == 1
                 or (frame_idx - 1) % 3 == 0
@@ -1315,10 +1345,28 @@ def main() -> None:
             if det_idx == frame_idx and not args.quiet:
                 for line in logs:
                     print(line)
-            if not show_fixed_window(cam_win, vis) or not show_grid_window(grid_win, grid):
-                break
+            if save_path is not None:
+                demo_frame = stack_demo_views(vis, grid)
+                if video_writer is None:
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    video_writer = cv2.VideoWriter(
+                        str(save_path),
+                        fourcc,
+                        video_fps,
+                        (demo_frame.shape[1], demo_frame.shape[0]),
+                    )
+                    if not video_writer.isOpened():
+                        raise RuntimeError(f"無法建立影片：{save_path}")
+                video_writer.write(demo_frame)
+            if not args.no_show:
+                if not show_fixed_window(cam_win, vis) or not show_grid_window(
+                    grid_win, grid
+                ):
+                    break
 
-            if use_realtime:
+            if args.no_show:
+                key = -1
+            elif use_realtime:
                 # If we are ahead of the timeline, wait a bit.
                 ahead = frame_idx / video_fps - (time.perf_counter() - t_play0)
                 wait_ms = 1
@@ -1334,6 +1382,8 @@ def main() -> None:
             elif key in (ord("q"), 27):
                 break
     finally:
+        if video_writer is not None:
+            video_writer.release()
         if worker is not None:
             worker.stop()
         if reader is not None:

@@ -211,15 +211,23 @@ python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --
 
 ## Demo 影片（左：偵測，右：格子）
 
-**目前主 demo（Stable-ID + OSNet-AIN）**，由 `test/test.mp4` 匯出：
+**目前主 demo（Stable-ID + OSNet-AIN）**，使用 `test/test4.mp4` 與實際 `detect_grid.py` 流程錄製。
+
+一般測試與審查指令：
 
 ```powershell
-python export_demo_video.py --source test/test.mp4 --ref auto --cell-hold 2 --reid-model osnet_ain --stride 2 --out test/demo_stable_id_osnet_ain.mp4
+python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump
+```
+
+錄製同一套追蹤結果（不開預覽視窗）：
+
+```powershell
+python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump --save-video test/demo_stable_id_osnet_ain.mp4 --no-show --no-realtime
 ```
 
 | 版本 | 影片 | WebP |
 |------|------|------|
-| **Stable-ID + OSNet-AIN**（目前） | `test/demo_stable_id_osnet_ain.mp4` | `test/demo_stable_id_osnet_ain.webp` |
+| **Stable-ID + OSNet-AIN / test4**（目前） | `test/demo_stable_id_osnet_ain.mp4` | `test/demo_stable_id_osnet_ain.webp` |
 | Homography **v2**（舊，僅定位） | `test/demo_v2_chessboard.mp4` | `test/demo_v2_chessboard.webp` |
 | Homography **v1** | `test/demo_v1_manual.mp4` | `test/demo_v1_manual.webp` |
 
