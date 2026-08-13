@@ -179,7 +179,7 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 - 這裡的「N 次」以**偵測次數**計算（跟 `--stride` 搭配時，只算真正跑 YOLO 的那幀，不受跳幀影響其穩定邏輯）
 - `export_demo_video.py` 也支援同名的 `--stride` / `--cell-hold`
 
-## 目前建議設定（2026-08-06）
+## 目前建議設定（2026-08-13）
 
 | 項目 | 設定 |
 |------|------|
@@ -212,7 +212,7 @@ python export_demo_video.py --source test/test.mp4 --ref auto --cell-hold 2 --re
   <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：Stable-ID + OSNet-AIN，左偵測右格子"/>
 </p>
 
-## 狀態（2026-08-06）
+## 狀態（2026-08-13）
 
 **已完成**
 - YOLO26 偵測 + Homography v1／v2 腳點格子定位、RTSP 降延遲、跳幀、格子防抖  
