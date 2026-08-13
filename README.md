@@ -116,25 +116,36 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 
 ### 人物 ID（Stable-ID）
 
-管線：`YOLO26` → **ByteTrack**（短追蹤）→ **Stable-ID**（gallery 外貌 + 地板距離接回；同幀不共用 ID）。
+管線：`YOLO26.track(persist=True)` → **BoT-SORT**（短期）→ **Stable-ID + OSNet-AIN**（長期 ID）。畫面只標 `ID1`…；人框與格子同一套顏色。不假設場上只有一人。
 
-| 項目 | 說明 |
-|------|------|
-| Re-ID | `--reid-model osnet_ain`（建議）／`osnet`／`osnet_ibn`／YOLO26-ReID ONNX |
-| Gallery | `test/reid_gallery/ID00x/`（`first`／`latest`；雙人近距離時可能暫不寫圖） |
-| 發新號 | 須連續失敗 gallery（`--min-hits` 預設 8）才 mint，減少亂發 ID3／ID4 |
-| 顯示 | 畫面只標 `ID1`…；人框／ID 標籤與格子佔用**同一套 ID 顏色**；`--id-coast` 預設短，避免人走後框殘留 |
+**短追蹤**（`trackers/botsort.yaml`）
+- 固定監視器：`gmc_method: none`
+- 不開 BoT-SORT ReID（`with_reid: False`）；外貌交給 Stable-ID
+- `new_track_thresh: 0.65`：門邊碎框不開新軌
+- 不要把 OSNet `.pth` 寫進 yaml
+
+**Stable-ID**
+- 即時圖庫 `test/reid_gallery/`：每次重跑清空；比對用記憶體向量，不讀回 jpg
+- 審查庫 `test/reid_review/`：**預設關閉**。加 `--review-dump` 才存裁圖（不參與即時比對；背景 Pillow 寫檔，避免拖慢 YOLO）
+- 同一人雙框（IoU／包覆）合併，留較舊號
+- 室內漏檢沿用約 1.2 秒；框貼畫面邊緣立刻清除（人已離開）
+- 新 ID 須連續對不上圖庫（`--min-hits` 預設 16）才發號
 
 ```powershell
-# 建議（單人／test.mp4 較穩）
-python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --stride 2 --log-id
+# 建議
+python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
+
+# 要存錯圖審查時再加
+python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump
 
 # RTSP
 $env:OPENCV_FFMPEG_CAPTURE_OPTIONS = "rtsp_transport;tcp"
-python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --stride 2
-```
+python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
 
-BoT-SORT（`--tracker trackers/botsort_reid.yaml`）短追蹤只用 YOLO-ReID ONNX；Stable-ID 仍可用 `osnet_ain`。不要把 OSNet `.pth` 寫進 BoT-SORT yaml。
+# 只要人框、不要 ID
+python detect_person.py --source test/test.mp4 --no-map
+python detect_grid.py --source test/test.mp4 --no-track
+```
 
 ### RTSP 降延遲（自動啟用）
 
@@ -163,7 +174,7 @@ RTSP／影片不必每幀都跑 YOLO，可跳幀降低運算量，中間幀沿�
 python detect_grid.py --source test/test.mp4 --stride 3
 ```
 
-- `--stride N`：每 N 幀才跑一次 YOLO（**預設 2**；設 1＝每幀都跑）
+- `--stride N`：每 N 幀才跑一次 YOLO（**預設 5** ≈ 20fps 時每秒 4 次；設 1＝每幀都跑）
 - 格子視窗會標示 `cached`，代表這幀是沿用結果、不是新偵測
 - 本機影片另有 `--realtime`（預設開）：依影片時間軸丟幀，避免播放變慢動作
 
@@ -184,15 +195,17 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 | 項目 | 設定 |
 |------|------|
 | Homography | **v2**（`calibration/homography.json`） |
-| 偵測 | `yolo26s.pt`、`--ref auto`、`--conf 0.50`、`--cell-hold 2` |
-| ID | ByteTrack + Stable-ID；`--reid-model osnet_ain`；`--min-hits 8`；`--appear-thresh 0.34` |
-| 效能 | `--stride 2`（OSNet 時建議）；跳幀框外推；本機影片即時跟播 |
+| 偵測 | `yolo26s.pt`、`--ref auto`、`--conf 0.45`、`--cell-hold 2` |
+| 短追蹤 | BoT-SORT（`trackers/botsort.yaml`；GMC off、短 ReID off） |
+| 長期 ID | Stable-ID + `--reid-model osnet_ain`；`--min-hits 16`；`--appear-thresh 0.34` |
+| 效能 | `--stride 5`（約每秒 4 次）；YOLO 在背景執行緒；本機影片即時跟播 |
+| 審查庫 | 預設關；`--review-dump` 寫入 `test/reid_review/<時間>/ID***/` |
 
 ```powershell
-python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --stride 2 --log-id
+python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
 ```
 
-舊校正：`--calib calibration/homography_v1_manual.json`；舊桌區灰格：`--valid-xmin 170`。
+舊校正：`--calib calibration/homography_v1_manual.json`；舊桌區灰格：`--valid-xmin 170`。舊短追蹤：`--tracker trackers/bytetrack_stable.yaml`。
 
 ## Demo 影片（左：偵測，右：格子）
 
@@ -215,14 +228,13 @@ python export_demo_video.py --source test/test.mp4 --ref auto --cell-hold 2 --re
 ## 狀態（2026-08-13）
 
 **已完成**
-- YOLO26 偵測 + Homography v1／v2 腳點格子定位、RTSP 降延遲、跳幀、格子防抖  
-- Stable-ID：gallery 外貌接回、多外貌 prototype、OSNet／OSNet-AIN／OSNet-IBN  
-- 圖庫防混人、較短 box coast（人離開後框不長留）  
-- 不同 ID 在即時畫面人框／標籤與格子佔用使用同一套顏色  
-- 單人／`test.mp4`：ID 大致穩定可用  
+- YOLO26 官方 `model.track` + BoT-SORT 短追蹤；長期 ID 仍由 Stable-ID + OSNet-AIN  
+- 重疊雙框合併、門邊碎框較難開新號、室內漏檢短沿用／貼邊立刻清  
+- 即時圖庫與審查庫分開：審查圖不進 Re-ID；審查預設關，避免寫檔拖慢追蹤  
+- YOLO 與預覽分執行緒；格子防抖、跳幀、RTSP 降延遲  
 
 **尚未解決**
-- 雙人／多人近距離：仍可能漏检造成 `ID1,ID2 ↔ ID2` 閃爍  
+- 多人遮擋／漏檢仍可能閃號（坐著、趴著、被擋時 `conf=0.45` 較易漏）  
 - 近鏡頭大框易吃到另一人 → 圖庫可能拒寫或外貌混淆  
 - 換裝、跨鏡頭、畸變校正接入管線  
 
