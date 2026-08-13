@@ -127,6 +127,8 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 **Stable-ID**
 - 即時圖庫 `test/reid_gallery/`：每次重跑清空；比對用記憶體向量，不讀回 jpg
 - 審查庫 `test/reid_review/`：**預設關閉**。加 `--review-dump` 才存裁圖（不參與即時比對；背景 Pillow 寫檔，避免拖慢 YOLO）
+- 圖庫只接受乾淨、低重疊的人框，避免相鄰人物污染 `first.jpg` 與外貌原型
+- 每幀以衣著色彩修正明顯換人；陌生 raw track 先短暫隔離，確認後建立新 ID
 - 同一人雙框（IoU／包覆）合併，留較舊號
 - 室內漏檢沿用約 1.2 秒；框貼畫面邊緣立刻清除（人已離開）
 - 新 ID 須連續對不上圖庫（`--min-hits` 預設 16）才發號
@@ -164,7 +166,7 @@ python detect_grid.py --source test/test.mp4 --no-track
 | `LatestFrameCapture` | 降低「畫面落後感」 | 丟緩衝區舊幀，永遠處理最新畫面 |
 | `--stride` | 降低運算量 | 不必每幀都跑 YOLO |
 
-本機 `.mp4` 不會啟用最新幀讀取（逐幀播放比較合理）。
+本機 `.mp4` 不會啟用最新幀讀取；固定處理第 `1, 1+stride, 1+2×stride, ...` 幀，避免電腦負載不同造成 BoT-SORT 輸入與 ID 結果改變。
 
 ### 跳幀（`--stride`）
 
@@ -176,7 +178,7 @@ python detect_grid.py --source test/test.mp4 --stride 3
 
 - `--stride N`：每 N 幀才跑一次 YOLO（**預設 5** ≈ 20fps 時每秒 4 次；設 1＝每幀都跑）
 - 格子視窗會標示 `cached`，代表這幀是沿用結果、不是新偵測
-- 本機影片另有 `--realtime`（預設開）：依影片時間軸丟幀，避免播放變慢動作
+- 本機影片的 `--realtime`（預設開）只限制播放速度不超過來源 FPS；推論慢時會變慢，但不丟追蹤幀。`--no-realtime` 可取消等待，追蹤取樣幀不變
 
 ### 格子防抖（`--cell-hold`）
 
@@ -190,7 +192,7 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 - 這裡的「N 次」以**偵測次數**計算（跟 `--stride` 搭配時，只算真正跑 YOLO 的那幀，不受跳幀影響其穩定邏輯）
 - `export_demo_video.py` 也支援同名的 `--stride` / `--cell-hold`
 
-## 目前建議設定（2026-08-13）
+## 目前建議設定（2026-08-14）
 
 | 項目 | 設定 |
 |------|------|
@@ -198,7 +200,7 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 | 偵測 | `yolo26s.pt`、`--ref auto`、`--conf 0.45`、`--cell-hold 2` |
 | 短追蹤 | BoT-SORT（`trackers/botsort.yaml`；GMC off、短 ReID off） |
 | 長期 ID | Stable-ID + `--reid-model osnet_ain`；`--min-hits 16`；`--appear-thresh 0.34` |
-| 效能 | `--stride 5`（約每秒 4 次）；YOLO 在背景執行緒；本機影片即時跟播 |
+| 效能 | `--stride 5`（約每秒 4 次）；本機影片同步、固定取樣以確保可重現；RTSP 維持背景執行緒與最新幀模式 |
 | 審查庫 | 預設關；`--review-dump` 寫入 `test/reid_review/<時間>/ID***/` |
 
 ```powershell
@@ -225,17 +227,20 @@ python export_demo_video.py --source test/test.mp4 --ref auto --cell-hold 2 --re
   <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：Stable-ID + OSNet-AIN，左偵測右格子"/>
 </p>
 
-## 狀態（2026-08-13）
+## 狀態（2026-08-14）
 
 **已完成**
 - YOLO26 官方 `model.track` + BoT-SORT 短追蹤；長期 ID 仍由 Stable-ID + OSNet-AIN  
 - 重疊雙框合併、門邊碎框較難開新號、室內漏檢短沿用／貼邊立刻清  
 - 即時圖庫與審查庫分開：審查圖不進 Re-ID；審查預設關，避免寫檔拖慢追蹤  
-- YOLO 與預覽分執行緒；格子防抖、跳幀、RTSP 降延遲  
+- 本機影片固定追蹤幀，重跑結果不再受即時丟幀與電腦負載改變  
+- 陌生人物不再直接冒用既有 ID；短暫確認後建立可供回場比對的新 ID  
+- RTSP 保留背景 YOLO、最新幀與 TCP 降延遲；格子支援防抖與跳幀  
 
 **尚未解決**
 - 多人遮擋／漏檢仍可能閃號（坐著、趴著、被擋時 `conf=0.45` 較易漏）  
 - 近鏡頭大框易吃到另一人 → 圖庫可能拒寫或外貌混淆  
+- `test3.mp4` 的人數多、停留短且交叉頻繁；目前 `--min-hits 16` 與陌生人隔離較保守，可能延遲或隱藏新 ID，尚待加入依框品質調整的自適應發號  
 - 換裝、跨鏡頭、畸變校正接入管線  
 
 ## 文件
