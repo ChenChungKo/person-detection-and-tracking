@@ -160,6 +160,12 @@ def id_fill_color(track_id: int) -> tuple[int, int, int]:
     return palette[(max(1, int(track_id)) - 1) % len(palette)]
 
 
+def id_bgr_color(track_id: int) -> tuple[int, int, int]:
+    """Same ID color as the floor grid, in OpenCV BGR."""
+    r, g, b = id_fill_color(track_id)
+    return (int(b), int(g), int(r))
+
+
 # Cached empty board (axes + title) so 2-person redraws stay cheap.
 _EMPTY_GRID_CACHE: dict[tuple[float, int], Image.Image] = {}
 

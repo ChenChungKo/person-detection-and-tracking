@@ -123,7 +123,7 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 | Re-ID | `--reid-model osnet_ain`（建議）／`osnet`／`osnet_ibn`／YOLO26-ReID ONNX |
 | Gallery | `test/reid_gallery/ID00x/`（`first`／`latest`；雙人近距離時可能暫不寫圖） |
 | 發新號 | 須連續失敗 gallery（`--min-hits` 預設 8）才 mint，減少亂發 ID3／ID4 |
-| 顯示 | 畫面只標 `ID1`…；`--id-coast` 預設短，避免人走後框殘留 |
+| 顯示 | 畫面只標 `ID1`…；人框／ID 標籤與格子佔用**同一套 ID 顏色**；`--id-coast` 預設短，避免人走後框殘留 |
 
 ```powershell
 # 建議（單人／test.mp4 較穩）
@@ -218,6 +218,7 @@ python export_demo_video.py --source test/test.mp4 --ref auto --cell-hold 2 --re
 - YOLO26 偵測 + Homography v1／v2 腳點格子定位、RTSP 降延遲、跳幀、格子防抖  
 - Stable-ID：gallery 外貌接回、多外貌 prototype、OSNet／OSNet-AIN／OSNet-IBN  
 - 圖庫防混人、較短 box coast（人離開後框不長留）  
+- 不同 ID 在即時畫面人框／標籤與格子佔用使用同一套顏色  
 - 單人／`test.mp4`：ID 大致穩定可用  
 
 **尚未解決**

@@ -30,6 +30,7 @@ from grid_occupancy import (
     X_EDGES,
     cell_label,
     draw_grid,
+    id_bgr_color,
     imread_unicode,
     imwrite_unicode,
     show_fixed_window,
@@ -375,7 +376,7 @@ def annotate_and_cells(
         used = det.get("mode", "foot")
         tid = det.get("track_id")
         id_txt = f"ID{tid}" if tid is not None else "person"
-        box_color = (0, 255, 0)
+        box_color = id_bgr_color(tid) if tid is not None else (0, 255, 0)
         if "world" in det and "cell" in det:
             wx, wy = det["world"]
             cell = det["cell"]
@@ -416,7 +417,7 @@ def annotate_and_cells(
                 id_txt,
                 (x1, label_y),
                 fg=(0, 0, 0),
-                bg=(0, 255, 255),
+                bg=box_color,
                 scale=0.85 * fs,
                 thickness=thick,
             )
