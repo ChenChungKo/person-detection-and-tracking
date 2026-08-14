@@ -3,8 +3,9 @@
 Ground reference:
   - foot / head_drop / auto (see --ref)
 
-Tracking (same person -> same ID):
-  - default: Ultralytics ByteTrack (see --tracker)
+Tracking (Ultralytics docs: https://docs.ultralytics.com/modes/track):
+  - default: YOLO.track persist=True + BoT-SORT (trackers/botsort.yaml)
+  - long-term IDs: Stable-ID + OSNet gallery (not the tracker yaml)
   - disable with --no-track
 
 Usage:
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +45,7 @@ from stable_id import StableIdMapper
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "test" / "static_frame.jpg"
 DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
 DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "detect_grid_preview.jpg"
-DEFAULT_TRACKER = Path(__file__).resolve().parent / "trackers" / "bytetrack_stable.yaml"
+DEFAULT_TRACKER = Path(__file__).resolve().parent / "trackers" / "botsort.yaml"
 
 
 def format_id_list(ids: tuple[int, ...]) -> str:
@@ -76,6 +78,20 @@ def resize_for_preview(frame: np.ndarray, max_width: int) -> np.ndarray:
         return frame.copy()
     scale = max_width / float(w)
     return cv2.resize(frame, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
+
+
+def stack_demo_views(camera: np.ndarray, grid: np.ndarray, height: int = 720) -> np.ndarray:
+    """Place camera and floor-grid views side by side for video export."""
+
+    def fit_height(image: np.ndarray) -> np.ndarray:
+        h, w = image.shape[:2]
+        width = max(1, int(round(w * height / float(h))))
+        return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+
+    left = fit_height(camera)
+    right = fit_height(grid)
+    separator = np.full((height, 2, 3), (40, 40, 40), dtype=np.uint8)
+    return np.hstack((left, separator, right))
 
 
 def load_homography(path: Path) -> np.ndarray:
@@ -157,35 +173,31 @@ def is_plausible_person_box(
     y2: float,
     frame_h: int,
     frame_w: int,
-    min_h_ratio: float = 0.15,
-    min_aspect: float = 1.2,
-    min_bottom_ratio: float = 0.28,
-    max_aspect: float = 3.8,
+    min_h_ratio: float = 0.06,
+    min_aspect: float = 0.8,
+    min_bottom_ratio: float = 0.12,
+    max_aspect: float = 4.5,
 ) -> bool:
-    """Keep only YOLO boxes that look like a full person (not a hand/monitor).
+    """Drop only obvious non-person fragments (hands / top-of-frame monitors).
 
-    Re-ID and gallery both use this same box: if it is not a whole person,
-    it must not enter tracking / feature compare / ID photo dump.
+    Seated classmates are often short/wide; a strict full-body gate hid them.
     """
     bw = max(1.0, x2 - x1)
     bh = max(1.0, y2 - y1)
     if bh < min_h_ratio * frame_h:
         return False
-    if bh < 160:  # absolute floor on high-res RTSP (rejects wrist/hand FPs)
+    if bh < 80:
         return False
-    if bw < max(70, 0.04 * frame_w):
+    if bw < max(40, 0.02 * frame_w):
         return False
     aspect = bh / bw
     if aspect < min_aspect:
         return False
-    # Pencil-thin vertical strips (edge of body / chair leg) — not a person.
     if aspect > max_aspect:
         return False
-    # box bottom should not sit high in the frame (typical monitor FP region)
     if y2 < min_bottom_ratio * frame_h:
         return False
-    # discard tiny area relative to frame
-    if (bw * bh) < 0.010 * frame_w * frame_h:
+    if (bw * bh) < 0.004 * frame_w * frame_h:
         return False
     return True
 
@@ -198,9 +210,9 @@ def extract_foot_detections(
     mode: str = "auto",
     aspect: float = 3.0,
     truncate_ratio: float = 1.6,
-    min_h_ratio: float = 0.15,
-    min_aspect: float = 1.2,
-    min_bottom_ratio: float = 0.28,
+    min_h_ratio: float = 0.06,
+    min_aspect: float = 0.8,
+    min_bottom_ratio: float = 0.12,
 ) -> list[dict]:
     """Return person ground-ref points from YOLO detect/track boxes."""
     out: list[dict] = []
@@ -215,7 +227,11 @@ def extract_foot_detections(
         if conf < conf_thres:
             continue
         x1, y1, x2, y2 = boxes.xyxy[i].tolist()
-        track_id = int(boxes.id[i].item()) if has_ids else None
+        track_id = None
+        if has_ids:
+            raw = float(boxes.id[i].item())
+            if raw == raw:
+                track_id = int(raw)
         # Same geometry gate for detect and track — tracked FPs (monitor/chair)
         # used to skip this and steal stable IDs.
         if not is_plausible_person_box(
@@ -276,17 +292,22 @@ class DetectionCoaster:
         self._hist: dict[int, list[tuple[int, float, float, float, float]]] = {}
 
     def observe(self, dets: list[dict], frame_idx: int) -> None:
+        seen: set[int] = set()
         for det in dets:
             tid = det.get("track_id")
             if tid is None:
                 continue
             tid = int(tid)
+            seen.add(tid)
             x1, y1, x2, y2 = det["xyxy"]
             cx = 0.5 * (x1 + x2)
             cy = 0.5 * (y1 + y2)
             hist = self._hist.setdefault(tid, [])
             hist.append((frame_idx, cx, cy, float(x2 - x1), float(y2 - y1)))
             del hist[:-3]
+        for tid in list(self._hist):
+            if tid not in seen:
+                self._hist.pop(tid, None)
 
     def extrapolate(self, dets: list[dict], frame_idx: int) -> list[dict]:
         out: list[dict] = []
@@ -611,6 +632,63 @@ def detect_and_locate(
     return dets, detect_ms, locate_ms
 
 
+class AsyncTrackWorker:
+    """YOLO.track(persist=True) on a side thread so the preview stays live.
+
+    Official docs want consecutive persist calls; we queue at most one frame so
+    the tracker still sees an ordered stream without blocking cv2.imshow.
+    """
+
+    def __init__(self, model: YOLO, h_mat: np.ndarray, det_kw: dict, id_mapper) -> None:
+        self._model = model
+        self._h_mat = h_mat
+        self._det_kw = det_kw
+        self._id_mapper = id_mapper
+        self._lock = threading.Lock()
+        self._pending: tuple[np.ndarray, int] | None = None
+        self._dets: list[dict] = []
+        self._timing: tuple[float, float] | None = None
+        self._idx = 0
+        self._stop = False
+        self._thread = threading.Thread(
+            target=self._loop, name="yolo-track", daemon=True
+        )
+        self._thread.start()
+
+    def try_submit(self, frame: np.ndarray, frame_idx: int) -> None:
+        with self._lock:
+            if self._pending is not None:
+                return
+            self._pending = (frame.copy(), frame_idx)
+
+    def snapshot(self) -> tuple[list[dict], tuple[float, float] | None, int]:
+        with self._lock:
+            return [dict(d) for d in self._dets], self._timing, self._idx
+
+    def stop(self) -> None:
+        self._stop = True
+        self._thread.join(timeout=3.0)
+
+    def _loop(self) -> None:
+        while not self._stop:
+            with self._lock:
+                job = self._pending
+                self._pending = None
+            if job is None:
+                time.sleep(0.003)
+                continue
+            frame, frame_idx = job
+            dets, detect_ms, locate_ms = detect_and_locate(
+                frame, self._model, self._h_mat, **self._det_kw
+            )
+            if self._det_kw.get("track") and self._id_mapper is not None:
+                dets = self._id_mapper.apply(dets, frame_idx, frame=frame)
+            with self._lock:
+                self._dets = dets
+                self._timing = (detect_ms, locate_ms)
+                self._idx = frame_idx
+
+
 def render_detection_view(
     frame: np.ndarray,
     dets: list[dict],
@@ -669,7 +747,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--source", default=str(DEFAULT_IMAGE))
     p.add_argument("--calib", default=str(DEFAULT_CALIB))
     p.add_argument("--model", default="yolo26s.pt", help="Ultralytics detect weights (e.g. yolo26n/s/m.pt)")
-    p.add_argument("--conf", type=float, default=0.50, help="higher reduces desk/monitor FPs")
+    p.add_argument(
+        "--conf",
+        type=float,
+        default=0.45,
+        help="YOLO confidence (default 0.45; lower to 0.1 keeps more seated/far people, "
+        "higher drops monitors and door-edge fragments)",
+    )
     p.add_argument(
         "--ref",
         choices=["auto", "foot", "head_drop"],
@@ -692,19 +776,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--min-h-ratio",
         type=float,
-        default=0.15,
-        help="min box height / frame height; rejects hand/partial FPs before Re-ID",
+        default=0.06,
+        help="min box height / frame height; only drops tiny hand FPs",
     )
     p.add_argument(
         "--min-aspect",
         type=float,
-        default=1.2,
-        help="min box height / width (full person taller than wide)",
+        default=0.8,
+        help="min box height / width (seated people are often wider than 1.2)",
     )
     p.add_argument(
         "--min-bottom-ratio",
         type=float,
-        default=0.30,
+        default=0.12,
         help="reject boxes whose bottom is above this frame-height ratio (monitors)",
     )
     p.add_argument(
@@ -724,6 +808,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-width", type=int, default=1280)
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument(
+        "--save-video",
+        default=None,
+        help="save camera + grid preview as an MP4 using this exact tracking run",
+    )
+    p.add_argument(
+        "--no-show",
+        action="store_true",
+        help="do not open preview windows (useful with --save-video)",
+    )
+    p.add_argument(
         "--no-timing",
         action="store_true",
         help="hide detect/locate timing on the Grid window",
@@ -731,9 +825,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--stride",
         type=int,
-        default=2,
-        help="run YOLO every N frames; skipped frames reuse last detections "
-        "(default 2; use 1 only if you need denser track updates)",
+        default=5,
+        help="YOLO+grid occupancy every N display frames (default 5). "
+        "Camera still draws every frame with coasted boxes; "
+        "higher stride makes floor-grid lights change less often (more continuous)",
     )
     p.add_argument(
         "--cell-hold",
@@ -747,7 +842,7 @@ def parse_args() -> argparse.Namespace:
         dest="track",
         action="store_true",
         default=True,
-        help="enable ByteTrack IDs via model.track (default on for video)",
+        help="enable Ultralytics model.track persist=True (default on for video)",
     )
     p.add_argument(
         "--no-track",
@@ -758,7 +853,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tracker",
         default=str(DEFAULT_TRACKER),
-        help="Ultralytics tracker yaml (default: trackers/bytetrack_stable.yaml)",
+        help="Ultralytics tracker yaml (default: trackers/botsort.yaml, docs default)",
     )
     p.add_argument(
         "--imgsz",
@@ -771,13 +866,13 @@ def parse_args() -> argparse.Namespace:
         dest="realtime",
         action="store_true",
         default=True,
-        help="for local video: skip frames to keep near realtime (default on)",
+        help="for local video: cap playback near source fps without dropping track frames",
     )
     p.add_argument(
         "--no-realtime",
         dest="realtime",
         action="store_false",
-        help="process every frame even if playback becomes slow-motion",
+        help="do not pace local playback (fixed tracking frames are unchanged)",
     )
     p.add_argument(
         "--quiet",
@@ -831,17 +926,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--min-hits",
         type=int,
-        default=8,
+        default=16,
         help="detect-runs that must FAIL gallery before minting a NEW ID "
-        "(default 8; with --stride 2 ≈ 0.8s — reduces spurious ID3/ID4)",
+        "(default 16; with --stride 5 ≈ 4s at 20fps — reduces ID6/ID7 splits)",
     )
     p.add_argument(
         "--id-coast",
         type=int,
         default=8,
-        help="briefly keep last boxes when ALL detections drop "
-        "(default 8 ≈ 0.4s at 20fps; was 90 and looked like ghost boxes after leave). "
-        "ID rematch after longer gaps uses --id-sticky / gallery, not this",
+        help="briefly keep last INTERIOR boxes when ALL detections drop "
+        "(default 8 frames ≈ 0.4s; not multiplied by stride). "
+        "Boxes at the image edge are cleared immediately (person left). "
+        "ID rematch after a real leave uses --id-sticky / gallery, not this",
     )
     p.add_argument(
         "--id-sticky",
@@ -867,6 +963,27 @@ def parse_args() -> argparse.Namespace:
         help="do not save appearance gallery crop images",
     )
     p.add_argument(
+        "--review-dir",
+        default=str(Path(__file__).resolve().parent / "test" / "reid_review"),
+        help="per-run review crops for later cleanup (not used for live Re-ID)",
+    )
+    p.add_argument(
+        "--review-every",
+        type=int,
+        default=10,
+        help="save one review crop per ID every N video frames (default 10 ≈ 0.5s)",
+    )
+    p.add_argument(
+        "--review-dump",
+        action="store_true",
+        help="save a review photo database (off by default so tracking stays fast)",
+    )
+    p.add_argument(
+        "--no-review-dump",
+        action="store_true",
+        help="do not save the review photo database (default)",
+    )
+    p.add_argument(
         "--reid",
         dest="reid",
         action="store_true",
@@ -881,8 +998,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--reid-model",
-        default="yolo26n-reid.onnx",
-        help="Re-ID model: yolo26n/s-reid.onnx, or osnet / osnet_ain / osnet_ain_x1_0 / osnet_ibn",
+        default="osnet_ain",
+        help="Stable-ID appearance: osnet_ain / osnet / yolo26n-reid.onnx "
+        "(BoT-SORT short ReID is set in trackers/botsort.yaml)",
     )
     return p.parse_args()
 
@@ -915,18 +1033,28 @@ def main() -> None:
     grid_win = "Grid"
     if args.track:
         print(
-            f"偵測＋追蹤：YOLO（{args.model}）+ ByteTrack（{tracker_path.name}），"
-            f"conf={args.conf}，imgsz={args.imgsz}，stride={args.stride}"
+            f"偵測＋追蹤：YOLO（{args.model}）+ BoT-SORT（{tracker_path.name}）"
+            f" persist=True，conf={args.conf}，imgsz={args.imgsz}，stride={args.stride}"
         )
     else:
         print(
             f"偵測：YOLO（{args.model}），conf={args.conf}，"
             f"imgsz={args.imgsz}（每幀獨立，無 ID／追蹤）"
         )
+    if args.track:
+        print(
+            "官方 track：同一支影片連續幀 model.track(persist=True)；"
+            "靜態相機 gmc=none；BoT-SORT 不開短 ReID（長期 ID 交給 OSNet 圖庫＋座位）。"
+        )
+        print("畫面與 YOLO 分執行緒，預覽不因推論卡住。")
     print(f"參考點模式：{args.ref}（紅=foot，紫=head_drop）。按 q 結束，s 存圖。")
     print(f"預覽寬度固定 max-width={args.max_width}（影片與格子視窗皆鎖定畫面像素大小）")
     if args.stride > 1:
-        print(f"跳幀：每 {args.stride} 幀才跑 YOLO，中間幀沿用上次偵測／ID。")
+        print(
+            f"跳幀：相機每幀都畫（框會預測跟上）；"
+            f"YOLO 與格子佔用每 {args.stride} 幀才更新"
+            f"（再加 cell-hold={args.cell_hold}，格子比較連續、比較不閃）。"
+        )
     if args.cell_hold > 1:
         print(f"防抖：格子需連續 {args.cell_hold} 次偵測結果一致才會點亮／熄滅。")
     if args.out_margin > 0:
@@ -1018,8 +1146,8 @@ def main() -> None:
     use_realtime = bool(args.realtime and is_file_video)
     if use_realtime:
         print(
-            f"本機影片：即時跟播（約 {video_fps:.1f} fps）；"
-            "推論慢會自動丟幀。完整逐幀請加 --no-realtime"
+            f"本機影片：以約 {video_fps:.1f} fps 為播放上限；"
+            "推論慢時播放會變慢，但不丟追蹤幀。"
         )
 
     stabilizer = CellStabilizer(args.cell_hold)
@@ -1036,25 +1164,13 @@ def main() -> None:
             reid_encoder = PersonReIDEncoder(model_name)
             print(
                 f"Re-ID 就緒：{reid_encoder.model_name} "
-                f"[backend={reid_encoder.backend}]（深度外貌特徵）。"
+                f"[backend={reid_encoder.backend}]（Stable-ID 長期圖庫）。"
             )
-            # Keep YOLO denser so boxes track motion; Re-ID is already lazy.
-            import sys
-
-            stride_set = any(
-                a == "--stride" or a.startswith("--stride=") for a in sys.argv[1:]
-            )
-            if reid_encoder.backend == "osnet":
-                if not stride_set:
-                    args.stride = 2
-                print(
-                    f"OSNet：YOLO 每 {args.stride} 幀更新框"
-                    "（跳幀會預測框位置；要更跟手可改 --stride 1）。"
-                )
         except Exception as exc:  # noqa: BLE001
             print(f"Re-ID 載入失敗，改回 HSV：{exc}")
             reid_encoder = None
 
+    coast_frames = max(int(args.id_coast), int(args.stride))
     id_mapper = StableIdMapper(
         max_dist_cm=args.id_max_dist,
         max_gap_frames=args.id_max_gap,
@@ -1064,10 +1180,16 @@ def main() -> None:
         single_person=args.single_person,
         min_hits=args.min_hits,
         encoder=reid_encoder,
-        coast_frames=args.id_coast,
+        coast_frames=coast_frames,
         sticky_frames=args.id_sticky,
         max_prototypes=args.max_prototypes,
         gallery_dir=None if args.no_gallery_dump else args.gallery_dir,
+        review_dir=(
+            args.review_dir
+            if args.review_dump and not args.no_review_dump
+            else None
+        ),
+        review_every=args.review_every,
     )
     if args.track:
         if args.single_person:
@@ -1083,13 +1205,26 @@ def main() -> None:
                 f"ID 穩定層：{appear_mode}｜YOLO框人 → temp 比對過去 ID 照片 → "
                 f"命中沿用／連續追蹤換裝則存新照／都沒中才發新 ID；"
                 f"appear≥{args.appear_thresh:.2f}，{proto_s}；"
-                f"新 ID 需連續 {args.min_hits} 次仍對不上圖庫才發號。"
+                f"新 ID 需連續 {args.min_hits} 次仍對不上圖庫才發號；"
+                "場上人數沒增加時優先接回空缺座位、不發新號。"
             )
+        print(
+            f"進出畫面：室內漏檢沿用約 {max(coast_frames, int(id_mapper.fps * 1.2))} 幀；"
+            "貼畫面邊緣的框立刻清除（人已離開），不把殘框留在場上。"
+        )
         if not args.no_gallery_dump:
             print(
                 f"外貌圖庫：{args.gallery_dir}（ID***/；temp/current.jpg=當前比對圖；"
-                f"每次重跑清空）"
+                f"每次重跑清空，只供即時比對）"
             )
+        if id_mapper.review is not None:
+            print(
+                f"審查資料庫：{id_mapper.review.session_dir} "
+                f"（每個 ID 約每 {args.review_every} 幀一張，背景 Pillow 寫檔，"
+                "不參與即時比對；錯圖可之後刪）"
+            )
+        else:
+            print("審查資料庫：關閉（預設；要存錯圖審查請加 --review-dump）")
         print(
             f"誤檢過濾：conf≥{args.conf}，min_bottom={args.min_bottom_ratio}，"
             f"min_aspect={args.min_aspect}，min_h={args.min_h_ratio}"
@@ -1098,11 +1233,31 @@ def main() -> None:
             print("ID 變化會印 [ID-CHANGE]（時刻 / elapsed / video / frame）。")
         print("格子視窗會標示各 ID 所在格（不同人不同底色）。")
 
+    # Local files must be reproducible: process the fixed stride frames
+    # synchronously so BoT-SORT always sees 1, 1+stride, 1+2*stride, ...
+    # RTSP remains asynchronous/latest-frame because low live latency matters
+    # more than replay determinism there.
+    worker = (
+        None
+        if is_file_video
+        else AsyncTrackWorker(model, h_mat, det_kw, id_mapper if args.track else None)
+    )
+    if is_file_video:
+        print(
+            f"本機影片：固定取樣第 1、{1 + args.stride}、"
+            f"{1 + 2 * args.stride}…幀；同一影片重跑使用相同追蹤幀。"
+        )
+    save_path = Path(args.save_video).resolve() if args.save_video else None
+    video_writer: cv2.VideoWriter | None = None
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"錄製展示影片：{save_path}")
     try:
         frame_idx = 0
         last_dets: list[dict] = []
         last_timing: tuple[float, float] | None = None
         last_id_key: tuple[int, ...] | None = None
+        last_obs_idx = -1
         t_play0 = time.perf_counter()
         log_fps = video_fps if (is_file_video or use_latest) else 20.0
         while True:
@@ -1116,68 +1271,102 @@ def main() -> None:
                     continue
                 frame_idx += 1
             else:
-                if use_realtime:
-                    # Drop frames so wall-clock stays near video timeline.
-                    target = int((time.perf_counter() - t_play0) * video_fps) + 1
-                    while frame_idx + 1 < target:
-                        if not cap.grab():
-                            ok, frame = False, None
-                            break
-                        frame_idx += 1
-                    else:
-                        ok, frame = cap.read()
-                        if ok:
-                            frame_idx += 1
-                else:
-                    ok, frame = cap.read()
-                    if ok:
-                        frame_idx += 1
+                ok, frame = cap.read()
+                if ok:
+                    frame_idx += 1
                 if not ok or frame is None:
                     print("讀取結束或失敗。")
                     break
 
             run_detect = frame_idx == 1 or (frame_idx - 1) % args.stride == 0
-            if run_detect:
-                last_dets, detect_ms, locate_ms = detect_and_locate(
-                    frame, model, h_mat, **det_kw
-                )
-                if det_kw.get("track"):
-                    last_dets = id_mapper.apply(last_dets, frame_idx, frame=frame)
-                box_coaster.observe(last_dets, frame_idx)
-                last_timing = None if args.no_timing else (detect_ms, locate_ms)
+            if is_file_video:
+                if run_detect:
+                    dets, detect_ms, locate_ms = detect_and_locate(
+                        frame, model, h_mat, **det_kw
+                    )
+                    if det_kw.get("track"):
+                        dets = id_mapper.apply(dets, frame_idx, frame=frame)
+                    timing = (detect_ms, locate_ms)
+                    det_idx = frame_idx
+                else:
+                    dets = last_dets
+                    timing = last_timing
+                    det_idx = last_obs_idx
+            else:
+                if run_detect:
+                    worker.try_submit(frame, frame_idx)
+                dets, timing, det_idx = worker.snapshot()
+            if det_idx != last_obs_idx:
+                last_obs_idx = det_idx
+                last_dets = dets
+                last_timing = None if args.no_timing else timing
+                box_coaster.observe(last_dets, det_idx if det_idx else frame_idx)
                 raw_cells = {d["cell"] for d in last_dets if d.get("cell") is not None}
                 confirmed_cells = stabilizer.update(raw_cells)
-                draw_dets = last_dets
-            else:
-                # Predict box motion on skipped frames so overlay keeps up.
-                draw_dets = box_coaster.extrapolate(last_dets, frame_idx)
-            timing = last_timing if not args.no_timing else None
+                if det_kw.get("track") and args.log_id:
+                    id_key = tuple(
+                        sorted(
+                            d["track_id"]
+                            for d in last_dets
+                            if d.get("track_id") is not None
+                        )
+                    )
+                    if id_key != last_id_key:
+                        log_id_change(det_idx, log_fps, t_play0, last_id_key, id_key)
+                        last_id_key = id_key
+            # Full-resolution resize + annotation + two GUI windows are
+            # expensive on this 2880x1620 CPU-only setup. Keep every tracking
+            # frame, but render a deterministic ~9 fps preview between them.
+            # This changes display smoothness only, never the BoT-SORT input.
+            render_frame = (
+                save_path is not None
+                or not is_file_video
+                or run_detect
+                or frame_idx == 1
+                or (frame_idx - 1) % 3 == 0
+            )
+            if not render_frame:
+                continue
+            draw_dets = (
+                box_coaster.extrapolate(last_dets, frame_idx) if last_dets else last_dets
+            )
             vis, grid, logs = render_detection_view(
                 frame,
                 draw_dets,
                 h_mat,
                 args.valid_xmin,
-                timing=timing,
-                cached=not run_detect,
+                timing=last_timing,
+                cached=det_idx != frame_idx,
                 grid_cells=confirmed_cells,
                 max_width=args.max_width,
                 grid_cache=grid_cache,
                 out_margin=args.out_margin,
             )
-            if run_detect and det_kw.get("track") and args.log_id:
-                id_key = tuple(
-                    sorted(d["track_id"] for d in last_dets if d.get("track_id") is not None)
-                )
-                if id_key != last_id_key:
-                    log_id_change(frame_idx, log_fps, t_play0, last_id_key, id_key)
-                    last_id_key = id_key
-            if run_detect and not args.quiet:
+            if det_idx == frame_idx and not args.quiet:
                 for line in logs:
                     print(line)
-            if not show_fixed_window(cam_win, vis) or not show_grid_window(grid_win, grid):
-                break
+            if save_path is not None:
+                demo_frame = stack_demo_views(vis, grid)
+                if video_writer is None:
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    video_writer = cv2.VideoWriter(
+                        str(save_path),
+                        fourcc,
+                        video_fps,
+                        (demo_frame.shape[1], demo_frame.shape[0]),
+                    )
+                    if not video_writer.isOpened():
+                        raise RuntimeError(f"無法建立影片：{save_path}")
+                video_writer.write(demo_frame)
+            if not args.no_show:
+                if not show_fixed_window(cam_win, vis) or not show_grid_window(
+                    grid_win, grid
+                ):
+                    break
 
-            if use_realtime:
+            if args.no_show:
+                key = -1
+            elif use_realtime:
                 # If we are ahead of the timeline, wait a bit.
                 ahead = frame_idx / video_fps - (time.perf_counter() - t_play0)
                 wait_ms = 1
@@ -1193,6 +1382,10 @@ def main() -> None:
             elif key in (ord("q"), 27):
                 break
     finally:
+        if video_writer is not None:
+            video_writer.release()
+        if worker is not None:
+            worker.stop()
         if reader is not None:
             reader.release()
         else:

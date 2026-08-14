@@ -12,11 +12,98 @@ Intended pipeline (matches product design):
 
 from __future__ import annotations
 
+import queue
 import shutil
+import threading
+from datetime import datetime
 from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image
+
+
+class ReviewDumper:
+    """Background file dump for later human cleanup. Not used for live Re-ID.
+
+    The tracker thread only copies a numpy crop onto a drop-if-full queue.
+    Resize, JPEG, and disk I/O run on a side thread with Pillow — never
+    OpenCV — so YOLO/BoT-SORT is not slowed and does not share cv2 state.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        every_frames: int = 10,
+        max_edge: int = 320,
+        jpeg_quality: int = 85,
+    ) -> None:
+        self.every_frames = max(1, int(every_frames))
+        self.max_edge = max(64, int(max_edge))
+        self.jpeg_quality = int(jpeg_quality)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_dir = Path(root) / stamp
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self._last_frame: dict[int, int] = {}
+        self._q: queue.Queue[tuple[Path, np.ndarray] | None] = queue.Queue(maxsize=24)
+        self._thread = threading.Thread(
+            target=self._writer, name="review-dump", daemon=True
+        )
+        self._thread.start()
+
+    def _writer(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            path, crop = item
+            try:
+                rgb = crop[:, :, ::-1]
+                img = Image.fromarray(rgb)
+                img.thumbnail(
+                    (self.max_edge, self.max_edge), Image.Resampling.BILINEAR
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                img.save(
+                    path,
+                    format="JPEG",
+                    quality=self.jpeg_quality,
+                    optimize=False,
+                )
+            except Exception:
+                continue
+
+    def maybe_save(
+        self,
+        sid: int,
+        frame: np.ndarray,
+        xyxy: tuple[int, int, int, int],
+        frame_idx: int,
+    ) -> None:
+        last = self._last_frame.get(sid, -10**9)
+        if frame_idx - last < self.every_frames:
+            return
+        x1, y1, x2, y2 = [int(v) for v in xyxy]
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w - 1, x2), min(h - 1, y2)
+        if x2 - x1 < 8 or y2 - y1 < 16:
+            return
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+        # Cheap integer downsample so the queue stays small; Pillow does
+        # the final resize. No OpenCV on this thread.
+        edge = max(crop.shape[0], crop.shape[1])
+        step = max(1, edge // (self.max_edge * 2))
+        crop = np.ascontiguousarray(crop[::step, ::step])
+        path = self.session_dir / f"ID{sid:03d}" / f"f{frame_idx:05d}.jpg"
+        try:
+            self._q.put_nowait((path, crop))
+            self._last_frame[sid] = frame_idx
+        except queue.Full:
+            return
 
 
 class StableIdMapper:
@@ -50,6 +137,8 @@ class StableIdMapper:
         proto_new_thresh: float | None = None,
         gallery_dir: str | Path | None = None,
         gallery_latest_every: int = 20,
+        review_dir: str | Path | None = None,
+        review_every: int = 10,
     ) -> None:
         self.max_dist_cm = max_dist_cm
         self.max_gap_frames = max_gap_frames
@@ -75,6 +164,11 @@ class StableIdMapper:
         )
         self.gallery_latest_every = max(1, int(gallery_latest_every))
         self.gallery_dir = Path(gallery_dir) if gallery_dir else None
+        self.review = (
+            ReviewDumper(review_dir, every_frames=review_every)
+            if review_dir
+            else None
+        )
         self._raw_to_stable: dict[int, int] = {}
         self._stable: dict[int, dict] = {}
         self._raw_hits: dict[int, int] = {}
@@ -84,14 +178,19 @@ class StableIdMapper:
         self._next_id = 1
         self._last_out: list[dict] = []
         self._last_out_frame = 0
+        self._sid_last_real: dict[int, int] = {}
+        self._sid_last_embed_frame: dict[int, int] = {}
+        self._last_identity_audit_frame = -10**9
         self._gallery_latest_at: dict[int, int] = {}
         self._gallery_first_saved: set[int] = set()
         self._gallery_best_area: dict[int, int] = {}
         self._gallery_best: dict[int, tuple[float, np.ndarray]] = {}
         self._gallery_first_wh: dict[int, tuple[int, int]] = {}
         self._gallery_first_feat: dict[int, np.ndarray] = {}
+        self._gallery_first_color: dict[int, np.ndarray] = {}
         self._sid_born_frame: dict[int, int] = {}
         self._unbind_votes: dict[int, tuple[str, int]] = {}
+        self._unknown_raw_pending: dict[int, tuple[int, int]] = {}
         self._temp_dir: Path | None = None
         if self.gallery_dir is not None:
             if self.gallery_dir.exists():
@@ -214,12 +313,18 @@ class StableIdMapper:
         feat: np.ndarray | None,
         used_sids: set[int],
         assigned_world: dict[int, tuple[float, float]],
+        xyxy: tuple[int, int, int, int] | None = None,
+        assigned_boxes: dict[int, tuple[int, int, int, int]] | None = None,
     ) -> int | None:
         """Collapse a second YOLO box of the *same* person only.
 
-        Must NOT merge two nearby people (adjacent desks). Require nearly the
-        same foot point; appearance alone is never enough.
+        Must NOT merge two nearby people (adjacent desks). Prefer overlapping
+        boxes (edge split); otherwise require nearly the same foot point.
         """
+        if xyxy is not None and assigned_boxes:
+            overlap = self._overlap_sid(xyxy, assigned_boxes)
+            if overlap is not None:
+                return overlap
         if world is None:
             return None
         best: tuple[float, int] | None = None
@@ -232,21 +337,34 @@ class StableIdMapper:
                 continue
             dist = self._dist(world, anchor)
             # ~one grid cell; two standing classmates are usually farther.
-            if dist > 55.0:
+            if dist > 90.0:
                 continue
-            if dist <= 35.0:
+            if dist <= 50.0:
                 score = dist
             else:
-                # 35–55cm: only if appearance also strongly agrees.
+                # 50–90cm: only if appearance also agrees (occlusion double-box).
                 if feat is None or meta is None:
                     continue
                 sim = self._best_proto_sim(feat, meta)
-                if sim < self.appear_thresh + 0.12:
+                if sim < self.soft_appear_thresh:
                     continue
                 score = dist
             if best is None or score < best[0]:
                 best = (score, sid)
         return None if best is None else best[1]
+
+    def _overlap_sid(
+        self,
+        xyxy: tuple[int, int, int, int],
+        assigned_boxes: dict[int, tuple[int, int, int, int]],
+    ) -> int | None:
+        best: int | None = None
+        for sid, box in assigned_boxes.items():
+            if not self._boxes_same_person(xyxy, box):
+                continue
+            if best is None or sid < best:
+                best = sid
+        return best
 
     def _short_gap_recover(
         self,
@@ -281,6 +399,56 @@ class StableIdMapper:
                 best = cand
         return None if best is None else best[2]
 
+    def _reuse_free_sid(
+        self,
+        world: tuple[float, float] | None,
+        frame_idx: int,
+        used_sids: set[int],
+        feat: np.ndarray | None = None,
+    ) -> int | None:
+        """Reuse a recently-seen free ID by desk location.
+
+        Appearance is a tie-break. Does not assume how many people are on screen:
+        a free ID at another desk is not reused just because this frame has one box.
+        """
+        recover_frames = max(int(self.sticky_frames), int(self.fps * 8))
+        best: tuple[float, float, int] | None = None  # dist, -sim, sid
+        for sid, meta in self._stable.items():
+            if sid in used_sids:
+                continue
+            gap = frame_idx - int(meta["frame"])
+            if gap < 0 or gap > recover_frames:
+                continue
+            if world is None:
+                dist = 9999.0
+            else:
+                dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
+            limit = max(self._reach_limit_cm(gap), 250.0)
+            if world is not None and dist > limit:
+                continue
+            sim = self._best_proto_sim(feat, meta) if feat is not None else 0.0
+            cand = (dist, -sim, sid)
+            if best is None or cand < best:
+                best = cand
+        return None if best is None else best[2]
+
+    def _recent_alive_count(self, frame_idx: int) -> int:
+        window = max(int(self.sticky_frames), int(self.fps * 8))
+        return sum(
+            1
+            for meta in self._stable.values()
+            if 0 <= frame_idx - int(meta["frame"]) <= window
+        )
+
+    def _should_refuse_mint(self, frame_idx: int, n_dets: int) -> bool:
+        """If we already have enough recent IDs for this many boxes, do not mint.
+
+        A new person (more boxes than recent IDs) may still mint. Extra boxes of
+        the same body are collapsed by overlap, not by assuming a head-count.
+        """
+        n_alive = self._recent_alive_count(frame_idx)
+        return n_alive > 0 and n_alive >= n_dets
+
     @staticmethod
     def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
         return float(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5)
@@ -308,6 +476,23 @@ class StableIdMapper:
         if n < 1e-6:
             return None
         return hist / n
+
+    @staticmethod
+    def _color_feat_from_crop(crop: np.ndarray | None) -> np.ndarray | None:
+        if crop is None or crop.size == 0:
+            return None
+        h, w = crop.shape[:2]
+        # In this seated camera view, the tracked body occupies the left/middle
+        # of overlapped boxes; the right side often contains the person behind.
+        torso = crop[int(0.18 * h) : int(0.70 * h), : int(0.58 * w)]
+        if torso.size == 0:
+            return None
+        hsv = cv2.cvtColor(torso, cv2.COLOR_BGR2HSV)
+        feat = cv2.calcHist(
+            [hsv], [0, 1], None, [24, 16], [0, 180, 0, 256]
+        ).flatten().astype(np.float32)
+        norm = float(np.linalg.norm(feat))
+        return None if norm < 1e-6 else feat / norm
 
     @staticmethod
     def _appear_sim(a: np.ndarray | None, b: np.ndarray | None) -> float:
@@ -417,32 +602,50 @@ class StableIdMapper:
         return inter / float(area_a + area_b - inter)
 
     @classmethod
+    def _boxes_same_person(
+        cls,
+        a: tuple[int, int, int, int],
+        b: tuple[int, int, int, int],
+    ) -> bool:
+        """True when two boxes are a split / nested detection of one body."""
+        iou = cls._box_iou(a, b)
+        if iou >= 0.40:
+            return True
+        ax1, ay1, ax2, ay2 = [int(v) for v in a]
+        bx1, by1, bx2, by2 = [int(v) for v in b]
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if inter <= 0:
+            return False
+        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1, (bx2 - bx1) * (by2 - by1))
+        # Nested / truncated fragment inside a larger person box.
+        return inter / float(min(area_a, area_b)) >= 0.60
+
+    @classmethod
     def _gallery_conflicts_others(
         cls,
         xyxy: tuple[int, int, int, int],
         others: list[tuple[int, int, int, int]] | None,
     ) -> bool:
-        """True if this box already swallowed (or heavily overlaps) another person."""
+        """True when another detected person can contaminate this crop."""
         if not others:
             return False
         x1, y1, x2, y2 = [int(v) for v in xyxy]
         area = max(1, (x2 - x1) * (y2 - y1))
         for ob in others:
+            iou = cls._box_iou(xyxy, ob)
+            if iou >= 0.35:
+                return True
             ox1, oy1, ox2, oy2 = [int(v) for v in ob]
-            # Any meaningful IoU → two people too close for a clean gallery shot.
-            if cls._box_iou(xyxy, ob) >= 0.05:
-                return True
-            # Other person's center inside my box (classic mega-box contamination).
-            cx = 0.5 * (ox1 + ox2)
-            cy = 0.5 * (oy1 + oy2)
-            if x1 <= cx <= x2 and y1 <= cy <= y2:
-                return True
-            # My box covers a large fraction of the other person.
             ix1, iy1 = max(x1, ox1), max(y1, oy1)
             ix2, iy2 = min(x2, ox2), min(y2, oy2)
             inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
             oarea = max(1, (ox2 - ox1) * (oy2 - oy1))
-            if inter / float(oarea) >= 0.35 or inter / float(area) >= 0.20:
+            smaller = min(area, oarea)
+            # Even partial overlap can put a classmate's shirt/face into OSNet.
+            if inter / float(smaller) >= 0.65:
                 return True
         return False
 
@@ -702,18 +905,9 @@ class StableIdMapper:
                 crop = frame[y1:y2, x1:x2].copy()
         if crop is None:
             return False
-        if self._crop_has_split_outfits(crop):
-            return False
         score = self._gallery_person_score(frame, xyxy, conf, others=others)
 
         if capture_first and sid not in self._gallery_first_saved:
-            # Wait for a usable enrollment shot (not blurry / not multi-person).
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            sharp = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-            if sharp < 40.0 or score <= 0.0:
-                return False
-            if self._crop_has_split_outfits(crop):
-                return False
             self._write_gallery_crop(sid, "first.jpg", crop)
             self._write_gallery_crop(sid, "proto_0.jpg", crop)
             self._write_gallery_crop(sid, "latest.jpg", crop)
@@ -724,13 +918,12 @@ class StableIdMapper:
             self._gallery_best_area[sid] = int(crop.shape[0] * crop.shape[1])
             if feat is not None:
                 self._gallery_first_feat[sid] = feat.copy()
+            color_feat = self._color_feat_from_crop(crop)
+            if color_feat is not None:
+                self._gallery_first_color[sid] = color_feat
             return True
 
         if sid not in self._gallery_first_saved:
-            return False
-        if not self._crop_looks_like_one_person(
-            sid, crop, frame, xyxy, conf, others=others
-        ):
             return False
 
         if also_proto is not None and also_proto > 0:
@@ -746,6 +939,14 @@ class StableIdMapper:
                     )
             return True
         if score <= 0.0:
+            due = (
+                frame_idx - self._gallery_latest_at.get(sid, -10**9)
+                >= self.gallery_latest_every
+            )
+            if due:
+                self._write_gallery_crop(sid, "latest.jpg", crop)
+                self._gallery_latest_at[sid] = frame_idx
+                return True
             return False
 
         prev = self._gallery_best.get(sid)
@@ -878,7 +1079,14 @@ class StableIdMapper:
         """If two people were crossed, reassign IDs to maximize appearance match."""
         import itertools
 
-        idxs = list(assigned.keys())
+        # A confirmed newcomer can receive a SID earlier in this frame; its
+        # stable metadata/prototypes are created later in the output pass.
+        # Swap auditing must only compare already-enrolled identities.
+        idxs = [
+            i
+            for i, sid in assigned.items()
+            if sid in self._stable and self._proto_list(self._stable[sid])
+        ]
         if len(idxs) < 2 or len(idxs) > 4:
             return
         sids = [assigned[i] for i in idxs]
@@ -902,6 +1110,21 @@ class StableIdMapper:
                 best_perm = perm
         if best_perm == tuple(range(len(idxs))):
             return
+        # Appearance-only swaps teleport seated classmates when clothes look alike.
+        for a, b in enumerate(best_perm):
+            if a == b:
+                continue
+            w = work[idxs[a]].get("world")
+            if w is None:
+                continue
+            meta_old = self._stable.get(sids[a])
+            meta_new = self._stable.get(sids[b])
+            if meta_old is None or meta_new is None:
+                continue
+            dist_old = self._dist(w, (float(meta_old["wx"]), float(meta_old["wy"])))
+            dist_new = self._dist(w, (float(meta_new["wx"]), float(meta_new["wy"])))
+            if dist_old + 80.0 < dist_new:
+                return
         # Apply swap.
         new_map = {idxs[a]: sids[b] for a, b in enumerate(best_perm)}
         assigned.clear()
@@ -919,6 +1142,103 @@ class StableIdMapper:
                 assigned_world[sid] = (float(w[0]), float(w[1]))
         # silence unused
         _ = used
+
+    def _audit_color_bindings(
+        self,
+        work: list[dict],
+        assigned: dict[int, int],
+        used_sids: set[int],
+        assigned_world: dict[int, tuple[float, float]],
+        frame: np.ndarray | None,
+        drop_unknown: bool = False,
+    ) -> None:
+        """Correct obvious raw-track swaps using clean enrollment clothing."""
+        if frame is None or len(self._gallery_first_color) < 2:
+            return
+        colors: dict[int, np.ndarray] = {}
+        for i in assigned:
+            xyxy = work[i].get("xyxy")
+            color = (
+                self._color_feat_from_crop(self._crop_person(frame, xyxy))
+                if xyxy is not None
+                else None
+            )
+            if color is not None:
+                colors[i] = color
+
+        # Both IDs are occupied, but each crop matches the other's enrollment.
+        indices = list(assigned)
+        for pos, i in enumerate(indices):
+            for j in indices[pos + 1 :]:
+                sid_i, sid_j = assigned[i], assigned[j]
+                ci, cj = colors.get(i), colors.get(j)
+                ei = self._gallery_first_color.get(sid_i)
+                ej = self._gallery_first_color.get(sid_j)
+                if ci is None or cj is None or ei is None or ej is None:
+                    continue
+                own = self._appear_sim(ci, ei) + self._appear_sim(cj, ej)
+                cross_i = self._appear_sim(ci, ej)
+                cross_j = self._appear_sim(cj, ei)
+                if (
+                    min(cross_i, cross_j) < 0.45
+                    or max(cross_i, cross_j) < 0.65
+                    or cross_i + cross_j < own + 0.35
+                ):
+                    continue
+                assigned[i], assigned[j] = sid_j, sid_i
+                wi, wj = work[i].get("world"), work[j].get("world")
+                if wi is not None:
+                    assigned_world[sid_j] = (float(wi[0]), float(wi[1]))
+                if wj is not None:
+                    assigned_world[sid_i] = (float(wj[0]), float(wj[1]))
+                for k, sid in ((i, sid_j), (j, sid_i)):
+                    raw = work[k].get("track_id")
+                    if raw is not None:
+                        self._raw_to_stable[int(raw)] = sid
+
+        for i, sid in list(assigned.items()):
+            own_enrollment = self._gallery_first_color.get(sid)
+            color = colors.get(i)
+            if own_enrollment is None or color is None:
+                continue
+            own = self._appear_sim(color, own_enrollment)
+            best: tuple[float, int] | None = None
+            for other, enrollment in self._gallery_first_color.items():
+                if other == sid or other in used_sids:
+                    continue
+                sim = self._appear_sim(color, enrollment)
+                if best is None or sim > best[0]:
+                    best = (sim, other)
+            can_switch = (
+                best is not None
+                and own < 0.45
+                and best[0] >= 0.65
+                and best[0] >= own + 0.20
+            )
+            if not can_switch:
+                if drop_unknown and own < 0.40:
+                    assigned.pop(i, None)
+                    used_sids.discard(sid)
+                    assigned_world.pop(sid, None)
+                    raw = work[i].get("track_id")
+                    if raw is not None:
+                        raw = int(raw)
+                        self._raw_to_stable.pop(raw, None)
+                        count, _last = self._unknown_raw_pending.get(raw, (0, -1))
+                        self._unknown_raw_pending[raw] = (count + 1, self._raw_last_frame.get(raw, 0))
+                continue
+            assert best is not None
+            other = best[1]
+            used_sids.discard(sid)
+            used_sids.add(other)
+            assigned[i] = other
+            assigned_world.pop(sid, None)
+            world = work[i].get("world")
+            if world is not None:
+                assigned_world[other] = (float(world[0]), float(world[1]))
+            raw = work[i].get("track_id")
+            if raw is not None:
+                self._raw_to_stable[int(raw)] = other
 
     def _audit_raw_bindings(
         self,
@@ -995,7 +1315,7 @@ class StableIdMapper:
     ) -> tuple[int | None, float]:
         """Best gallery rematch: appearance + spatial nearness (not newest ID)."""
         best: tuple[float, float, float, int] | None = None
-        # score, sim, -dist, sid
+        # score, sim, -dist, -sid  (older ID wins exact ties)
         for sid, meta in self._stable.items():
             if sid in used_sids:
                 continue
@@ -1017,12 +1337,162 @@ class StableIdMapper:
                     score += 0.03
                 else:
                     score -= min(0.12, (dist - 150.0) / 2000.0)
-            cand = (score, sim, -dist, sid)
+            cand = (score, sim, -dist, -sid)
             if best is None or cand > best:
                 best = cand
         if best is None:
             return None, -1.0
-        return best[3], best[1]
+        return -best[3], best[1]
+
+    def _retire_young_sid(self, lose_sid: int, win_sid: int, frame_idx: int) -> None:
+        """Drop a freshly minted split-ID so leave/re-enter keeps ID1."""
+        if lose_sid == win_sid:
+            return
+        born = self._sid_born_frame.get(lose_sid)
+        age = frame_idx - int(born) if born is not None else 10**9
+        if age > int(max(self.fps * 4, 80)):
+            return
+        self._stable.pop(lose_sid, None)
+        self._sid_born_frame.pop(lose_sid, None)
+        self._sid_last_embed_frame.pop(lose_sid, None)
+        self._gallery_latest_at.pop(lose_sid, None)
+        self._gallery_first_saved.discard(lose_sid)
+        self._gallery_best_area.pop(lose_sid, None)
+        self._gallery_best.pop(lose_sid, None)
+        self._gallery_first_wh.pop(lose_sid, None)
+        self._gallery_first_feat.pop(lose_sid, None)
+        self._gallery_first_color.pop(lose_sid, None)
+        for raw, sid in list(self._raw_to_stable.items()):
+            if sid == lose_sid:
+                self._raw_to_stable[raw] = win_sid
+        if lose_sid == self._next_id - 1:
+            self._next_id = lose_sid
+
+    def _collapse_split_outputs(
+        self, out: list[dict], frame_idx: int
+    ) -> list[dict]:
+        if len(out) < 2:
+            return out
+        keep = [True] * len(out)
+        for i in range(len(out)):
+            if not keep[i]:
+                continue
+            for j in range(i + 1, len(out)):
+                if not keep[j]:
+                    continue
+                if not self._boxes_same_person(out[i]["xyxy"], out[j]["xyxy"]):
+                    continue
+                si = int(out[i]["track_id"])
+                sj = int(out[j]["track_id"])
+                if si == sj:
+                    keep[j] = False
+                    raw = out[j].get("raw_track_id")
+                    if raw is not None:
+                        self._raw_to_stable[int(raw)] = si
+                    continue
+                color_i = self._gallery_first_color.get(si)
+                color_j = self._gallery_first_color.get(sj)
+                if (
+                    color_i is not None
+                    and color_j is not None
+                    and self._appear_sim(color_i, color_j) < 0.45
+                ):
+                    # Adjacent classmates can have nested boxes while seated.
+                    # Distinct clean enrollment colors prove they are not a
+                    # split detection of one body.
+                    continue
+                loser, winner = (j, i) if si < sj else (i, j)
+                keep[loser] = False
+                win_sid = int(out[winner]["track_id"])
+                lose_sid = int(out[loser]["track_id"])
+                raw = out[loser].get("raw_track_id")
+                if raw is not None:
+                    self._raw_to_stable[int(raw)] = win_sid
+                self._retire_young_sid(lose_sid, win_sid, frame_idx)
+        return [d for d, k in zip(out, keep) if k]
+
+    def _dump_review(
+        self,
+        out: list[dict],
+        frame: np.ndarray | None,
+        frame_idx: int,
+    ) -> None:
+        if self.review is None or frame is None:
+            return
+        for d in out:
+            sid = d.get("track_id")
+            xyxy = d.get("xyxy")
+            if sid is None or xyxy is None:
+                continue
+            self.review.maybe_save(int(sid), frame, xyxy, frame_idx)
+
+    @staticmethod
+    def _box_at_border(
+        det: dict, frame: np.ndarray | None, frac: float = 0.04
+    ) -> bool:
+        """True when the box is clipped to the image edge (person walking out)."""
+        if frame is None:
+            return False
+        xyxy = det.get("xyxy")
+        if xyxy is None:
+            return False
+        h, w = frame.shape[:2]
+        m = max(16, int(frac * min(w, h)))
+        x1, y1, x2, y2 = [int(v) for v in xyxy]
+        return x1 <= m or y1 <= m or x2 >= w - m or y2 >= h - m
+
+    def _coasted_empty_out(
+        self, frame_idx: int, frame: np.ndarray | None
+    ) -> list[dict]:
+        """Hold interior boxes briefly on a total miss; never after an exit."""
+        if (
+            not self._last_out
+            or self.coast_frames <= 0
+            or frame_idx - self._last_out_frame > self.coast_frames
+        ):
+            return []
+        keep = [
+            dict(d)
+            for d in self._last_out
+            if not self._box_at_border(d, frame)
+        ]
+        return keep
+
+    def _hold_missing_interior(
+        self,
+        out: list[dict],
+        frame_idx: int,
+        frame: np.ndarray | None,
+    ) -> list[dict]:
+        """Keep a recently seen ID if YOLO missed them this frame.
+
+        Does not assume how many people are present. Boxes at the image edge
+        (walking out) are not held — those must disappear immediately.
+        """
+        hold = max(int(self.coast_frames), int(self.fps * 1.2))
+        if hold <= 0:
+            return out
+        have = {
+            int(d["track_id"])
+            for d in out
+            if d.get("track_id") is not None
+        }
+        extra: list[dict] = []
+        for prev in self._last_out:
+            sid = prev.get("track_id")
+            if sid is None:
+                continue
+            sid = int(sid)
+            if sid in have:
+                continue
+            last = self._sid_last_real.get(sid, self._last_out_frame)
+            if frame_idx - int(last) > hold:
+                continue
+            if self._box_at_border(prev, frame):
+                continue
+            extra.append(dict(prev))
+            have.add(sid)
+        return out + extra
 
     def apply(
         self,
@@ -1032,13 +1502,7 @@ class StableIdMapper:
     ) -> list[dict]:
         self._expire(frame_idx)
         if not dets:
-            if (
-                self._last_out
-                and self.coast_frames > 0
-                and frame_idx - self._last_out_frame <= self.coast_frames
-            ):
-                return [dict(d) for d in self._last_out]
-            return []
+            return self._coasted_empty_out(frame_idx, frame)
 
         work = list(dets)
         if self.single_person and len(work) > 1:
@@ -1071,6 +1535,7 @@ class StableIdMapper:
         used_sids: set[int] = set()
         from_raw: set[int] = set()  # continuous ByteTrack → may learn new looks
         assigned_world: dict[int, tuple[float, float]] = {}
+        pending_unknown: set[int] = set()
 
         # 1) Continuous YOLO/ByteTrack box → keep the same stable ID
         #    (clothes change later records a photo, does not mint).
@@ -1079,6 +1544,22 @@ class StableIdMapper:
             if raw is None:
                 continue
             raw = int(raw)
+            pending = self._unknown_raw_pending.get(raw)
+            if pending is not None:
+                count = pending[0] + 1
+                if count < max(3, self.min_hits // 4):
+                    self._unknown_raw_pending[raw] = (count, frame_idx)
+                    pending_unknown.add(i)
+                    continue
+                self._unknown_raw_pending.pop(raw, None)
+                sid = self._alloc_stable_id()
+                assigned[i] = sid
+                used_sids.add(sid)
+                self._raw_to_stable[raw] = sid
+                w = det.get("world")
+                if w is not None:
+                    assigned_world[sid] = (float(w[0]), float(w[1]))
+                continue
             sid = self._raw_to_stable.get(raw)
             if sid is None or sid not in self._stable or sid in used_sids:
                 continue
@@ -1089,8 +1570,16 @@ class StableIdMapper:
             if w is not None:
                 assigned_world[sid] = (float(w[0]), float(w[1]))
 
-        # 1b) Catch ByteTrack body swaps early (two light tops look similar).
-        if len(work) >= 2:
+        self._audit_color_bindings(
+            work, assigned, used_sids, assigned_world, frame
+        )
+
+        # 1b) Audit body swaps periodically. Running OSNet over every person
+        # on every detection cannot keep up on the CPU-only setup.
+        identity_audit_due = (
+            frame_idx - self._last_identity_audit_frame >= max(1, int(self.fps))
+        )
+        if len(work) >= 2 and identity_audit_due:
             self._audit_raw_bindings(
                 work,
                 assigned,
@@ -1100,10 +1589,11 @@ class StableIdMapper:
                 feat_at,
                 frame_idx,
             )
+            self._last_identity_audit_frame = frame_idx
 
         # 2) Short-gap spatial recovery FIRST (stop ID thrash on brief drops).
         for i in range(len(work)):
-            if i in assigned:
+            if i in assigned or i in pending_unknown:
                 continue
             sid = self._short_gap_recover(
                 work[i].get("world"), frame_idx, used_sids, feat_at(i)
@@ -1116,9 +1606,29 @@ class StableIdMapper:
             if w is not None:
                 assigned_world[sid] = (float(w[0]), float(w[1]))
 
+        def assigned_boxes() -> dict[int, tuple[int, int, int, int]]:
+            return {
+                assigned[j]: work[j]["xyxy"]
+                for j in assigned
+                if work[j].get("xyxy") is not None
+            }
+
+        # 2b) Nested / split YOLO box of someone already assigned (door edge).
+        for i in range(len(work)):
+            if i in assigned or i in pending_unknown:
+                continue
+            sid = self._overlap_sid(work[i]["xyxy"], assigned_boxes())
+            if sid is None:
+                continue
+            assigned[i] = sid
+            used_sids.add(sid)
+            w = work[i].get("world")
+            if w is not None:
+                assigned_world[sid] = (float(w[0]), float(w[1]))
+
         # 3) Gallery rematch only after spatial miss (stricter identity reclaim).
         for i in range(len(work)):
-            if i in assigned:
+            if i in assigned or i in pending_unknown:
                 continue
             raw_i = work[i].get("track_id")
             raw_i = int(raw_i) if raw_i is not None else None
@@ -1138,9 +1648,24 @@ class StableIdMapper:
                 assigned_world[sid] = (float(w[0]), float(w[1]))
 
         # 3b) If crossed IDs score higher, swap them back (high margin only).
-        if len(assigned) >= 2:
+        if (
+            identity_audit_due
+            and len(assigned) >= 2
+            and len(set(assigned.values())) >= 2
+        ):
             self._fix_id_swaps(work, assigned, from_raw, assigned_world, feat_at)
             used_sids = set(assigned.values())
+
+        # Recovery/rematch above can introduce a crossed pair that was not
+        # present during the first raw-binding pass.
+        self._audit_color_bindings(
+            work,
+            assigned,
+            used_sids,
+            assigned_world,
+            frame,
+            drop_unknown=True,
+        )
 
         out: list[dict] = []
         seen_raw: set[int] = set()
@@ -1153,6 +1678,8 @@ class StableIdMapper:
                 self._raw_last_frame[raw] = frame_idx
                 self._raw_miss[raw] = 0
 
+            if i in pending_unknown:
+                continue
             if i in assigned:
                 sid = assigned[i]
             else:
@@ -1177,55 +1704,105 @@ class StableIdMapper:
                         sid = occ_sid
                     else:
                         merge_sid = self._merge_duplicate(
-                            d.get("world"), probe, used_sids, assigned_world
+                            d.get("world"),
+                            probe,
+                            used_sids,
+                            assigned_world,
+                            xyxy=d.get("xyxy"),
+                            assigned_boxes=assigned_boxes(),
                         )
                         if merge_sid is not None:
                             sid = merge_sid
                         else:
-                            if raw is None:
-                                hits = self.min_hits
+                            reuse_sid = self._reuse_free_sid(
+                                d.get("world"),
+                                frame_idx,
+                                used_sids,
+                                probe,
+                            )
+                            if reuse_sid is not None:
+                                sid = reuse_sid
                             else:
+                                if raw is None:
+                                    # Untracked box — never mint.
+                                    continue
                                 hits = self._raw_hits.get(raw, 0) + 1
                                 self._raw_hits[raw] = hits
-                            if hits < self.min_hits:
-                                # Still collecting temp — do not mint yet.
-                                continue
-                            # Final gallery check (no soft last_chance — that minted ID3/ID4).
-                            final_sid, _final_sim = self._select_rematch(
-                                probe, d.get("world"), frame_idx, used_sids
-                            )
-                            if final_sid is None:
-                                final_sid = self._short_gap_recover(
-                                    d.get("world"), frame_idx, used_sids, probe
+                                if hits < self.min_hits:
+                                    continue
+                                final_sid, _final_sim = self._select_rematch(
+                                    probe,
+                                    d.get("world"),
+                                    frame_idx,
+                                    used_sids,
                                 )
-                            if final_sid is None:
-                                final_sid = self._merge_duplicate(
-                                    d.get("world"), probe, used_sids, assigned_world
-                                )
-                            if final_sid is not None:
-                                sid = final_sid
-                            else:
-                                # No past ID photo matched → mint new ID.
-                                sid = self._alloc_stable_id()
-                                recent_s = int(self.fps * 6)
-                                had_recent = any(
-                                    frame_idx - int(m["frame"]) <= recent_s
-                                    for m in self._stable.values()
-                                )
-                                if not had_recent:
-                                    self._freeze_other_galleries(sid, feat_at(i))
+                                if final_sid is None:
+                                    final_sid = self._short_gap_recover(
+                                        d.get("world"), frame_idx, used_sids, probe
+                                    )
+                                if final_sid is None:
+                                    final_sid = self._merge_duplicate(
+                                        d.get("world"),
+                                        probe,
+                                        used_sids,
+                                        assigned_world,
+                                        xyxy=d.get("xyxy"),
+                                        assigned_boxes=assigned_boxes(),
+                                    )
+                                if final_sid is None:
+                                    final_sid = self._reuse_free_sid(
+                                        d.get("world"),
+                                        frame_idx,
+                                        used_sids,
+                                        probe,
+                                    )
+                                if final_sid is not None:
+                                    sid = final_sid
+                                elif self._should_refuse_mint(frame_idx, len(work)):
+                                    continue
+                                else:
+                                    sid = self._alloc_stable_id()
+                                    recent_s = int(self.fps * 6)
+                                    had_recent = any(
+                                        frame_idx - int(m["frame"]) <= recent_s
+                                        for m in self._stable.values()
+                                    )
+                                    if not had_recent:
+                                        self._freeze_other_galleries(sid, feat_at(i))
 
             if raw is not None:
                 self._raw_to_stable[raw] = sid
                 self._raw_hits[raw] = max(self._raw_hits.get(raw, 0), self.min_hits)
                 self._pending_feat.pop(raw, None)
-            # Hard rule: two people in the same frame never share one ID.
+            # Hard rule: two people in the same frame never share one ID —
+            # unless the extra box is a split of the same body.
             if sid in used_sids and i not in assigned:
+                boxes_now = assigned_boxes()
+                overlap = (
+                    self._overlap_sid(d["xyxy"], boxes_now)
+                    if d.get("xyxy") is not None
+                    else None
+                )
+                if overlap is not None:
+                    if raw is not None:
+                        self._raw_to_stable[raw] = overlap
+                    continue
                 probe = feat_at(i, force=True)
                 alt, _ = self._select_rematch(
                     probe, d.get("world"), frame_idx, used_sids
                 )
-                sid = alt if alt is not None else self._alloc_stable_id()
+                if alt is None:
+                    alt = self._reuse_free_sid(
+                        d.get("world"),
+                        frame_idx,
+                        used_sids,
+                        probe,
+                    )
+                if alt is None:
+                    if self._should_refuse_mint(frame_idx, len(work)):
+                        continue
+                    alt = self._alloc_stable_id()
+                sid = alt
                 if raw is not None:
                     self._raw_to_stable[raw] = sid
             wx, wy = d.get("world", (0.0, 0.0))
@@ -1233,14 +1810,28 @@ class StableIdMapper:
             if is_first_for_sid:
                 self._sid_born_frame[sid] = frame_idx
             prev = dict(self._stable.get(sid, {}))
-            # Embed less often with 2+ people (OSNet CPU bottleneck).
-            embed_every = 15 if len(work) >= 2 else 10
+            xyxy = d.get("xyxy")
+            other_boxes = [
+                tuple(int(v) for v in work[j]["xyxy"])
+                for j in range(len(work))
+                if j != i and work[j].get("xyxy") is not None
+            ]
+            crop_clean = bool(xyxy) and not self._gallery_conflicts_others(
+                xyxy, other_boxes
+            )
+            # Multi-person appearance is already audited once per second.
+            # Track the last real embedding frame; modulo arithmetic misses
+            # forever when stride=5 yields frames 1,6,11,...
+            embed_every = int(self.fps) if len(work) >= 2 else 10
+            last_embed = self._sid_last_embed_frame.get(sid, -10**9)
             need_feat = (
                 is_first_for_sid
                 or i not in from_raw
-                or (frame_idx % embed_every) == 0
+                or frame_idx - last_embed >= embed_every
             )
             cur_feat = feat_at(i, force=need_feat) if need_feat else None
+            if cur_feat is not None:
+                self._sid_last_embed_frame[sid] = frame_idx
             # If this crop looks like another ID, do not overwrite classmate gallery.
             can_update_gallery = self._gallery_update_allowed(sid, cur_feat) if (
                 cur_feat is not None and not is_first_for_sid
@@ -1270,10 +1861,31 @@ class StableIdMapper:
                         self._raw_to_stable[raw] = sid
             # Prefer switching to a free better ID; never collide with used_sids.
             if sid in used_sids and i not in assigned:
-                sid = self._alloc_stable_id()
-                is_first_for_sid = True
-                self._sid_born_frame[sid] = frame_idx
-                prev = {}
+                boxes_now = assigned_boxes()
+                overlap = (
+                    self._overlap_sid(d["xyxy"], boxes_now)
+                    if d.get("xyxy") is not None
+                    else None
+                )
+                if overlap is not None:
+                    if raw is not None:
+                        self._raw_to_stable[raw] = overlap
+                    continue
+                alt = self._reuse_free_sid(
+                    d.get("world"),
+                    frame_idx,
+                    used_sids,
+                    cur_feat,
+                )
+                if alt is None:
+                    if self._should_refuse_mint(frame_idx, len(work)):
+                        continue
+                    alt = self._alloc_stable_id()
+                sid = alt
+                is_first_for_sid = sid not in self._stable
+                if is_first_for_sid:
+                    self._sid_born_frame[sid] = frame_idx
+                prev = dict(self._stable.get(sid, {}))
                 can_update_gallery = cur_feat is not None
                 if raw is not None:
                     self._raw_to_stable[raw] = sid
@@ -1281,6 +1893,7 @@ class StableIdMapper:
                 (i in from_raw or is_first_for_sid)
                 and not prev.get("outfit_frozen", False)
                 and can_update_gallery
+                and crop_clean
             )
             # Never enroll a look that barely matches this ID (swap pollution).
             if (
@@ -1291,7 +1904,7 @@ class StableIdMapper:
             ):
                 if self._best_proto_sim(cur_feat, prev) < self.soft_appear_thresh:
                     allow_new_proto = False
-            if cur_feat is not None and can_update_gallery:
+            if cur_feat is not None and can_update_gallery and crop_clean:
                 prev, snap_i, is_new_proto = self._update_prototypes(
                     prev, cur_feat, allow_new=allow_new_proto
                 )
@@ -1303,40 +1916,19 @@ class StableIdMapper:
             self._stable[sid] = prev
             used_sids.add(sid)
             assigned_world[sid] = (float(wx), float(wy))
-            xyxy = d.get("xyxy")
             conf = d.get("conf")
             conf_f = float(conf) if conf is not None else None
-            other_boxes = [
-                tuple(int(v) for v in work[j]["xyxy"])
-                for j in range(len(work))
-                if j != i and work[j].get("xyxy") is not None
-            ]
-            # Hard rule: never dump while YOLO sees 2+ people in this frame.
-            alone_in_frame = len(work) < 2 and not other_boxes
-            # Near-camera mega-box while classmate was just on screen → usually
-            # still has their limb/shoulder in the crop; skip gallery write.
-            mega_box = False
-            if xyxy is not None and frame is not None:
-                parsed = self._box_wh(frame, xyxy)
-                if parsed is not None:
-                    _x1, _y1, _x2, _y2, bw, bh = parsed
-                    fh, fw = frame.shape[:2]
-                    mega_box = bw > int(0.11 * fw) or (bw * bh) > int(
-                        0.07 * fw * fh
-                    )
-            alone_clean = alone_in_frame and not (
-                mega_box and self._other_id_recent(sid, frame_idx)
-            )
-            # latest.jpg also waits until the other ID has walked away, and
-            # must still match enrollment look (blocks ID1←white-shirt overwrite).
-            clear_of_neighbors = alone_clean and not self._nearby_other_person(
-                sid, d.get("world"), frame_idx
-            )
-            gallery_feat = cur_feat if cur_feat is not None else feat_at(i, force=True)
-            # Keep retrying first.jpg until a clean single-person shot is saved.
-            if alone_clean and (
+            # Save gallery only from a clean, non-overlapping person box.
+            gallery_feat = cur_feat
+            needs_first_gallery = crop_clean and (
                 is_first_for_sid or sid not in self._gallery_first_saved
-            ):
+            )
+            if needs_first_gallery and gallery_feat is None:
+                gallery_feat = feat_at(i, force=True)
+                if gallery_feat is not None:
+                    self._sid_last_embed_frame[sid] = frame_idx
+            # Keep retrying first.jpg until a usable shot is saved.
+            if needs_first_gallery:
                 self._update_gallery_best(
                     sid,
                     frame,
@@ -1347,17 +1939,9 @@ class StableIdMapper:
                     others=other_boxes,
                     feat=gallery_feat,
                 )
-            elif (
-                clear_of_neighbors
-                and can_update_gallery
-                and (
-                    (is_new_proto and snap_i)
-                    or self._matches_enrollment(sid, gallery_feat)
-                )
-                and self._gallery_person_score(
-                    frame, xyxy, conf_f, others=other_boxes
-                )
-                > 0.0
+            elif gallery_feat is not None and crop_clean and can_update_gallery and (
+                (is_new_proto and snap_i)
+                or self._matches_enrollment(sid, gallery_feat)
             ):
                 proto_i = snap_i if is_new_proto else None
                 self._update_gallery_best(
@@ -1372,7 +1956,12 @@ class StableIdMapper:
                 )
             d["raw_track_id"] = raw
             d["track_id"] = sid
+            self._sid_last_real[int(sid)] = frame_idx
             out.append(d)
+
+        out = self._collapse_split_outputs(out, frame_idx)
+        self._dump_review(out, frame, frame_idx)
+        out = self._hold_missing_interior(out, frame_idx, frame)
 
         for raw in list(self._raw_hits.keys()):
             if raw in seen_raw or raw in self._raw_to_stable:
@@ -1386,10 +1975,5 @@ class StableIdMapper:
         if out:
             self._last_out = [dict(d) for d in out]
             self._last_out_frame = frame_idx
-        elif (
-            self._last_out
-            and self.coast_frames > 0
-            and frame_idx - self._last_out_frame <= self.coast_frames
-        ):
-            return [dict(d) for d in self._last_out]
-        return out
+            return out
+        return self._coasted_empty_out(frame_idx, frame)

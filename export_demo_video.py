@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--stride",
         type=int,
-        default=2,
+        default=5,
         help="run YOLO every N frames; skipped frames reuse/coast last detections",
     )
     p.add_argument(
@@ -175,7 +175,7 @@ def main() -> None:
             fps=fps,
             min_hits=args.min_hits,
             encoder=enc,
-            coast_frames=args.id_coast,
+            coast_frames=max(int(args.id_coast), int(args.stride)),
             sticky_frames=args.id_sticky,
             gallery_dir=gallery,
         )

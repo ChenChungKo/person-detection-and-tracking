@@ -116,25 +116,51 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 
 ### 人物 ID（Stable-ID）
 
-管線：`YOLO26` → **ByteTrack**（短追蹤）→ **Stable-ID**（gallery 外貌 + 地板距離接回；同幀不共用 ID）。
+管線：`YOLO26.track(persist=True)` → **BoT-SORT**（短期）→ **Stable-ID + OSNet-AIN**（長期 ID）。畫面只標 `ID1`…；人框與格子同一套顏色。不假設場上只有一人。
 
-| 項目 | 說明 |
+**短追蹤**（`trackers/botsort.yaml`）
+- 固定監視器：`gmc_method: none`
+- 不開 BoT-SORT ReID（`with_reid: False`）；外貌交給 Stable-ID
+- `new_track_thresh: 0.65`：門邊碎框不開新軌
+- 不要把 OSNet `.pth` 寫進 yaml
+
+**Stable-ID**
+- 即時圖庫 `test/reid_gallery/`：每次重跑清空；比對用記憶體向量，不讀回 jpg
+- 審查庫 `test/reid_review/`：**預設關閉**。加 `--review-dump` 才存裁圖（不參與即時比對；背景 Pillow 寫檔，避免拖慢 YOLO）
+- 圖庫只接受乾淨、低重疊的人框，避免相鄰人物污染 `first.jpg` 與外貌原型
+- 每幀以衣著色彩修正明顯換人；陌生 raw track 先短暫隔離，確認後建立新 ID
+- 同一人雙框（IoU／包覆）合併，留較舊號
+- 室內漏檢沿用約 1.2 秒；框貼畫面邊緣立刻清除（人已離開）
+- 新 ID 須連續對不上圖庫（`--min-hits` 預設 16）才發號；開頭約 **3.8–4 秒** 才會出現第一個框（`--stride 5`、約 20 fps 時：16 次偵測 × 5 幀 ÷ 20 ≈ 4 秒。`test4.mp4` 實測約第 76 幀／3.8 秒）
+
+**問題與作法**
+
+| 遇到的問題 | 作法 |
 |------|------|
-| Re-ID | `--reid-model osnet_ain`（建議）／`osnet`／`osnet_ibn`／YOLO26-ReID ONNX |
-| Gallery | `test/reid_gallery/ID00x/`（`first`／`latest`；雙人近距離時可能暫不寫圖） |
-| 發新號 | 須連續失敗 gallery（`--min-hits` 預設 8）才 mint，減少亂發 ID3／ID4 |
-| 顯示 | 畫面只標 `ID1`…；人框／ID 標籤與格子佔用**同一套 ID 顏色**；`--id-coast` 預設短，避免人走後框殘留 |
+| 同一支本機影片、不同時間跑，ID 結果不同 | 以前為了跟時間軸會丟幀，電腦忙時丟得多。現在固定只處理第 `1, 1+stride, …` 幀；`--realtime` 只限播放速度，不丟追蹤幀 |
+| 預覽卡、CPU 忙時追蹤更不穩 | 追蹤幀全留；本機預覽約每 3 幀才畫一次，不改 BoT-SORT 輸入。OSNet 全身稽核改約每秒一次 |
+| `first.jpg` 混進隔壁人，之後一直配錯 | 圖庫只收乾淨、低重疊框；衣著顏色明顯不同的兩框不再合併成同一人 |
+| 藍衣／綠衣被短追蹤接錯，一秒後才改回來 | 每幀用上半身 HSV 對初次登錄顏色；明顯不像自己、又很像另一個空缺 ID 就當場改回 |
+| 新人出現在舊人前面，直接繼承舊 ID | 不像任何已知 ID 的 raw track 先隔離數幀，確認後發新號並寫圖庫，回來可配回同一號 |
+| 剛發新 ID 就崩潰（`KeyError`） | 交換檢查只比對已登錄完成的身份 |
+| 開 `--review-dump` 時追蹤變慢或不穩 | 審查圖改背景 Pillow 寫檔，不參與即時 Re-ID |
+| 影片開頭好幾秒都沒框人 | 不是漏檢，是在等新 ID 確認。預設 `--min-hits 16`、`--stride 5`、約 20 fps → 約 4 秒才發第一個號。已登錄的人再出現不必再等這段；若要更快可把 `--min-hits` 降小，但門邊碎框較容易開新號 |
 
 ```powershell
-# 建議（單人／test.mp4 較穩）
-python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --stride 2 --log-id
+# 建議
+python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
+
+# 要存錯圖審查時再加
+python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump
 
 # RTSP
 $env:OPENCV_FFMPEG_CAPTURE_OPTIONS = "rtsp_transport;tcp"
-python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --stride 2
-```
+python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
 
-BoT-SORT（`--tracker trackers/botsort_reid.yaml`）短追蹤只用 YOLO-ReID ONNX；Stable-ID 仍可用 `osnet_ain`。不要把 OSNet `.pth` 寫進 BoT-SORT yaml。
+# 只要人框、不要 ID
+python detect_person.py --source test/test.mp4 --no-map
+python detect_grid.py --source test/test.mp4 --no-track
+```
 
 ### RTSP 降延遲（自動啟用）
 
@@ -153,7 +179,7 @@ BoT-SORT（`--tracker trackers/botsort_reid.yaml`）短追蹤只用 YOLO-ReID ON
 | `LatestFrameCapture` | 降低「畫面落後感」 | 丟緩衝區舊幀，永遠處理最新畫面 |
 | `--stride` | 降低運算量 | 不必每幀都跑 YOLO |
 
-本機 `.mp4` 不會啟用最新幀讀取（逐幀播放比較合理）。
+本機 `.mp4` 不會啟用最新幀讀取；固定處理第 `1, 1+stride, 1+2×stride, ...` 幀，避免電腦負載不同造成 BoT-SORT 輸入與 ID 結果改變。
 
 ### 跳幀（`--stride`）
 
@@ -163,9 +189,9 @@ RTSP／影片不必每幀都跑 YOLO，可跳幀降低運算量，中間幀沿�
 python detect_grid.py --source test/test.mp4 --stride 3
 ```
 
-- `--stride N`：每 N 幀才跑一次 YOLO（**預設 2**；設 1＝每幀都跑）
+- `--stride N`：每 N 幀才跑一次 YOLO（**預設 5** ≈ 20fps 時每秒 4 次；設 1＝每幀都跑）
 - 格子視窗會標示 `cached`，代表這幀是沿用結果、不是新偵測
-- 本機影片另有 `--realtime`（預設開）：依影片時間軸丟幀，避免播放變慢動作
+- 本機影片的 `--realtime`（預設開）只限制播放速度不超過來源 FPS；推論慢時會變慢，但不丟追蹤幀。`--no-realtime` 可取消等待，追蹤取樣幀不變
 
 ### 格子防抖（`--cell-hold`）
 
@@ -179,32 +205,42 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 - 這裡的「N 次」以**偵測次數**計算（跟 `--stride` 搭配時，只算真正跑 YOLO 的那幀，不受跳幀影響其穩定邏輯）
 - `export_demo_video.py` 也支援同名的 `--stride` / `--cell-hold`
 
-## 目前建議設定（2026-08-13）
+## 目前建議設定（2026-08-14）
 
 | 項目 | 設定 |
 |------|------|
 | Homography | **v2**（`calibration/homography.json`） |
-| 偵測 | `yolo26s.pt`、`--ref auto`、`--conf 0.50`、`--cell-hold 2` |
-| ID | ByteTrack + Stable-ID；`--reid-model osnet_ain`；`--min-hits 8`；`--appear-thresh 0.34` |
-| 效能 | `--stride 2`（OSNet 時建議）；跳幀框外推；本機影片即時跟播 |
+| 偵測 | `yolo26s.pt`、`--ref auto`、`--conf 0.45`、`--cell-hold 2` |
+| 短追蹤 | BoT-SORT（`trackers/botsort.yaml`；GMC off、短 ReID off） |
+| 長期 ID | Stable-ID + `--reid-model osnet_ain`；`--min-hits 16`；`--appear-thresh 0.34` |
+| 效能 | `--stride 5`（約每秒 4 次）；本機影片同步、固定取樣以確保可重現；RTSP 維持背景執行緒與最新幀模式 |
+| 審查庫 | 預設關；`--review-dump` 寫入 `test/reid_review/<時間>/ID***/` |
 
 ```powershell
-python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --stride 2 --log-id
+python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
 ```
 
-舊校正：`--calib calibration/homography_v1_manual.json`；舊桌區灰格：`--valid-xmin 170`。
+舊校正：`--calib calibration/homography_v1_manual.json`；舊桌區灰格：`--valid-xmin 170`。舊短追蹤：`--tracker trackers/bytetrack_stable.yaml`。
 
 ## Demo 影片（左：偵測，右：格子）
 
-**目前主 demo（Stable-ID + OSNet-AIN）**，由 `test/test.mp4` 匯出：
+**目前主 demo（Stable-ID + OSNet-AIN）**，使用 `test/test4.mp4` 與實際 `detect_grid.py` 流程錄製。
+
+一般測試與審查指令：
 
 ```powershell
-python export_demo_video.py --source test/test.mp4 --ref auto --cell-hold 2 --reid-model osnet_ain --stride 2 --out test/demo_stable_id_osnet_ain.mp4
+python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump
+```
+
+錄製同一套追蹤結果（不開預覽視窗）：
+
+```powershell
+python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump --save-video test/demo_stable_id_osnet_ain.mp4 --no-show --no-realtime
 ```
 
 | 版本 | 影片 | WebP |
 |------|------|------|
-| **Stable-ID + OSNet-AIN**（目前） | `test/demo_stable_id_osnet_ain.mp4` | `test/demo_stable_id_osnet_ain.webp` |
+| **Stable-ID + OSNet-AIN / test4**（目前） | `test/demo_stable_id_osnet_ain.mp4` | `test/demo_stable_id_osnet_ain.webp` |
 | Homography **v2**（舊，僅定位） | `test/demo_v2_chessboard.mp4` | `test/demo_v2_chessboard.webp` |
 | Homography **v1** | `test/demo_v1_manual.mp4` | `test/demo_v1_manual.webp` |
 
@@ -212,18 +248,20 @@ python export_demo_video.py --source test/test.mp4 --ref auto --cell-hold 2 --re
   <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：Stable-ID + OSNet-AIN，左偵測右格子"/>
 </p>
 
-## 狀態（2026-08-13）
+## 狀態（2026-08-14）
 
 **已完成**
-- YOLO26 偵測 + Homography v1／v2 腳點格子定位、RTSP 降延遲、跳幀、格子防抖  
-- Stable-ID：gallery 外貌接回、多外貌 prototype、OSNet／OSNet-AIN／OSNet-IBN  
-- 圖庫防混人、較短 box coast（人離開後框不長留）  
-- 不同 ID 在即時畫面人框／標籤與格子佔用使用同一套顏色  
-- 單人／`test.mp4`：ID 大致穩定可用  
+- YOLO26 官方 `model.track` + BoT-SORT 短追蹤；長期 ID 仍由 Stable-ID + OSNet-AIN  
+- 重疊雙框合併、門邊碎框較難開新號、室內漏檢短沿用／貼邊立刻清  
+- 即時圖庫與審查庫分開：審查圖不進 Re-ID；審查預設關，避免寫檔拖慢追蹤  
+- 本機影片固定追蹤幀，重跑結果不再受即時丟幀與電腦負載改變  
+- 陌生人物不再直接冒用既有 ID；短暫確認後建立可供回場比對的新 ID  
+- RTSP 保留背景 YOLO、最新幀與 TCP 降延遲；格子支援防抖與跳幀  
 
 **尚未解決**
-- 雙人／多人近距離：仍可能漏检造成 `ID1,ID2 ↔ ID2` 閃爍  
+- 多人遮擋／漏檢仍可能閃號（坐著、趴著、被擋時 `conf=0.45` 較易漏）  
 - 近鏡頭大框易吃到另一人 → 圖庫可能拒寫或外貌混淆  
+- `test3.mp4` 的人數多、停留短且交叉頻繁；目前 `--min-hits 16` 與陌生人隔離較保守，可能延遲或隱藏新 ID，尚待加入依框品質調整的自適應發號  
 - 換裝、跨鏡頭、畸變校正接入管線  
 
 ## 文件

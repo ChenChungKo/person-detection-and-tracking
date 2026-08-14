@@ -1,0 +1,21 @@
+# Ultralytics BoT-SORT for this static office camera.
+# Docs: https://docs.ultralytics.com/modes/track
+# Official defaults plus:
+#   - gmc_method: none  (static CCTV; docs: turn CMC off to save ms)
+# Short tracker is motion-only. Look-alike classmates (two white shirts)
+# are handled by Stable-ID + OSNet + floor position, not BoT-SORT ReID.
+# Official docs: with_reid helps crowds, but here it minted extra IDs.
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+# Same idea as trackers/bytetrack_stable.yaml: existing tracks may be low-conf,
+# but a *new* ID should not start from a door-edge fragment (that minted ID2).
+new_track_thresh: 0.65
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: True
+gmc_method: none
+proximity_thresh: 0.5
+appearance_thresh: 0.85
+with_reid: False
+model: auto
