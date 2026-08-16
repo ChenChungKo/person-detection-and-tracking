@@ -791,7 +791,7 @@ def render_detection_view(
         h_mat,
         valid_xmin,
         out_margin=out_margin,
-        show_cell_label=show_floor_grid,
+        show_cell_label=False,
     )
     display_cells = grid_cells if grid_cells is not None else cells
     if grid_occupancy is not None:
@@ -901,7 +901,7 @@ def parse_args() -> argparse.Namespace:
         "--no-floor-grid",
         dest="show_floor_grid",
         action="store_false",
-        help="hide floor-grid overlay and cell coordinates on person labels",
+        help="hide the five floor marks on camera and bird-eye views",
     )
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument(

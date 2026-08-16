@@ -85,16 +85,16 @@ Y_EDGES = y_edges()
 
 # Shared floor landmarks for camera overlay and bird-eye grid (world cm).
 # RGB colors so both Pillow (grid) and OpenCV BGR (camera) stay in sync.
-# Use the visible aisle near the chessboard, not the full 0–530 / 0–540 map:
-# X=0 and Y=0 sit under desks / the far wall, so those corners project onto furniture.
+# Use the visible aisle, spread to tile corners that stay on camera.
+# Avoid X=0 / Y=0 / X=530: those map corners sit under desks or the far wall.
 FLOOR_LANDMARKS: tuple[tuple[str, float, float, tuple[int, int, int]], ...] = (
-    ("A", 170.0, 270.0, (255, 80, 80)),
-    ("B", 260.0, 270.0, (40, 160, 255)),
-    ("C", 260.0, 405.0, (40, 200, 90)),
+    ("A", 170.0, 90.0, (255, 80, 80)),
+    ("B", 395.0, 90.0, (40, 160, 255)),
+    ("C", 395.0, 405.0, (40, 200, 90)),
     ("D", 170.0, 405.0, (255, 160, 0)),
 )
-_FLOOR_CX = 0.5 * (170.0 + 260.0)
-_FLOOR_CY = 0.5 * (270.0 + 405.0)
+_FLOOR_CX = 0.5 * (170.0 + 395.0)
+_FLOOR_CY = 0.5 * (90.0 + 405.0)
 FLOOR_MARKS: tuple[tuple[str, float, float, tuple[int, int, int]], ...] = FLOOR_LANDMARKS + (
     ("O", _FLOOR_CX, _FLOOR_CY, (255, 230, 0)),
 )
