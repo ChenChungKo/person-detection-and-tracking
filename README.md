@@ -114,6 +114,8 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 以 bbox 底邊中點為腳點；桌旁被擋時可用 `--ref auto` / `--ref head_drop`。  
 測試影片：`test/test.mp4`。按 `q` 結束，`s` 存圖。
 
+**定位對照（報告用）**：相機畫面疊同一張地板格線，四角標 A–D（A/B 遠端牆側，C/D 為鏡頭裡還看得到的近端格線），黃線分成四塊；右側格子用同一組標記。人框會加格子座標，例如 `ID1 (6,8)`。此分支預設開啟；`--no-floor-grid` 可關。
+
 ### 人物 ID（Stable-ID）
 
 管線：`YOLO26.track(persist=True)` → **BoT-SORT**（短期）→ **Stable-ID + OSNet-AIN**（長期 ID）。畫面只標 `ID1`…；人框與格子同一套顏色。不假設場上只有一人。

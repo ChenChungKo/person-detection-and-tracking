@@ -29,12 +29,17 @@ import numpy as np
 from ultralytics import YOLO
 
 from grid_occupancy import (
+    FLOOR_LANDMARKS,
+    FLOOR_MID_X,
+    FLOOR_MID_Y,
     X_EDGES,
+    Y_EDGES,
     cell_label,
     draw_grid,
     id_bgr_color,
     imread_unicode,
     imwrite_unicode,
+    landmark_bgr,
     show_fixed_window,
     show_grid_window,
     world_to_cell,
@@ -103,6 +108,151 @@ def image_to_world(h_mat: np.ndarray, x: float, y: float) -> tuple[float, float]
     pts = np.array([[[x, y]]], dtype=np.float64)
     world = cv2.perspectiveTransform(pts, h_mat)[0, 0]
     return float(world[0]), float(world[1])
+
+
+def world_to_image(h_inv: np.ndarray, x: float, y: float) -> tuple[float, float]:
+    pts = np.array([[[x, y]]], dtype=np.float64)
+    pix = cv2.perspectiveTransform(pts, h_inv)[0, 0]
+    return float(pix[0]), float(pix[1])
+
+
+def _floor_line_samples(axis: str, value: float, step_cm: float = 15.0) -> list[tuple[float, float]]:
+    if axis == "x":
+        n = max(2, int(round((Y_EDGES[-1] - Y_EDGES[0]) / step_cm)) + 1)
+        return [(value, float(y)) for y in np.linspace(Y_EDGES[0], Y_EDGES[-1], n)]
+    n = max(2, int(round((X_EDGES[-1] - X_EDGES[0]) / step_cm)) + 1)
+    return [(float(x), value) for x in np.linspace(X_EDGES[0], X_EDGES[-1], n)]
+
+
+def _project_world_polyline(
+    h_inv: np.ndarray,
+    samples: list[tuple[float, float]],
+    scale: float,
+    width: int,
+    height: int,
+) -> list[np.ndarray]:
+    """Project a world polyline to preview pixels, dropping off-image jumps."""
+    raw: list[tuple[float, float] | None] = []
+    margin = 80.0
+    max_jump = 220.0
+    for wx, wy in samples:
+        ix, iy = world_to_image(h_inv, wx, wy)
+        px, py = ix * scale, iy * scale
+        if not np.isfinite(px) or not np.isfinite(py):
+            raw.append(None)
+            continue
+        if px < -margin or py < -margin or px > width + margin or py > height + margin:
+            raw.append(None)
+            continue
+        raw.append((px, py))
+
+    segs: list[np.ndarray] = []
+    cur: list[tuple[int, int]] = []
+    for i, pt in enumerate(raw):
+        if pt is None:
+            if len(cur) >= 2:
+                segs.append(np.array(cur, dtype=np.int32))
+            cur = []
+            continue
+        x, y = int(round(pt[0])), int(round(pt[1]))
+        if cur:
+            dx = x - cur[-1][0]
+            dy = y - cur[-1][1]
+            if dx * dx + dy * dy > max_jump * max_jump:
+                if len(cur) >= 2:
+                    segs.append(np.array(cur, dtype=np.int32))
+                cur = [(x, y)]
+                continue
+        cur.append((x, y))
+        _ = i
+    if len(cur) >= 2:
+        segs.append(np.array(cur, dtype=np.int32))
+    return segs
+
+
+class FloorOverlayCache:
+    """Homography is static: project grid lines once per preview size."""
+
+    def __init__(self) -> None:
+        self._key: tuple[int, int, int, int] | None = None
+        self._h_inv: np.ndarray | None = None
+        self._grid_segs: list[np.ndarray] = []
+        self._mid_segs: list[np.ndarray] = []
+        self._marks: list[tuple[str, int, int, tuple[int, int, int]]] = []
+
+    def prepare(self, h_mat: np.ndarray, frame_wh: tuple[int, int], preview_wh: tuple[int, int]) -> None:
+        fw, fh = frame_wh
+        pw, ph = preview_wh
+        key = (fw, fh, pw, ph)
+        if self._key == key and self._h_inv is not None:
+            return
+        self._key = key
+        self._h_inv = np.linalg.inv(h_mat)
+        scale = pw / float(fw) if fw else 1.0
+        grid_segs: list[np.ndarray] = []
+        for xv in X_EDGES:
+            grid_segs.extend(
+                _project_world_polyline(
+                    self._h_inv, _floor_line_samples("x", xv), scale, pw, ph
+                )
+            )
+        for yv in Y_EDGES:
+            grid_segs.extend(
+                _project_world_polyline(
+                    self._h_inv, _floor_line_samples("y", yv), scale, pw, ph
+                )
+            )
+        self._grid_segs = grid_segs
+        mid_segs: list[np.ndarray] = []
+        mid_segs.extend(
+            _project_world_polyline(
+                self._h_inv, _floor_line_samples("x", FLOOR_MID_X), scale, pw, ph
+            )
+        )
+        mid_segs.extend(
+            _project_world_polyline(
+                self._h_inv, _floor_line_samples("y", FLOOR_MID_Y), scale, pw, ph
+            )
+        )
+        self._mid_segs = mid_segs
+        marks: list[tuple[str, int, int, tuple[int, int, int]]] = []
+        for name, wx, wy, rgb in FLOOR_LANDMARKS:
+            ix, iy = world_to_image(self._h_inv, wx, wy)
+            px, py = int(round(ix * scale)), int(round(iy * scale))
+            if -40 <= px < pw + 40 and -40 <= py < ph + 40:
+                marks.append((name, px, py, landmark_bgr(rgb)))
+        self._marks = marks
+
+    def draw(self, vis: np.ndarray) -> None:
+        line = (160, 60, 140)
+        mid = (0, 220, 255)
+        for seg in self._grid_segs:
+            cv2.polylines(vis, [seg], False, line, 1, cv2.LINE_AA)
+        for seg in self._mid_segs:
+            cv2.polylines(vis, [seg], False, mid, 2, cv2.LINE_AA)
+        for name, px, py, bgr in self._marks:
+            cv2.circle(vis, (px, py), 10, (20, 20, 20), -1, cv2.LINE_AA)
+            cv2.circle(vis, (px, py), 8, bgr, -1, cv2.LINE_AA)
+            cv2.putText(
+                vis,
+                name,
+                (px + 12, py + 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (255, 255, 255),
+                4,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                vis,
+                name,
+                (px + 12, py + 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                bgr,
+                2,
+                cv2.LINE_AA,
+            )
 
 
 def open_capture(source: str) -> cv2.VideoCapture | None:
@@ -384,6 +534,7 @@ def annotate_and_cells(
     h_mat: np.ndarray,
     valid_xmin: float,
     out_margin: float = 45.0,
+    show_cell_label: bool = False,
 ) -> tuple[np.ndarray, set[tuple[int, int]], list[str]]:
     vis = frame  # caller passes a writable preview-sized copy
     cells: set[tuple[int, int]] = set()
@@ -433,9 +584,10 @@ def annotate_and_cells(
             if valid_xmin > 0 and X_EDGES[cell[0] + 1] <= valid_xmin:
                 low_conf = True
             cell_txt = cell_label(*cell)
+            tag = f"{id_txt} ({cell[0]},{cell[1]})" if show_cell_label else id_txt
             put_label(
                 vis,
-                id_txt,
+                tag,
                 (x1, label_y),
                 fg=(0, 0, 0),
                 bg=box_color,
@@ -483,23 +635,27 @@ class GridCache:
     def __init__(self) -> None:
         self._key: frozenset[tuple[tuple[int, int], frozenset[int]]] | None = None
         self._valid_xmin: float | None = None
+        self._landmarks = False
         self._base: np.ndarray | None = None
 
     def get(
         self,
         occupancy: dict[tuple[int, int], list[int]],
         valid_xmin: float,
+        landmarks: bool = False,
     ) -> np.ndarray:
         key = occupancy_key(occupancy)
         if (
             self._base is not None
             and self._key == key
             and self._valid_xmin == valid_xmin
+            and self._landmarks == landmarks
         ):
             return self._base.copy()
-        img = draw_occupancy_grid(occupancy, valid_xmin)
+        img = draw_occupancy_grid(occupancy, valid_xmin, landmarks=landmarks)
         self._key = key
         self._valid_xmin = valid_xmin
+        self._landmarks = landmarks
         self._base = img
         return img.copy()
 
@@ -507,9 +663,12 @@ class GridCache:
 def draw_occupancy_grid(
     occupancy: dict[tuple[int, int], list[int]],
     valid_xmin: float,
+    landmarks: bool = False,
 ) -> np.ndarray:
     """Light occupied cells and label each with person ID(s)."""
-    return draw_grid(None, valid_x_min=valid_xmin, occupancy=occupancy)
+    return draw_grid(
+        None, valid_x_min=valid_xmin, occupancy=occupancy, landmarks=landmarks
+    )
 
 
 def draw_multi_grid(cells: set[tuple[int, int]], valid_xmin: float) -> np.ndarray:
@@ -701,13 +860,29 @@ def render_detection_view(
     grid_cache: GridCache | None = None,
     out_margin: float = 45.0,
     grid_occupancy: dict[tuple[int, int], list[int]] | None = None,
+    show_floor_grid: bool = False,
+    floor_overlay: FloorOverlayCache | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     # Draw on preview-sized frame (much cheaper than annotating 2880px then resize).
     view = resize_for_preview(frame, max_width)
     scale = view.shape[1] / float(frame.shape[1]) if frame.shape[1] else 1.0
+    if show_floor_grid:
+        if floor_overlay is None:
+            floor_overlay = FloorOverlayCache()
+        floor_overlay.prepare(
+            h_mat,
+            (frame.shape[1], frame.shape[0]),
+            (view.shape[1], view.shape[0]),
+        )
+        floor_overlay.draw(view)
     draw_dets = scale_detections_for_preview(dets, scale)
     vis, cells, logs = annotate_and_cells(
-        view, draw_dets, h_mat, valid_xmin, out_margin=out_margin
+        view,
+        draw_dets,
+        h_mat,
+        valid_xmin,
+        out_margin=out_margin,
+        show_cell_label=show_floor_grid,
     )
     display_cells = grid_cells if grid_cells is not None else cells
     if grid_occupancy is not None:
@@ -718,9 +893,9 @@ def render_detection_view(
         occupancy = occupancy_from_dets(dets, allowed_cells=display_cells)
 
     if grid_cache is not None:
-        grid = grid_cache.get(occupancy, valid_xmin)
+        grid = grid_cache.get(occupancy, valid_xmin, landmarks=show_floor_grid)
     else:
-        grid = draw_occupancy_grid(occupancy, valid_xmin)
+        grid = draw_occupancy_grid(occupancy, valid_xmin, landmarks=show_floor_grid)
 
     if timing is not None:
         detect_ms, locate_ms = timing
@@ -806,6 +981,19 @@ def parse_args() -> argparse.Namespace:
         "snap into the nearest edge cell instead of marking OUT (default 45=1 tile)",
     )
     p.add_argument("--max-width", type=int, default=1280)
+    p.add_argument(
+        "--show-floor-grid",
+        dest="show_floor_grid",
+        action="store_true",
+        default=True,
+        help="overlay warped floor grid + A–D landmarks on camera and bird-eye views",
+    )
+    p.add_argument(
+        "--no-floor-grid",
+        dest="show_floor_grid",
+        action="store_false",
+        help="hide floor-grid overlay and cell coordinates on person labels",
+    )
     p.add_argument("--out", default=str(DEFAULT_OUT))
     p.add_argument(
         "--save-video",
@@ -1079,6 +1267,9 @@ def main() -> None:
         out_margin=args.out_margin,
     )
     grid_cache = GridCache()
+    floor_overlay = FloorOverlayCache()
+    if args.show_floor_grid:
+        print("定位對照：相機疊地板格線＋A–D 角點；格子畫面同一組標記；人框標格子座標。")
 
     def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         dets, detect_ms, locate_ms = detect_and_locate(frame, model, h_mat, **det_kw)
@@ -1093,6 +1284,8 @@ def main() -> None:
             max_width=args.max_width,
             grid_cache=grid_cache,
             out_margin=args.out_margin,
+            show_floor_grid=args.show_floor_grid,
+            floor_overlay=floor_overlay,
         )
         if not args.quiet:
             for line in logs:
@@ -1341,6 +1534,8 @@ def main() -> None:
                 max_width=args.max_width,
                 grid_cache=grid_cache,
                 out_margin=args.out_margin,
+                show_floor_grid=args.show_floor_grid,
+                floor_overlay=floor_overlay,
             )
             if det_idx == frame_idx and not args.quiet:
                 for line in logs:

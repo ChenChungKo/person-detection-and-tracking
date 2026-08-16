@@ -83,6 +83,52 @@ def y_edges() -> list[float]:
 X_EDGES = x_edges()
 Y_EDGES = y_edges()
 
+# Shared floor landmarks for camera overlay and bird-eye grid (world cm).
+# RGB colors so both Pillow (grid) and OpenCV BGR (camera) stay in sync.
+FLOOR_LANDMARKS: tuple[tuple[str, float, float, tuple[int, int, int]], ...] = (
+    ("A", X_EDGES[0], Y_EDGES[0], (255, 80, 80)),
+    ("B", X_EDGES[-1], Y_EDGES[0], (40, 160, 255)),
+    # Y=315 cm is the nearest grid line still inside this camera FOV.
+    # The calibrated floor continues to 540 cm (below the frame).
+    ("C", X_EDGES[-1], 315.0, (40, 200, 90)),
+    ("D", X_EDGES[0], 315.0, (255, 160, 0)),
+)
+FLOOR_MID_X = 0.5 * (X_EDGES[0] + X_EDGES[-1])
+FLOOR_MID_Y = 0.5 * (Y_EDGES[0] + Y_EDGES[-1])
+GRID_MARGIN_L = 96
+GRID_MARGIN_T = 52
+GRID_CELL_PX = 72
+
+
+def world_to_grid_px(
+    wx: float,
+    wy: float,
+    cell_px: int = GRID_CELL_PX,
+) -> tuple[int, int]:
+    """Map world cm to pixel on the drawn bird-eye grid."""
+
+    def axis_pos(value: float, edges: list[float]) -> float:
+        if value <= edges[0]:
+            return 0.0
+        if value >= edges[-1]:
+            return float(len(edges) - 1)
+        for i in range(len(edges) - 1):
+            lo, hi = edges[i], edges[i + 1]
+            if lo <= value <= hi:
+                span = hi - lo
+                frac = 0.0 if span <= 1e-9 else (value - lo) / span
+                return i + frac
+        return float(len(edges) - 1)
+
+    px = GRID_MARGIN_L + axis_pos(wx, X_EDGES) * cell_px
+    py = GRID_MARGIN_T + axis_pos(wy, Y_EDGES) * cell_px
+    return int(round(px)), int(round(py))
+
+
+def landmark_bgr(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+    r, g, b = rgb
+    return (int(b), int(g), int(r))
+
 
 def imread_unicode(path: Path) -> np.ndarray | None:
     data = np.fromfile(str(path), dtype=np.uint8)
@@ -237,11 +283,36 @@ def _empty_grid_image(valid_x_min: float, cell_px: int) -> Image.Image:
     return img.copy()
 
 
+def _draw_grid_landmarks(draw, cell_px: int) -> None:
+    """Same A–D corners and mid split as the camera overlay."""
+    try:
+        font_mark = ImageFont.truetype(str(Path(r"C:\Windows\Fonts\msyhbd.ttc")), 22)
+    except OSError:
+        font_mark = _load_fonts()[1]
+    ax, ay = world_to_grid_px(X_EDGES[0], FLOOR_MID_Y, cell_px)
+    bx, by = world_to_grid_px(X_EDGES[-1], FLOOR_MID_Y, cell_px)
+    cx, cy = world_to_grid_px(FLOOR_MID_X, Y_EDGES[0], cell_px)
+    dx, dy = world_to_grid_px(FLOOR_MID_X, Y_EDGES[-1], cell_px)
+    draw.line((ax, ay, bx, by), fill=(90, 90, 90), width=2)
+    draw.line((cx, cy, dx, dy), fill=(90, 90, 90), width=2)
+    radius = 11
+    for name, wx, wy, rgb in FLOOR_LANDMARKS:
+        px, py = world_to_grid_px(wx, wy, cell_px)
+        draw.ellipse(
+            (px - radius, py - radius, px + radius, py + radius),
+            fill=rgb,
+            outline=(20, 20, 20),
+            width=2,
+        )
+        draw.text((px + 12, py - 16), name, fill=rgb, font=font_mark)
+
+
 def draw_grid(
     active: tuple[int, int] | None,
     valid_x_min: float = 0.0,
     cell_px: int = 72,
     occupancy: dict[tuple[int, int], list[int]] | None = None,
+    landmarks: bool = False,
 ) -> np.ndarray:
     """Draw grid with Pillow (sharp text/lines on Windows).
 
@@ -315,6 +386,8 @@ def draw_grid(
             fill=(200, 100, 0),
             font=font,
         )
+    if landmarks:
+        _draw_grid_landmarks(draw, cell_px)
     return _pil_to_bgr(img)
 
 
