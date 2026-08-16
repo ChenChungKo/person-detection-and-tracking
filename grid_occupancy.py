@@ -130,6 +130,19 @@ def landmark_bgr(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
     return (int(b), int(g), int(r))
 
 
+def floor_overlay_bounds() -> tuple[float, float, float, float]:
+    """Axis-aligned world box covering A–D (the camera-visible floor ROI)."""
+    xs = [wx for _n, wx, _y, _c in FLOOR_LANDMARKS]
+    ys = [wy for _n, _x, wy, _c in FLOOR_LANDMARKS]
+    return min(xs), max(xs), min(ys), max(ys)
+
+
+def floor_overlay_corners() -> list[tuple[float, float]]:
+    """A → B → C → D in world cm."""
+    by_name = {name: (wx, wy) for name, wx, wy, _c in FLOOR_LANDMARKS}
+    return [by_name[k] for k in ("A", "B", "C", "D")]
+
+
 def imread_unicode(path: Path) -> np.ndarray | None:
     data = np.fromfile(str(path), dtype=np.uint8)
     if data.size == 0:
@@ -286,25 +299,29 @@ def _empty_grid_image(valid_x_min: float, cell_px: int) -> Image.Image:
 def _draw_grid_landmarks(draw, cell_px: int) -> None:
     """Same A–D corners and mid split as the camera overlay."""
     try:
-        font_mark = ImageFont.truetype(str(Path(r"C:\Windows\Fonts\msyhbd.ttc")), 22)
+        font_mark = ImageFont.truetype(str(Path(r"C:\Windows\Fonts\msyhbd.ttc")), 28)
     except OSError:
         font_mark = _load_fonts()[1]
-    ax, ay = world_to_grid_px(X_EDGES[0], FLOOR_MID_Y, cell_px)
-    bx, by = world_to_grid_px(X_EDGES[-1], FLOOR_MID_Y, cell_px)
-    cx, cy = world_to_grid_px(FLOOR_MID_X, Y_EDGES[0], cell_px)
-    dx, dy = world_to_grid_px(FLOOR_MID_X, Y_EDGES[-1], cell_px)
-    draw.line((ax, ay, bx, by), fill=(90, 90, 90), width=2)
-    draw.line((cx, cy, dx, dy), fill=(90, 90, 90), width=2)
-    radius = 11
+    x0, x1, y0, y1 = floor_overlay_bounds()
+    # Quadrant cross inside the A–D box (matches camera).
+    hx0, hy0 = world_to_grid_px(x0, FLOOR_MID_Y, cell_px)
+    hx1, hy1 = world_to_grid_px(x1, FLOOR_MID_Y, cell_px)
+    vx0, vy0 = world_to_grid_px(FLOOR_MID_X, y0, cell_px)
+    vx1, vy1 = world_to_grid_px(FLOOR_MID_X, y1, cell_px)
+    draw.line((hx0, hy0, hx1, hy1), fill=(0, 180, 220), width=4)
+    draw.line((vx0, vy0, vx1, vy1), fill=(0, 180, 220), width=4)
+    corners = [world_to_grid_px(wx, wy, cell_px) for wx, wy in floor_overlay_corners()]
+    draw.line(corners + [corners[0]], fill=(140, 60, 160), width=5)
+    radius = 14
     for name, wx, wy, rgb in FLOOR_LANDMARKS:
         px, py = world_to_grid_px(wx, wy, cell_px)
         draw.ellipse(
             (px - radius, py - radius, px + radius, py + radius),
             fill=rgb,
             outline=(20, 20, 20),
-            width=2,
+            width=3,
         )
-        draw.text((px + 12, py - 16), name, fill=rgb, font=font_mark)
+        draw.text((px + 16, py - 20), name, fill=rgb, font=font_mark)
 
 
 def draw_grid(
