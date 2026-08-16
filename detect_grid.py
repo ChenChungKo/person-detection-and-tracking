@@ -29,15 +29,10 @@ import numpy as np
 from ultralytics import YOLO
 
 from grid_occupancy import (
-    FLOOR_LANDMARKS,
-    FLOOR_MID_X,
-    FLOOR_MID_Y,
+    FLOOR_MARKS,
     X_EDGES,
-    Y_EDGES,
     cell_label,
     draw_grid,
-    floor_overlay_bounds,
-    floor_overlay_corners,
     id_bgr_color,
     imread_unicode,
     imwrite_unicode,
@@ -118,90 +113,12 @@ def world_to_image(h_inv: np.ndarray, x: float, y: float) -> tuple[float, float]
     return float(pix[0]), float(pix[1])
 
 
-def _floor_line_samples(
-    axis: str,
-    value: float,
-    step_cm: float = 15.0,
-    x0: float | None = None,
-    x1: float | None = None,
-    y0: float | None = None,
-    y1: float | None = None,
-) -> list[tuple[float, float]]:
-    xa = X_EDGES[0] if x0 is None else x0
-    xb = X_EDGES[-1] if x1 is None else x1
-    ya = Y_EDGES[0] if y0 is None else y0
-    yb = Y_EDGES[-1] if y1 is None else y1
-    if axis == "x":
-        n = max(2, int(round((yb - ya) / step_cm)) + 1)
-        return [(value, float(y)) for y in np.linspace(ya, yb, n)]
-    n = max(2, int(round((xb - xa) / step_cm)) + 1)
-    return [(float(x), value) for x in np.linspace(xa, xb, n)]
-
-
-def _edge_samples(p0: tuple[float, float], p1: tuple[float, float], step_cm: float = 15.0) -> list[tuple[float, float]]:
-    x0, y0 = p0
-    x1, y1 = p1
-    dist = float(((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5)
-    n = max(2, int(round(dist / step_cm)) + 1)
-    xs = np.linspace(x0, x1, n)
-    ys = np.linspace(y0, y1, n)
-    return [(float(x), float(y)) for x, y in zip(xs, ys)]
-
-
-def _project_world_polyline(
-    h_inv: np.ndarray,
-    samples: list[tuple[float, float]],
-    scale: float,
-    width: int,
-    height: int,
-) -> list[np.ndarray]:
-    """Project a world polyline to preview pixels, dropping off-image jumps."""
-    raw: list[tuple[float, float] | None] = []
-    margin = 80.0
-    max_jump = 220.0
-    for wx, wy in samples:
-        ix, iy = world_to_image(h_inv, wx, wy)
-        px, py = ix * scale, iy * scale
-        if not np.isfinite(px) or not np.isfinite(py):
-            raw.append(None)
-            continue
-        if px < -margin or py < -margin or px > width + margin or py > height + margin:
-            raw.append(None)
-            continue
-        raw.append((px, py))
-
-    segs: list[np.ndarray] = []
-    cur: list[tuple[int, int]] = []
-    for i, pt in enumerate(raw):
-        if pt is None:
-            if len(cur) >= 2:
-                segs.append(np.array(cur, dtype=np.int32))
-            cur = []
-            continue
-        x, y = int(round(pt[0])), int(round(pt[1]))
-        if cur:
-            dx = x - cur[-1][0]
-            dy = y - cur[-1][1]
-            if dx * dx + dy * dy > max_jump * max_jump:
-                if len(cur) >= 2:
-                    segs.append(np.array(cur, dtype=np.int32))
-                cur = [(x, y)]
-                continue
-        cur.append((x, y))
-        _ = i
-    if len(cur) >= 2:
-        segs.append(np.array(cur, dtype=np.int32))
-    return segs
-
-
 class FloorOverlayCache:
-    """Homography is static: project the A–D frame and quadrant cross once."""
+    """Homography is static: project the five floor marks once per preview size."""
 
     def __init__(self) -> None:
         self._key: tuple[int, int, int, int] | None = None
         self._h_inv: np.ndarray | None = None
-        self._frame_segs: list[np.ndarray] = []
-        self._mid_segs: list[np.ndarray] = []
         self._marks: list[tuple[str, int, int, tuple[int, int, int]]] = []
 
     def prepare(self, h_mat: np.ndarray, frame_wh: tuple[int, int], preview_wh: tuple[int, int]) -> None:
@@ -213,36 +130,8 @@ class FloorOverlayCache:
         self._key = key
         self._h_inv = np.linalg.inv(h_mat)
         scale = pw / float(fw) if fw else 1.0
-        x0, x1, y0, y1 = floor_overlay_bounds()
-        corners = floor_overlay_corners()
-        frame_segs: list[np.ndarray] = []
-        for a, b in zip(corners, corners[1:] + corners[:1]):
-            frame_segs.extend(
-                _project_world_polyline(self._h_inv, _edge_samples(a, b), scale, pw, ph)
-            )
-        self._frame_segs = frame_segs
-        mid_segs: list[np.ndarray] = []
-        mid_segs.extend(
-            _project_world_polyline(
-                self._h_inv,
-                _floor_line_samples("x", FLOOR_MID_X, x0=x0, x1=x1, y0=y0, y1=y1),
-                scale,
-                pw,
-                ph,
-            )
-        )
-        mid_segs.extend(
-            _project_world_polyline(
-                self._h_inv,
-                _floor_line_samples("y", FLOOR_MID_Y, x0=x0, x1=x1, y0=y0, y1=y1),
-                scale,
-                pw,
-                ph,
-            )
-        )
-        self._mid_segs = mid_segs
         marks: list[tuple[str, int, int, tuple[int, int, int]]] = []
-        for name, wx, wy, rgb in FLOOR_LANDMARKS:
+        for name, wx, wy, rgb in FLOOR_MARKS:
             ix, iy = world_to_image(self._h_inv, wx, wy)
             px, py = int(round(ix * scale)), int(round(iy * scale))
             if -40 <= px < pw + 40 and -40 <= py < ph + 40:
@@ -250,14 +139,6 @@ class FloorOverlayCache:
         self._marks = marks
 
     def draw(self, vis: np.ndarray) -> None:
-        frame_color = (160, 60, 140)
-        mid = (0, 220, 255)
-        for seg in self._frame_segs:
-            cv2.polylines(vis, [seg], False, (20, 20, 20), 5, cv2.LINE_AA)
-            cv2.polylines(vis, [seg], False, frame_color, 3, cv2.LINE_AA)
-        for seg in self._mid_segs:
-            cv2.polylines(vis, [seg], False, (20, 20, 20), 4, cv2.LINE_AA)
-            cv2.polylines(vis, [seg], False, mid, 2, cv2.LINE_AA)
         for name, px, py, bgr in self._marks:
             cv2.circle(vis, (px, py), 12, (20, 20, 20), -1, cv2.LINE_AA)
             cv2.circle(vis, (px, py), 9, bgr, -1, cv2.LINE_AA)
@@ -1014,7 +895,7 @@ def parse_args() -> argparse.Namespace:
         dest="show_floor_grid",
         action="store_true",
         default=True,
-        help="overlay warped floor grid + A–D landmarks on camera and bird-eye views",
+        help="overlay five floor marks (A–D + center O) on camera and bird-eye views",
     )
     p.add_argument(
         "--no-floor-grid",
@@ -1297,7 +1178,7 @@ def main() -> None:
     grid_cache = GridCache()
     floor_overlay = FloorOverlayCache()
     if args.show_floor_grid:
-        print("定位對照：相機只畫 A–D 外框＋十字四象限；右側細格保留，並強調 A–D 與有人色格。")
+        print("定位對照：相機只畫地上五點 A/B/C/D/O（無線）；右側細格保留，並強調同一組五點與有人色格。")
 
     def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         dets, detect_ms, locate_ms = detect_and_locate(frame, model, h_mat, **det_kw)
