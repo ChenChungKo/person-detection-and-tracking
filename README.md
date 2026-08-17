@@ -114,6 +114,29 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 以 bbox 底邊中點為腳點；桌旁被擋時可用 `--ref auto` / `--ref head_drop`。  
 測試影片：`test/test.mp4`。按 `q` 結束，`s` 存圖。
 
+**定位對照（此分支 `feature/floor-grid-overlay`，報告用，尚未合入 main）**
+
+相機與右側格子畫同一組 **四個地上點**（無線、人框只標 ID）。不含遠右角，避免投到桌子／家具上。
+
+| 點 | 世界座標 (cm) | 位置 |
+|---|---|---|
+| **A** | (170, 450) | 近左 |
+| **B** | (170, 180) | 遠左 |
+| **C** | (440, 450) | 近右 |
+| **O** | (260, 315) | 走道中心 |
+
+座標存在 `calibration/floor_marks.json`。此分支預設開啟；`--no-floor-grid` 可關。
+
+若要改點，只點看得見的地面：
+
+```powershell
+python pick_floor_marks.py --source test/static_frame.jpg
+# 或影片某一幀：
+python pick_floor_marks.py --source test/test4.mp4 --frame 1
+```
+
+依序點 A（近左）→ B（遠左）→ C（近右）→ O（正中心），按 `s` 覆寫 `floor_marks.json`。
+
 ### 人物 ID（Stable-ID）
 
 管線：`YOLO26.track(persist=True)` → **BoT-SORT**（短期）→ **Stable-ID + OSNet-AIN**（長期 ID）。畫面只標 `ID1`…；人框與格子同一套顏色。不假設場上只有一人。
@@ -210,6 +233,7 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 | 項目 | 設定 |
 |------|------|
 | Homography | **v2**（`calibration/homography.json`） |
+| 定位對照（此分支） | 地上四點 A/B/C/O，見 `calibration/floor_marks.json`；`--no-floor-grid` 可關 |
 | 偵測 | `yolo26s.pt`、`--ref auto`、`--conf 0.45`、`--cell-hold 2` |
 | 短追蹤 | BoT-SORT（`trackers/botsort.yaml`；GMC off、短 ReID off） |
 | 長期 ID | Stable-ID + `--reid-model osnet_ain`；`--min-hits 16`；`--appear-thresh 0.34` |
@@ -224,18 +248,18 @@ python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --
 
 ## Demo 影片（左：偵測，右：格子）
 
-**目前主 demo（Stable-ID + OSNet-AIN）**，使用 `test/test4.mp4` 與實際 `detect_grid.py` 流程錄製。
+**目前主 demo（Stable-ID + OSNet-AIN + 地板四點）**，使用 `test/test4.mp4` 與實際 `detect_grid.py` 流程錄製（此分支含 A/B/C/O）。
 
-一般測試與審查指令：
+一般測試指令：
 
 ```powershell
-python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump
+python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
 ```
 
-錄製同一套追蹤結果（不開預覽視窗）：
+錄製同一套結果（不開預覽視窗）：
 
 ```powershell
-python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump --save-video test/demo_stable_id_osnet_ain.mp4 --no-show --no-realtime
+python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --save-video test/demo_stable_id_osnet_ain.mp4 --no-show --no-realtime
 ```
 
 | 版本 | 影片 | WebP |
@@ -248,7 +272,7 @@ python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet -
   <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：Stable-ID + OSNet-AIN，左偵測右格子"/>
 </p>
 
-## 狀態（2026-08-14）
+## 狀態（2026-08-17）
 
 **已完成**
 - YOLO26 官方 `model.track` + BoT-SORT 短追蹤；長期 ID 仍由 Stable-ID + OSNet-AIN  
@@ -257,12 +281,14 @@ python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet -
 - 本機影片固定追蹤幀，重跑結果不再受即時丟幀與電腦負載改變  
 - 陌生人物不再直接冒用既有 ID；短暫確認後建立可供回場比對的新 ID  
 - RTSP 保留背景 YOLO、最新幀與 TCP 降延遲；格子支援防抖與跳幀  
+- 報告用地板對照：相機／格子同一組 A/B/C/O（此分支 `feature/floor-grid-overlay`，尚未合入 main）  
 
 **尚未解決**
 - 多人遮擋／漏檢仍可能閃號（坐著、趴著、被擋時 `conf=0.45` 較易漏）  
 - 近鏡頭大框易吃到另一人 → 圖庫可能拒寫或外貌混淆  
 - `test3.mp4` 的人數多、停留短且交叉頻繁；目前 `--min-hits 16` 與陌生人隔離較保守，可能延遲或隱藏新 ID，尚待加入依框品質調整的自適應發號  
 - 換裝、跨鏡頭、畸變校正接入管線  
+- 遠右地板角被桌子擋住，對照點暫不標該角；此分支尚未合入 `main`  
 
 ## 文件
 

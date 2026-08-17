@@ -83,6 +83,97 @@ def y_edges() -> list[float]:
 X_EDGES = x_edges()
 Y_EDGES = y_edges()
 
+# Report overlay marks (world cm). No far-right point.
+MARK_NAMES: tuple[str, ...] = ("A", "B", "C", "O")
+MARK_COLORS_RGB: dict[str, tuple[int, int, int]] = {
+    "A": (255, 80, 80),
+    "B": (40, 160, 255),
+    "C": (40, 200, 90),
+    "O": (255, 230, 0),
+}
+DEFAULT_FLOOR_MARKS_PATH = Path(__file__).resolve().parent / "calibration" / "floor_marks.json"
+# A near-left, B far-left, C near-right, O aisle center.
+_DEFAULT_MARK_XY: dict[str, tuple[float, float]] = {
+    "A": (170.0, 450.0),
+    "B": (170.0, 180.0),
+    "C": (440.0, 450.0),
+    "O": (260.0, 315.0),
+}
+
+
+def _default_floor_marks() -> tuple[tuple[str, float, float, tuple[int, int, int]], ...]:
+    return tuple(
+        (name, _DEFAULT_MARK_XY[name][0], _DEFAULT_MARK_XY[name][1], MARK_COLORS_RGB[name])
+        for name in MARK_NAMES
+    )
+
+
+def load_floor_marks(
+    path: Path | None = None,
+) -> tuple[tuple[str, float, float, tuple[int, int, int]], ...]:
+    marks_path = path or DEFAULT_FLOOR_MARKS_PATH
+    if not marks_path.exists():
+        return _default_floor_marks()
+    try:
+        payload = json.loads(marks_path.read_text(encoding="utf-8"))
+        rows = payload.get("marks") or []
+        by_name: dict[str, tuple[float, float, tuple[int, int, int]]] = {}
+        for row in rows:
+            name = str(row["name"]).upper()
+            if name not in MARK_COLORS_RGB:
+                continue
+            wx, wy = row["world_xy_cm"]
+            rgb = tuple(int(v) for v in row.get("rgb", MARK_COLORS_RGB[name]))
+            if len(rgb) != 3:
+                rgb = MARK_COLORS_RGB[name]
+            by_name[name] = (float(wx), float(wy), (rgb[0], rgb[1], rgb[2]))
+        ordered: list[tuple[str, float, float, tuple[int, int, int]]] = []
+        for name in MARK_NAMES:
+            if name not in by_name:
+                raise KeyError(name)
+            wx, wy, rgb = by_name[name]
+            ordered.append((name, wx, wy, rgb))
+        return tuple(ordered)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return _default_floor_marks()
+
+
+FLOOR_MARKS = load_floor_marks()
+FLOOR_LANDMARKS = tuple(m for m in FLOOR_MARKS if m[0] != "O")
+GRID_MARGIN_L = 96
+GRID_MARGIN_T = 52
+GRID_CELL_PX = 72
+
+
+def world_to_grid_px(
+    wx: float,
+    wy: float,
+    cell_px: int = GRID_CELL_PX,
+) -> tuple[int, int]:
+    """Map world cm to pixel on the drawn bird-eye grid."""
+
+    def axis_pos(value: float, edges: list[float]) -> float:
+        if value <= edges[0]:
+            return 0.0
+        if value >= edges[-1]:
+            return float(len(edges) - 1)
+        for i in range(len(edges) - 1):
+            lo, hi = edges[i], edges[i + 1]
+            if lo <= value <= hi:
+                span = hi - lo
+                frac = 0.0 if span <= 1e-9 else (value - lo) / span
+                return i + frac
+        return float(len(edges) - 1)
+
+    px = GRID_MARGIN_L + axis_pos(wx, X_EDGES) * cell_px
+    py = GRID_MARGIN_T + axis_pos(wy, Y_EDGES) * cell_px
+    return int(round(px)), int(round(py))
+
+
+def landmark_bgr(rgb: tuple[int, int, int]) -> tuple[int, int, int]:
+    r, g, b = rgb
+    return (int(b), int(g), int(r))
+
 
 def imread_unicode(path: Path) -> np.ndarray | None:
     data = np.fromfile(str(path), dtype=np.uint8)
@@ -237,11 +328,30 @@ def _empty_grid_image(valid_x_min: float, cell_px: int) -> Image.Image:
     return img.copy()
 
 
+def _draw_grid_landmarks(draw, cell_px: int) -> None:
+    """Same four floor marks as the camera overlay: A, B, C, and center O."""
+    try:
+        font_mark = ImageFont.truetype(str(Path(r"C:\Windows\Fonts\msyhbd.ttc")), 28)
+    except OSError:
+        font_mark = _load_fonts()[1]
+    radius = 14
+    for name, wx, wy, rgb in FLOOR_MARKS:
+        px, py = world_to_grid_px(wx, wy, cell_px)
+        draw.ellipse(
+            (px - radius, py - radius, px + radius, py + radius),
+            fill=rgb,
+            outline=(20, 20, 20),
+            width=3,
+        )
+        draw.text((px + 16, py - 20), name, fill=rgb, font=font_mark)
+
+
 def draw_grid(
     active: tuple[int, int] | None,
     valid_x_min: float = 0.0,
     cell_px: int = 72,
     occupancy: dict[tuple[int, int], list[int]] | None = None,
+    landmarks: bool = False,
 ) -> np.ndarray:
     """Draw grid with Pillow (sharp text/lines on Windows).
 
@@ -315,6 +425,8 @@ def draw_grid(
             fill=(200, 100, 0),
             font=font,
         )
+    if landmarks:
+        _draw_grid_landmarks(draw, cell_px)
     return _pil_to_bgr(img)
 
 
