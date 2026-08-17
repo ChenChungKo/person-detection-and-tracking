@@ -114,7 +114,7 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 以 bbox 底邊中點為腳點；桌旁被擋時可用 `--ref auto` / `--ref head_drop`。  
 測試影片：`test/test.mp4`。按 `q` 結束，`s` 存圖。
 
-**定位對照（報告用）**：相機只畫四個地上點 A/C/D/O（無線，不含遠右）。人框只標 ID。右側仍保留細格與同一組四點。預設開啟；`--no-floor-grid` 可關。
+**定位對照（報告用）**：相機只畫四個地上點 A/B/C/O（無線）。座標為 A(170,450)、B(170,180)、C(440,450)、O(260,315) cm。人框只標 ID。右側仍保留細格與同一組四點。預設開啟；`--no-floor-grid` 可關。
 
 手動選點（建議只點看得見的地面）：
 
@@ -124,7 +124,7 @@ python pick_floor_marks.py --source test/static_frame.jpg
 python pick_floor_marks.py --source test/test4.mp4 --frame 1
 ```
 
-依序點 A（遠左）→ C（近右）→ D（近左）→ O（正中心），按 `s` 存到 `calibration/floor_marks.json`；之後跑 `detect_grid.py` 會自動讀取。
+依序點 A（近左）→ B（遠左）→ C（近右）→ O（正中心），按 `s` 存到 `calibration/floor_marks.json`；之後跑 `detect_grid.py` 會自動讀取。目前預設已用指定座標：A(170,450)、B(170,180)、C(440,450)、O(260,315)。
 
 ### 人物 ID（Stable-ID）
 

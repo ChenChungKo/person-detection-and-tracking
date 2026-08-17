@@ -895,7 +895,7 @@ def parse_args() -> argparse.Namespace:
         dest="show_floor_grid",
         action="store_true",
         default=True,
-        help="overlay four floor marks (A, C, D + center O) on camera and bird-eye views",
+        help="overlay four floor marks (A, B, C + center O) on camera and bird-eye views",
     )
     p.add_argument(
         "--no-floor-grid",
@@ -1178,7 +1178,7 @@ def main() -> None:
     grid_cache = GridCache()
     floor_overlay = FloorOverlayCache()
     if args.show_floor_grid:
-        print("定位對照：四點 A/C/D/O（可手動選：python pick_floor_marks.py）；人框只標 ID。")
+        print("定位對照：四點 A/B/C/O（可手動選：python pick_floor_marks.py）；人框只標 ID。")
 
     def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         dets, detect_ms, locate_ms = detect_and_locate(frame, model, h_mat, **det_kw)

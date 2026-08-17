@@ -83,25 +83,29 @@ def y_edges() -> list[float]:
 X_EDGES = x_edges()
 Y_EDGES = y_edges()
 
-# Shared floor landmarks for camera overlay and bird-eye grid (world cm).
-# Prefer calibration/floor_marks.json from pick_floor_marks.py; else aisle defaults.
-# No far-right mark: A far-left, C near-right, D near-left, O center.
-MARK_NAMES: tuple[str, ...] = ("A", "C", "D", "O")
+# Report overlay marks (world cm). No far-right point.
+MARK_NAMES: tuple[str, ...] = ("A", "B", "C", "O")
 MARK_COLORS_RGB: dict[str, tuple[int, int, int]] = {
     "A": (255, 80, 80),
+    "B": (40, 160, 255),
     "C": (40, 200, 90),
-    "D": (255, 160, 0),
     "O": (255, 230, 0),
 }
 DEFAULT_FLOOR_MARKS_PATH = Path(__file__).resolve().parent / "calibration" / "floor_marks.json"
+# A near-left, B far-left, C near-right, O aisle center.
+_DEFAULT_MARK_XY: dict[str, tuple[float, float]] = {
+    "A": (170.0, 450.0),
+    "B": (170.0, 180.0),
+    "C": (440.0, 450.0),
+    "O": (260.0, 315.0),
+}
 
 
 def _default_floor_marks() -> tuple[tuple[str, float, float, tuple[int, int, int]], ...]:
-    # Visible open-aisle defaults (not under desks / far wall).
-    a, c, d = (215.0, 225.0), (305.0, 360.0), (215.0, 360.0)
-    o = ((a[0] + c[0] + d[0]) / 3.0, (a[1] + c[1] + d[1]) / 3.0)
-    pts = {"A": a, "C": c, "D": d, "O": o}
-    return tuple((name, pts[name][0], pts[name][1], MARK_COLORS_RGB[name]) for name in MARK_NAMES)
+    return tuple(
+        (name, _DEFAULT_MARK_XY[name][0], _DEFAULT_MARK_XY[name][1], MARK_COLORS_RGB[name])
+        for name in MARK_NAMES
+    )
 
 
 def load_floor_marks(
@@ -325,7 +329,7 @@ def _empty_grid_image(valid_x_min: float, cell_px: int) -> Image.Image:
 
 
 def _draw_grid_landmarks(draw, cell_px: int) -> None:
-    """Same four floor marks as the camera overlay: A, C, D, and center O."""
+    """Same four floor marks as the camera overlay: A, B, C, and center O."""
     try:
         font_mark = ImageFont.truetype(str(Path(r"C:\Windows\Fonts\msyhbd.ttc")), 28)
     except OSError:

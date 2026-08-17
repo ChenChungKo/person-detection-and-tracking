@@ -1,4 +1,4 @@
-"""Manually pick four floor marks (A C D O) on a camera frame.
+"""Manually pick four floor marks (A B C O) on a camera frame.
 
 Click visible floor only. World cm come from the current Homography.
 
@@ -8,7 +8,7 @@ Usage:
   python pick_floor_marks.py --source test/test4.mp4 --frame 1
 
 Keys:
-  left-click  place next mark (A → C → D → O)
+  left-click  place next mark (A → B → C → O)
   u           undo last mark
   s           save and exit (needs all four)
   r           clear all
@@ -65,7 +65,7 @@ def open_frame(source: str, frame_idx: int) -> tuple[np.ndarray, str]:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Pick four floor marks A C D O")
+    p = argparse.ArgumentParser(description="Pick four floor marks A B C O")
     p.add_argument("--calib", default=str(DEFAULT_CALIB))
     p.add_argument("--source", default=str(DEFAULT_IMAGE))
     p.add_argument("--frame", type=int, default=1, help="video frame index (0-based)")
@@ -91,7 +91,7 @@ def main() -> None:
 
     # name -> (wx, wy, full_ix, full_iy)
     picks: list[tuple[str, float, float, float, float]] = []
-    win = "Pick Floor Marks (A C D O)"
+    win = "Pick Floor Marks (A B C O)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     def on_mouse(event, x, y, flags, param) -> None:  # noqa: ARG001
@@ -112,7 +112,7 @@ def main() -> None:
     cv2.setMouseCallback(win, on_mouse)
     print(f"校正：{calib_path}")
     print(f"來源：{source_label}")
-    print("請依序點地板：A（遠左）→ C（近右）→ D（近左）→ O（正中心）")
+    print("請依序點地板：A（近左）→ B（遠左）→ C（近右）→ O（正中心）")
     print("只點看得見的地面，不要點桌子／人／牆。")
     print("按鍵：u 撤銷  r 重選  s 存檔  q 離開")
 
@@ -180,7 +180,7 @@ def main() -> None:
                 "source": source_label.replace("\\", "/"),
                 "image_size_wh": [int(w), int(h)],
                 "marks": marks,
-                "note": "Manual floor marks for report overlay (A C D O).",
+                "note": "Manual floor marks for report overlay (A B C O).",
             }
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
