@@ -84,20 +84,55 @@ X_EDGES = x_edges()
 Y_EDGES = y_edges()
 
 # Shared floor landmarks for camera overlay and bird-eye grid (world cm).
-# RGB colors so both Pillow (grid) and OpenCV BGR (camera) stay in sync.
-# Keep all five marks on visible open-aisle floor (not under desks / far wall).
-# Spreading to map corners makes points appear stuck on furniture.
-FLOOR_LANDMARKS: tuple[tuple[str, float, float, tuple[int, int, int]], ...] = (
-    ("A", 215.0, 225.0, (255, 80, 80)),
-    ("B", 305.0, 225.0, (40, 160, 255)),
-    ("C", 305.0, 360.0, (40, 200, 90)),
-    ("D", 215.0, 360.0, (255, 160, 0)),
-)
-_FLOOR_CX = 0.5 * (215.0 + 305.0)
-_FLOOR_CY = 0.5 * (225.0 + 360.0)
-FLOOR_MARKS: tuple[tuple[str, float, float, tuple[int, int, int]], ...] = FLOOR_LANDMARKS + (
-    ("O", _FLOOR_CX, _FLOOR_CY, (255, 230, 0)),
-)
+# Prefer calibration/floor_marks.json from pick_floor_marks.py; else aisle defaults.
+MARK_COLORS_RGB: dict[str, tuple[int, int, int]] = {
+    "A": (255, 80, 80),
+    "B": (40, 160, 255),
+    "C": (40, 200, 90),
+    "D": (255, 160, 0),
+    "O": (255, 230, 0),
+}
+DEFAULT_FLOOR_MARKS_PATH = Path(__file__).resolve().parent / "calibration" / "floor_marks.json"
+
+
+def _default_floor_marks() -> tuple[tuple[str, float, float, tuple[int, int, int]], ...]:
+    # Visible open-aisle defaults (not under desks / far wall).
+    a, b, c, d = (215.0, 225.0), (305.0, 225.0), (305.0, 360.0), (215.0, 360.0)
+    o = (0.5 * (a[0] + c[0]), 0.5 * (a[1] + c[1]))
+    pts = {"A": a, "B": b, "C": c, "D": d, "O": o}
+    return tuple((name, pts[name][0], pts[name][1], MARK_COLORS_RGB[name]) for name in ("A", "B", "C", "D", "O"))
+
+
+def load_floor_marks(
+    path: Path | None = None,
+) -> tuple[tuple[str, float, float, tuple[int, int, int]], ...]:
+    marks_path = path or DEFAULT_FLOOR_MARKS_PATH
+    if not marks_path.exists():
+        return _default_floor_marks()
+    try:
+        payload = json.loads(marks_path.read_text(encoding="utf-8"))
+        rows = payload.get("marks") or []
+        by_name: dict[str, tuple[float, float, tuple[int, int, int]]] = {}
+        for row in rows:
+            name = str(row["name"]).upper()
+            wx, wy = row["world_xy_cm"]
+            rgb = tuple(int(v) for v in row.get("rgb", MARK_COLORS_RGB.get(name, (255, 255, 255))))
+            if len(rgb) != 3:
+                rgb = MARK_COLORS_RGB.get(name, (255, 255, 255))
+            by_name[name] = (float(wx), float(wy), (rgb[0], rgb[1], rgb[2]))
+        ordered: list[tuple[str, float, float, tuple[int, int, int]]] = []
+        for name in ("A", "B", "C", "D", "O"):
+            if name not in by_name:
+                raise KeyError(name)
+            wx, wy, rgb = by_name[name]
+            ordered.append((name, wx, wy, rgb))
+        return tuple(ordered)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return _default_floor_marks()
+
+
+FLOOR_MARKS = load_floor_marks()
+FLOOR_LANDMARKS = tuple(m for m in FLOOR_MARKS if m[0] != "O")
 GRID_MARGIN_L = 96
 GRID_MARGIN_T = 52
 GRID_CELL_PX = 72
