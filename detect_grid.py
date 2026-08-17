@@ -1178,7 +1178,7 @@ def main() -> None:
     grid_cache = GridCache()
     floor_overlay = FloorOverlayCache()
     if args.show_floor_grid:
-        print("定位對照：相機只畫走道五點 A/B/C/D/O（無線，可見地板角）；右側細格保留，並強調同一組五點與有人色格。")
+        print("定位對照：相機只畫走道五點 A/B/C/D/O（無線，皆在可見地板）；右側細格保留，並強調同一組五點與有人色格。")
 
     def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         dets, detect_ms, locate_ms = detect_and_locate(frame, model, h_mat, **det_kw)
