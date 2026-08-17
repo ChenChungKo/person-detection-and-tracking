@@ -248,18 +248,18 @@ python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --
 
 ## Demo 影片（左：偵測，右：格子）
 
-**目前主 demo（Stable-ID + OSNet-AIN）**，使用 `test/test4.mp4` 與實際 `detect_grid.py` 流程錄製。
+**目前主 demo（Stable-ID + OSNet-AIN + 地板四點）**，使用 `test/test4.mp4` 與實際 `detect_grid.py` 流程錄製（此分支含 A/B/C/O）。
 
-一般測試與審查指令：
+一般測試指令：
 
 ```powershell
-python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump
+python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
 ```
 
-錄製同一套追蹤結果（不開預覽視窗）：
+錄製同一套結果（不開預覽視窗）：
 
 ```powershell
-python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump --save-video test/demo_stable_id_osnet_ain.mp4 --no-show --no-realtime
+python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --save-video test/demo_stable_id_osnet_ain.mp4 --no-show --no-realtime
 ```
 
 | 版本 | 影片 | WebP |
