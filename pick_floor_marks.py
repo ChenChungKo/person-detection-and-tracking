@@ -1,4 +1,4 @@
-"""Manually pick five floor marks (A B C D O) on a camera frame.
+"""Manually pick four floor marks (A C D O) on a camera frame.
 
 Click visible floor only. World cm come from the current Homography.
 
@@ -8,9 +8,9 @@ Usage:
   python pick_floor_marks.py --source test/test4.mp4 --frame 1
 
 Keys:
-  left-click  place next mark (A → B → C → D → O)
+  left-click  place next mark (A → C → D → O)
   u           undo last mark
-  s           save and exit (needs all five)
+  s           save and exit (needs all four)
   r           clear all
   q           quit without saving
 """
@@ -25,12 +25,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from grid_occupancy import MARK_COLORS_RGB, imread_unicode, landmark_bgr
+from grid_occupancy import MARK_COLORS_RGB, MARK_NAMES, imread_unicode, landmark_bgr
 
 DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
 DEFAULT_OUT = Path(__file__).resolve().parent / "calibration" / "floor_marks.json"
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "test" / "static_frame.jpg"
-MARK_NAMES = ("A", "B", "C", "D", "O")
 
 
 def load_homography(path: Path) -> np.ndarray:
@@ -66,7 +65,7 @@ def open_frame(source: str, frame_idx: int) -> tuple[np.ndarray, str]:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Pick five floor marks A B C D O")
+    p = argparse.ArgumentParser(description="Pick four floor marks A C D O")
     p.add_argument("--calib", default=str(DEFAULT_CALIB))
     p.add_argument("--source", default=str(DEFAULT_IMAGE))
     p.add_argument("--frame", type=int, default=1, help="video frame index (0-based)")
@@ -92,14 +91,14 @@ def main() -> None:
 
     # name -> (wx, wy, full_ix, full_iy)
     picks: list[tuple[str, float, float, float, float]] = []
-    win = "Pick Floor Marks (A B C D O)"
+    win = "Pick Floor Marks (A C D O)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     def on_mouse(event, x, y, flags, param) -> None:  # noqa: ARG001
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         if len(picks) >= len(MARK_NAMES):
-            print("已選滿 5 點。按 s 存檔，或 u 撤銷／r 重選。")
+            print("已選滿 4 點。按 s 存檔，或 u 撤銷／r 重選。")
             return
         full_x = x / scale
         full_y = y / scale
@@ -108,12 +107,12 @@ def main() -> None:
         picks.append((name, wx, wy, full_x, full_y))
         print(f"{name}: image=({full_x:.1f},{full_y:.1f}) -> world=({wx:.1f},{wy:.1f}) cm")
         if len(picks) == len(MARK_NAMES):
-            print("五點齊了。按 s 存檔，u 撤銷最後一點，r 重來，q 離開不存。")
+            print("四點齊了。按 s 存檔，u 撤銷最後一點，r 重來，q 離開不存。")
 
     cv2.setMouseCallback(win, on_mouse)
     print(f"校正：{calib_path}")
     print(f"來源：{source_label}")
-    print("請依序點地板：A（遠左）→ B（遠右）→ C（近右）→ D（近左）→ O（正中心）")
+    print("請依序點地板：A（遠左）→ C（近右）→ D（近左）→ O（正中心）")
     print("只點看得見的地面，不要點桌子／人／牆。")
     print("按鍵：u 撤銷  r 重選  s 存檔  q 離開")
 
@@ -181,7 +180,7 @@ def main() -> None:
                 "source": source_label.replace("\\", "/"),
                 "image_size_wh": [int(w), int(h)],
                 "marks": marks,
-                "note": "Manual floor marks for report overlay (A B C D O).",
+                "note": "Manual floor marks for report overlay (A C D O).",
             }
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
