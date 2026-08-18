@@ -114,7 +114,7 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 
 預設 `--ref auto`：bbox 底邊中點；被裁切時改頭頂下推。按 `q` 結束，`s` 存圖。視窗可拖曳縮放。
 
-`--ref pose`（`feature/pose-foot-ref`，測試中）：偵測仍用 `yolo26s.pt`，骨架另跑 `yolo26s-pose.pt`。畫面預設畫 COCO-17 關節與連線（只是顯示；腳點仍依下表）。`--no-pose-skeleton` 可關；`--kpt-draw-conf` 控制關節要多明顯才畫（預設 0.25）。
+`--ref pose`（`feature/pose-foot-ref`，測試中）：偵測仍用 `yolo26s.pt`，骨架另跑 `yolo26s-pose.pt`。
 
 | 情況 | 腳點 |
 |------|------|
@@ -127,8 +127,21 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 ```powershell
 python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain
 # 審查裁圖：加 --review-dump（寫入 test/reid_review/<時間>/）
-# 不要骨架：加 --no-pose-skeleton
 ```
+
+### 骨架顯示（`--ref pose`）
+
+`--ref pose` 時會在人框上畫 COCO-17 關節與連線，方便對照坐／站／腳踝用到哪些點。骨架只是顯示，腳點仍依上表。
+
+```powershell
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain
+# 不要骨架：
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --no-pose-skeleton
+```
+
+- `--ref pose` 預設開啟骨架；加 `--no-pose-skeleton` 可關
+- `--kpt-draw-conf`：關節信心低於此值不畫（預設 0.25）
+- 腳點顏色看畫面上方圖例，與骨架顏色分開
 
 **定位對照（報告用）**
 
