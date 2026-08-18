@@ -1,7 +1,7 @@
 """Detect person (YOLO) + ground ref + light grid cell.
 
 Ground reference:
-  - foot / head_drop / auto (see --ref)
+  - foot / head_drop / auto / pose (see --ref)
 
 Tracking (Ultralytics docs: https://docs.ultralytics.com/modes/track):
   - default: YOLO.track persist=True + BoT-SORT (trackers/botsort.yaml)
@@ -10,6 +10,7 @@ Tracking (Ultralytics docs: https://docs.ultralytics.com/modes/track):
 
 Usage:
   python detect_grid.py --source test/test.mp4 --ref auto
+  python detect_grid.py --source test/test4.mp4 --ref pose
   python detect_grid.py --source test/test.mp4 --stride 3 --no-track
   python detect_grid.py --source "rtsp://user:pass@ip:554/stream1" --ref auto
 """
@@ -26,6 +27,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from ultralytics import YOLO
 
 from grid_occupancy import (
@@ -48,6 +50,78 @@ DEFAULT_IMAGE = Path(__file__).resolve().parent / "test" / "static_frame.jpg"
 DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
 DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "detect_grid_preview.jpg"
 DEFAULT_TRACKER = Path(__file__).resolve().parent / "trackers" / "botsort.yaml"
+# COCO pose: 11/12=hip, 13/14=knee, 15/16=ankle
+_HIP_L, _HIP_R = 11, 12
+_KNEE_L, _KNEE_R = 13, 14
+_ANKLE_L, _ANKLE_R = 15, 16
+REF_VIS = {
+    "seat": {"color": (0, 200, 80), "tag": "座位"},
+    "pose": {"color": (255, 255, 0), "tag": "腳踝"},
+    "stand_drop": {"color": (0, 140, 255), "tag": "站立補腳"},
+    "foot": {"color": (0, 0, 255), "tag": "框底"},
+    "head_drop": {"color": (255, 0, 255), "tag": "推估"},
+}
+# COCO-17 skeleton (0-indexed), same topology as YOLO pose
+_COCO_SKELETON: list[tuple[int, int]] = [
+    (15, 13),
+    (13, 11),
+    (16, 14),
+    (14, 12),
+    (11, 12),
+    (5, 11),
+    (6, 12),
+    (5, 6),
+    (5, 7),
+    (6, 8),
+    (7, 9),
+    (8, 10),
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 4),
+    (0, 5),
+    (0, 6),
+]
+# BGR limb colors: legs, torso, arms, face (YOLO pose style)
+_LIMB_COLORS: list[tuple[int, int, int]] = [
+    (0, 165, 255),
+    (0, 165, 255),
+    (0, 165, 255),
+    (0, 165, 255),
+    (0, 165, 255),
+    (255, 0, 255),
+    (255, 0, 255),
+    (255, 0, 255),
+    (255, 128, 0),
+    (255, 128, 0),
+    (255, 128, 0),
+    (255, 128, 0),
+    (0, 255, 0),
+    (0, 255, 0),
+    (0, 255, 0),
+    (0, 255, 0),
+    (0, 255, 0),
+    (0, 255, 0),
+]
+_KPT_COLORS: list[tuple[int, int, int]] = [
+    (0, 255, 0),
+    (0, 255, 0),
+    (0, 255, 0),
+    (0, 255, 0),
+    (0, 255, 0),
+    (255, 200, 0),
+    (255, 200, 0),
+    (255, 128, 0),
+    (255, 128, 0),
+    (255, 128, 0),
+    (255, 128, 0),
+    (255, 0, 255),
+    (255, 0, 255),
+    (0, 165, 255),
+    (0, 165, 255),
+    (0, 165, 255),
+    (0, 165, 255),
+]
 
 
 def format_id_list(ids: tuple[int, ...]) -> str:
@@ -225,6 +299,529 @@ def estimate_ref_point(
     return foot_x, min(foot_y, y_max), "foot"
 
 
+def pose_model_name(detect_name: str) -> str:
+    """Map yolo26s.pt → yolo26s-pose.pt (leave *-pose.pt unchanged)."""
+    path = Path(detect_name)
+    if "-pose" in path.name.lower():
+        return detect_name
+    return str(path.with_name(f"{path.stem}-pose{path.suffix or '.pt'}"))
+
+
+def _kpt_visible(
+    kpts_xy: np.ndarray,
+    kpts_conf: np.ndarray | None,
+    idx: int,
+    min_conf: float,
+) -> tuple[float, float] | None:
+    if kpts_xy is None or idx >= len(kpts_xy):
+        return None
+    x, y = float(kpts_xy[idx][0]), float(kpts_xy[idx][1])
+    if not np.isfinite(x) or not np.isfinite(y) or (x <= 1.0 and y <= 1.0):
+        return None
+    conf = 1.0 if kpts_conf is None else float(kpts_conf[idx])
+    if conf < min_conf:
+        return None
+    return x, y
+
+
+def _pair_mid(
+    kpts_xy: np.ndarray,
+    kpts_conf: np.ndarray | None,
+    ia: int,
+    ib: int,
+    min_conf: float,
+) -> tuple[float, float] | None:
+    a = _kpt_visible(kpts_xy, kpts_conf, ia, min_conf)
+    b = _kpt_visible(kpts_xy, kpts_conf, ib, min_conf)
+    if a is not None and b is not None:
+        return (0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]))
+    return a if a is not None else b
+
+
+def _shoulder_width(
+    kpts_xy: np.ndarray,
+    kpts_conf: np.ndarray | None,
+    min_conf: float,
+    bbox_w: float,
+) -> float:
+    l_sh = _kpt_visible(kpts_xy, kpts_conf, 5, min_conf)
+    r_sh = _kpt_visible(kpts_xy, kpts_conf, 6, min_conf)
+    if l_sh is not None and r_sh is not None:
+        sh_w = float(np.hypot(l_sh[0] - r_sh[0], l_sh[1] - r_sh[1]))
+        if sh_w >= 0.25 * bbox_w:
+            return sh_w
+    return bbox_w
+
+
+def ankle_ground_point(
+    kpts_xy: np.ndarray,
+    kpts_conf: np.ndarray | None,
+    min_conf: float,
+) -> tuple[float, float] | None:
+    """Midpoint of confident ankles, or the single visible ankle."""
+    if kpts_xy is None or len(kpts_xy) <= _ANKLE_R:
+        return None
+    pts: list[tuple[float, float]] = []
+    for idx in (_ANKLE_L, _ANKLE_R):
+        x, y = float(kpts_xy[idx][0]), float(kpts_xy[idx][1])
+        if not np.isfinite(x) or not np.isfinite(y) or (x <= 1.0 and y <= 1.0):
+            continue
+        conf = 1.0 if kpts_conf is None else float(kpts_conf[idx])
+        if conf >= min_conf:
+            pts.append((x, y))
+    if not pts:
+        return None
+    if len(pts) == 1:
+        return pts[0]
+    return (0.5 * (pts[0][0] + pts[1][0]), 0.5 * (pts[0][1] + pts[1][1]))
+
+
+def box_iou(
+    ax1: float, ay1: float, ax2: float, ay2: float,
+    bx1: float, by1: float, bx2: float, by2: float,
+) -> float:
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
+    return inter / (area_a + area_b - inter)
+
+
+def match_pose_keypoints(
+    det_xyxy: np.ndarray,
+    pose_result,
+    min_iou: float = 0.25,
+) -> list[tuple[np.ndarray, np.ndarray | None] | None]:
+    """Map each detect/track box index → (kpts_xy, kpts_conf) from pose boxes."""
+    n = len(det_xyxy)
+    out: list[tuple[np.ndarray, np.ndarray | None] | None] = [None] * n
+    if pose_result is None or pose_result.boxes is None or len(pose_result.boxes) == 0:
+        return out
+    pk = getattr(pose_result, "keypoints", None)
+    if pk is None or pk.xy is None:
+        return out
+    pboxes = pose_result.boxes
+    for i in range(n):
+        x1, y1, x2, y2 = det_xyxy[i].tolist()
+        best_j = -1
+        best_iou = min_iou
+        for j in range(len(pboxes)):
+            if int(pboxes.cls[j].item()) != 0:
+                continue
+            px1, py1, px2, py2 = pboxes.xyxy[j].tolist()
+            iou = box_iou(x1, y1, x2, y2, px1, py1, px2, py2)
+            if iou > best_iou:
+                best_iou = iou
+                best_j = j
+        if best_j < 0:
+            continue
+        xy = pk.xy[best_j].detach().cpu().numpy()
+        confs = None
+        if pk.conf is not None:
+            confs = pk.conf[best_j].detach().cpu().numpy()
+        out[i] = (xy, confs)
+    return out
+
+
+def classify_sitting(
+    kpts_xy: np.ndarray,
+    kpts_conf: np.ndarray | None,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    min_conf: float,
+) -> bool:
+    """Recognize sitting from bent thighs, not from bbox height or visible ankles."""
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    aspect = bh / bw
+    hips = _pair_mid(kpts_xy, kpts_conf, _HIP_L, _HIP_R, min_conf)
+    knees = _pair_mid(kpts_xy, kpts_conf, _KNEE_L, _KNEE_R, min_conf)
+    shoulders = _pair_mid(kpts_xy, kpts_conf, 5, 6, min_conf)
+
+    if hips is None or knees is None:
+        return False
+
+    thigh_dy = knees[1] - hips[1]
+    thigh_dx = abs(knees[0] - hips[0])
+    pair_horizontal = (
+        thigh_dx >= 1.15 * max(abs(thigh_dy), 1.0)
+        and thigh_dx >= 0.07 * bh
+    )
+
+    # Pair midpoints can cancel when legs point in opposite directions. Accept
+    # either left/right thigh when it is clearly more horizontal than vertical.
+    side_horizontal = False
+    for hip_idx, knee_idx in ((_HIP_L, _KNEE_L), (_HIP_R, _KNEE_R)):
+        hip = _kpt_visible(kpts_xy, kpts_conf, hip_idx, min_conf)
+        knee = _kpt_visible(kpts_xy, kpts_conf, knee_idx, min_conf)
+        if hip is None or knee is None:
+            continue
+        dx = abs(knee[0] - hip[0])
+        dy = abs(knee[1] - hip[1])
+        if dx >= 1.05 * max(dy, 1.0) and dx >= 0.07 * bh:
+            side_horizontal = True
+            break
+
+    if (pair_horizontal or side_horizontal) and aspect < 2.7:
+        return True
+
+    # A folded thigh can be nearly zero-length after left/right averaging.
+    # Keep this weaker cue only for compact boxes with a normal visible torso.
+    if shoulders is not None:
+        torso_dy = hips[1] - shoulders[1]
+        folded = (
+            torso_dy > 8.0
+            and abs(thigh_dy) < 0.45 * torso_dy
+            and thigh_dx >= 0.04 * bh
+        )
+        if folded and aspect < 1.9:
+            return True
+    return False
+
+
+def standing_drop_point(
+    kpts_xy: np.ndarray,
+    kpts_conf: np.ndarray | None,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    frame_h: int,
+    aspect: float,
+    min_conf: float,
+    drop_ratio: float,
+) -> tuple[tuple[float, float], list[tuple[float, float]]] | None:
+    """Estimate floor under a standing person whose legs are hidden (table / crop)."""
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    y_max = float(frame_h - 1)
+    shoulders = _pair_mid(kpts_xy, kpts_conf, 5, 6, min_conf)
+    hips = _pair_mid(kpts_xy, kpts_conf, _HIP_L, _HIP_R, min_conf)
+    nose = _kpt_visible(kpts_xy, kpts_conf, 0, min_conf)
+    head_y = nose[1] if nose is not None else float(y1)
+    sh_w = _shoulder_width(kpts_xy, kpts_conf, min_conf, bw)
+
+    if hips is not None and shoulders is not None:
+        torso = hips[1] - shoulders[1]
+        src = [hips]
+        if torso > 10.0:
+            foot_x, foot_y = hips[0], hips[1] + torso * drop_ratio
+        else:
+            foot_x, foot_y = hips[0], head_y + sh_w * aspect
+    elif shoulders is not None:
+        src = [shoulders]
+        foot_x, foot_y = shoulders[0], head_y + sh_w * aspect
+    else:
+        return None
+
+    foot_y = max(foot_y, float(y2))
+    cap = min(y_max, float(y2) + 1.80 * bh)
+    foot_y = min(foot_y, cap)
+    foot_x = min(max(foot_x, float(x1)), float(x2))
+    return (foot_x, foot_y), src
+
+
+def lower_body_hidden(
+    kpts_xy: np.ndarray,
+    kpts_conf: np.ndarray | None,
+    y2: float,
+    min_conf: float,
+) -> bool | None:
+    """True if visible length below hip is too short for standing legs.
+
+    None if hips/shoulders missing. Full-body standing: below-hip ≈ 1.5–1.8× torso.
+    Table cut: hip already near box bottom.
+    """
+    hips = _pair_mid(kpts_xy, kpts_conf, _HIP_L, _HIP_R, min_conf)
+    shoulders = _pair_mid(kpts_xy, kpts_conf, 5, 6, min_conf)
+    if hips is None or shoulders is None:
+        return None
+    torso = hips[1] - shoulders[1]
+    if torso < 10.0:
+        return None
+    # Standing legs ≈ 1.6× torso; table cut leaves ≲ one torso below the hip.
+    return (y2 - hips[1]) < 1.20 * torso
+
+
+def ankles_trusted(
+    ankle: tuple[float, float],
+    hips: tuple[float, float] | None,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    frame_h: int,
+    truncated: bool,
+    legs_cut: bool | None,
+) -> bool:
+    """Reject pose ankles glued to a mid-frame box bottom (table-edge fakes)."""
+    bh = max(1.0, y2 - y1)
+    ay = ankle[1]
+    if ay < y1 + 0.55 * bh:
+        return False
+    at_frame_bottom = y2 >= 0.90 * frame_h
+    near_box_bottom = ay >= y2 - 0.12 * bh
+    if legs_cut is True:
+        return False
+    if hips is not None and ay < hips[1] + 0.28 * bh and not at_frame_bottom:
+        return False
+    if truncated and near_box_bottom and not at_frame_bottom:
+        return False
+    return True
+
+
+class PoseTrackHistory:
+    """Complete occluded feet from reliable poses previously seen on each track.
+
+    This follows the safer PETL4SD-style order: current visible joints, temporal
+    body proportions, then bbox fallback. It never invents a standing extension
+    for a track that has not first supplied a trustworthy full-body sample.
+    """
+
+    def __init__(self, sit_confirm: int = 3, max_history_age: int = 40) -> None:
+        self.sit_confirm = max(1, int(sit_confirm))
+        self.max_history_age = max(1, int(max_history_age))
+        self._tracks: dict[int, dict] = {}
+
+    @staticmethod
+    def _ema(old, new, alpha: float = 0.25):
+        if old is None:
+            return new
+        if isinstance(new, tuple):
+            return (
+                (1.0 - alpha) * old[0] + alpha * new[0],
+                (1.0 - alpha) * old[1] + alpha * new[1],
+            )
+        return (1.0 - alpha) * old + alpha * new
+
+    def resolve(
+        self,
+        track_id: int | None,
+        kpts_xy: np.ndarray,
+        kpts_conf: np.ndarray | None,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        frame_h: int,
+        min_conf: float,
+    ) -> tuple[tuple[float, float] | None, str, list[tuple[float, float]]]:
+        if track_id is None:
+            return None, "foot", []
+
+        state = self._tracks.setdefault(
+            int(track_id),
+            {
+                "sit_hits": 0,
+                "full_hits": 0,
+                "history_age": self.max_history_age + 1,
+                "torso": None,
+                "hip_to_foot": None,
+                "shoulder_to_foot": None,
+            },
+        )
+        state["history_age"] += 1
+
+        hips = _pair_mid(kpts_xy, kpts_conf, _HIP_L, _HIP_R, min_conf)
+        shoulders = _pair_mid(kpts_xy, kpts_conf, 5, 6, min_conf)
+        ankle = ankle_ground_point(kpts_xy, kpts_conf, min_conf)
+        bh = max(1.0, y2 - y1)
+        sit_evidence = classify_sitting(
+            kpts_xy, kpts_conf, x1, y1, x2, y2, min_conf
+        )
+        if sit_evidence:
+            state["sit_hits"] = min(self.sit_confirm, state["sit_hits"] + 1)
+        else:
+            state["sit_hits"] = max(0, state["sit_hits"] - 1)
+
+        legs_cut = lower_body_hidden(kpts_xy, kpts_conf, y2, min_conf)
+        torso = None
+        if hips is not None and shoulders is not None:
+            torso = hips[1] - shoulders[1]
+
+        # A training sample must show a plausible full leg inside the person
+        # box. This excludes YOLO pose ankles hallucinated on a table edge.
+        full_body = (
+            not sit_evidence
+            and legs_cut is False
+            and torso is not None
+            and torso > 10.0
+            and hips is not None
+            and shoulders is not None
+            and ankle is not None
+            and ankle[1] <= y2 + 0.05 * bh
+            and ankle[1] - hips[1] >= 1.10 * torso
+        )
+        if full_body:
+            state["full_hits"] += 1
+            state["history_age"] = 0
+            state["torso"] = self._ema(state["torso"], torso)
+            state["hip_to_foot"] = self._ema(
+                state["hip_to_foot"],
+                (ankle[0] - hips[0], ankle[1] - hips[1]),
+            )
+            state["shoulder_to_foot"] = self._ema(
+                state["shoulder_to_foot"],
+                (ankle[0] - shoulders[0], ankle[1] - shoulders[1]),
+            )
+
+        # Bent legs immediately block a standing extension. Wait for a few
+        # consistent observations before showing the green seated reference.
+        if sit_evidence:
+            if state["sit_hits"] >= self.sit_confirm and hips is not None:
+                hx = min(max(hips[0], x1), x2)
+                return (hx, float(y2)), "seat", [hips]
+            return None, "foot", []
+
+        if full_body and ankle is not None:
+            ax = min(max(ankle[0], x1), x2)
+            ay = min(max(ankle[1], y1), float(frame_h - 1))
+            return (ax, ay), "pose", []
+
+        usable_history = (
+            state["full_hits"] >= 2
+            and state["history_age"] <= self.max_history_age
+            and state["torso"] is not None
+        )
+        if legs_cut is True and usable_history:
+            scale = 1.0
+            if torso is not None and torso > 10.0:
+                scale = float(np.clip(torso / state["torso"], 0.75, 1.35))
+            src = None
+            foot = None
+            if hips is not None and state["hip_to_foot"] is not None:
+                dx, dy = state["hip_to_foot"]
+                src = hips
+                foot = (hips[0] + dx * scale, hips[1] + dy * scale)
+            elif shoulders is not None and state["shoulder_to_foot"] is not None:
+                dx, dy = state["shoulder_to_foot"]
+                src = shoulders
+                foot = (shoulders[0] + dx * scale, shoulders[1] + dy * scale)
+            if foot is not None and src is not None:
+                fx = min(max(foot[0], x1), x2)
+                fy = min(max(foot[1], y2), float(frame_h - 1))
+                return (fx, fy), "stand_drop", [src]
+
+        # Trust a current ankle only when it resembles a complete visible leg.
+        if ankle is not None and legs_cut is False:
+            ax = min(max(ankle[0], x1), x2)
+            ay = min(max(ankle[1], y1), float(frame_h - 1))
+            return (ax, ay), "pose", []
+
+        # No trustworthy history: explicitly decline to extrapolate.
+        return None, "foot", []
+
+
+def pose_ground_from_keypoints(
+    kpts_xy: np.ndarray,
+    kpts_conf: np.ndarray | None,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    frame_h: int,
+    kpt_conf: float,
+    aspect: float,
+    drop_ratio: float,
+) -> tuple[tuple[float, float] | None, str, list[tuple[float, float]]]:
+    """Sit: hip X + box bottom. Stand + hidden legs: drop to floor. Else ankles / box."""
+    hips = _pair_mid(kpts_xy, kpts_conf, _HIP_L, _HIP_R, kpt_conf)
+    sitting = classify_sitting(kpts_xy, kpts_conf, x1, y1, x2, y2, kpt_conf)
+    if sitting:
+        if hips is not None:
+            hx = min(max(hips[0], x1), x2)
+            return (hx, float(y2)), "seat", [hips]
+        return None, "foot", []
+
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    sh_w = _shoulder_width(kpts_xy, kpts_conf, kpt_conf, bw)
+    truncated = (sh_w * aspect) > 1.25 * bh
+    mid_frame = y2 < 0.90 * frame_h
+    legs_cut = lower_body_hidden(kpts_xy, kpts_conf, y2, kpt_conf)
+
+    raw = ankle_ground_point(kpts_xy, kpts_conf, kpt_conf)
+    trusted = raw is not None and ankles_trusted(
+        raw, hips, x1, y1, x2, y2, frame_h, truncated, legs_cut
+    )
+    if trusted and raw is not None:
+        ax = min(max(raw[0], x1), x2)
+        ay = min(max(raw[1], float(y1)), float(y2) + 8.0)
+        return (ax, min(ay, float(frame_h - 1))), "pose", []
+
+    # Table / crop: hip too close to box bottom, or box shorter than standing height.
+    can_drop = legs_cut is True or (truncated and ((bh / bw) >= 1.25 or mid_frame))
+    if not can_drop and mid_frame and raw is not None and not trusted:
+        can_drop = True
+    if can_drop:
+        dropped = standing_drop_point(
+            kpts_xy,
+            kpts_conf,
+            x1,
+            y1,
+            x2,
+            y2,
+            frame_h,
+            aspect,
+            kpt_conf,
+            drop_ratio,
+        )
+        if dropped is not None:
+            return dropped[0], "stand_drop", dropped[1]
+
+    if hips is not None:
+        hx = min(max(hips[0], x1), x2)
+        return (hx, float(y2)), "foot", []
+    return None, "foot", []
+
+
+def draw_pose_skeleton(
+    vis: np.ndarray,
+    kpts_xy: np.ndarray,
+    kpts_conf: np.ndarray | None,
+    min_conf: float = 0.25,
+    line_scale: float = 1.0,
+) -> None:
+    """Draw COCO-17 skeleton on the preview frame (YOLO pose style)."""
+    thick = max(2, int(round(3 * line_scale)))
+    radius = max(3, int(round(4 * line_scale)))
+    for edge_i, (a, b) in enumerate(_COCO_SKELETON):
+        pa = _kpt_visible(kpts_xy, kpts_conf, a, min_conf)
+        pb = _kpt_visible(kpts_xy, kpts_conf, b, min_conf)
+        if pa is None or pb is None:
+            continue
+        color = _LIMB_COLORS[edge_i] if edge_i < len(_LIMB_COLORS) else (200, 200, 200)
+        cv2.line(
+            vis,
+            (int(round(pa[0])), int(round(pa[1]))),
+            (int(round(pb[0])), int(round(pb[1]))),
+            color,
+            thick,
+            cv2.LINE_AA,
+        )
+    for idx in range(min(len(kpts_xy), len(_KPT_COLORS))):
+        pt = _kpt_visible(kpts_xy, kpts_conf, idx, min_conf)
+        if pt is None:
+            continue
+        cv2.circle(
+            vis,
+            (int(round(pt[0])), int(round(pt[1]))),
+            radius,
+            _KPT_COLORS[idx],
+            -1,
+            cv2.LINE_AA,
+        )
+
+
 def is_plausible_person_box(
     x1: float,
     y1: float,
@@ -272,6 +869,10 @@ def extract_foot_detections(
     min_h_ratio: float = 0.06,
     min_aspect: float = 0.8,
     min_bottom_ratio: float = 0.12,
+    kpt_conf: float = 0.35,
+    stand_drop_ratio: float = 1.7,
+    pose_result=None,
+    pose_history: PoseTrackHistory | None = None,
 ) -> list[dict]:
     """Return person ground-ref points from YOLO detect/track boxes."""
     out: list[dict] = []
@@ -279,6 +880,12 @@ def extract_foot_detections(
         return out
     boxes = result.boxes
     has_ids = boxes.id is not None
+    kpts = getattr(result, "keypoints", None)
+    pose_kpts = (
+        match_pose_keypoints(boxes.xyxy, pose_result)
+        if mode == "pose" and pose_result is not None
+        else None
+    )
     for i in range(len(boxes)):
         if int(boxes.cls[i].item()) != 0:
             continue
@@ -305,19 +912,72 @@ def extract_foot_detections(
             min_bottom_ratio=min_bottom_ratio,
         ):
             continue
-        ref_x, ref_y, used = estimate_ref_point(
-            x1, y1, x2, y2, frame_h, mode, aspect, truncate_ratio
-        )
-        out.append(
-            {
-                "xyxy": (int(x1), int(y1), int(x2), int(y2)),
-                "foot": (ref_x, ref_y),
-                "head": (0.5 * (x1 + x2), float(y1)),
-                "mode": used,
-                "conf": conf,
-                "track_id": track_id,
-            }
-        )
+        pose_pt = None
+        used = "foot"
+        ref_src: list[tuple[float, float]] = []
+        kpts_xy_store = None
+        kpts_conf_store = None
+        if mode == "pose":
+            if pose_kpts is not None and pose_kpts[i] is not None:
+                xy, confs = pose_kpts[i]
+                kpts_xy_store = xy
+                kpts_conf_store = confs
+            elif kpts is not None and kpts.xy is not None and i < len(kpts.xy):
+                xy = kpts.xy[i].detach().cpu().numpy()
+                confs = None
+                if kpts.conf is not None:
+                    confs = kpts.conf[i].detach().cpu().numpy()
+                kpts_xy_store = xy
+                kpts_conf_store = confs
+            if kpts_xy_store is not None:
+                if pose_history is not None:
+                    got, used, ref_src = pose_history.resolve(
+                        track_id,
+                        kpts_xy_store,
+                        kpts_conf_store,
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        frame_h,
+                        kpt_conf,
+                    )
+                else:
+                    got, used, ref_src = pose_ground_from_keypoints(
+                        kpts_xy_store,
+                        kpts_conf_store,
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        frame_h,
+                        kpt_conf,
+                        aspect,
+                        stand_drop_ratio,
+                    )
+                if got is not None:
+                    pose_pt = got
+        if pose_pt is not None:
+            ref_x, ref_y = pose_pt[0], pose_pt[1]
+        else:
+            ref_x, ref_y, used = estimate_ref_point(
+                x1, y1, x2, y2, frame_h, "auto" if mode == "pose" else mode, aspect, truncate_ratio
+            )
+        item = {
+            "xyxy": (int(x1), int(y1), int(x2), int(y2)),
+            "foot": (ref_x, ref_y),
+            "head": (0.5 * (x1 + x2), float(y1)),
+            "mode": used,
+            "conf": conf,
+            "track_id": track_id,
+        }
+        if ref_src:
+            item["ref_src"] = ref_src
+        if kpts_xy_store is not None:
+            item["kpts_xy"] = kpts_xy_store
+            if kpts_conf_store is not None:
+                item["kpts_conf"] = kpts_conf_store
+        out.append(item)
     return out
 
 
@@ -340,6 +1000,14 @@ def scale_detections_for_preview(detections: list[dict], scale: float) -> list[d
         if "head" in det:
             hx, hy = det["head"]
             d["head"] = (hx * scale, hy * scale)
+        if "kpts_xy" in det:
+            k = np.asarray(det["kpts_xy"], dtype=np.float64)
+            k = k.copy()
+            k[:, 0] *= scale
+            k[:, 1] *= scale
+            d["kpts_xy"] = k
+        if "ref_src" in det:
+            d["ref_src"] = [(kx * scale, ky * scale) for kx, ky in det["ref_src"]]
         out.append(d)
     return out
 
@@ -403,8 +1071,129 @@ class DetectionCoaster:
             if "head" in d:
                 hx, hy = d["head"]
                 d["head"] = (hx + vcx * steps, hy + vcy * steps)
+            if "kpts_xy" in d:
+                k = np.asarray(d["kpts_xy"], dtype=np.float64)
+                k = k.copy()
+                k[:, 0] += vcx * steps
+                k[:, 1] += vcy * steps
+                d["kpts_xy"] = k
+            if "ref_src" in d:
+                d["ref_src"] = [
+                    (kx + vcx * steps, ky + vcy * steps) for kx, ky in d["ref_src"]
+                ]
             out.append(d)
         return out
+
+
+def draw_ref_guide(
+    vis: np.ndarray,
+    fx: float,
+    fy: float,
+    used: str,
+    ref_src: list[tuple[float, float]] | None,
+    fs: float,
+) -> None:
+    """Color-coded foot dot; dashed guide from hip/shoulder when estimated."""
+    style = REF_VIS.get(used, REF_VIS["foot"])
+    color = style["color"]
+    r = max(6, int(5 * fs))
+    cv2.circle(vis, (int(fx), int(fy)), r, color, -1, cv2.LINE_AA)
+    cv2.circle(vis, (int(fx), int(fy)), r + 2, (255, 255, 255), 1, cv2.LINE_AA)
+    if used in ("seat", "stand_drop") and ref_src:
+        for kx, ky in ref_src:
+            _draw_dashed_line(
+                vis,
+                (int(kx), int(ky)),
+                (int(fx), int(fy)),
+                color,
+                max(2, int(round(2 * fs))),
+            )
+
+
+def draw_ref_legend(vis: np.ndarray, fs: float) -> None:
+    """One-line color key at the top of the camera view."""
+    keys = ("seat", "pose", "stand_drop", "foot", "head_drop")
+    font_px = max(16, int(18 * fs))
+    pad_x = max(10, int(10 * fs))
+    pad_y = max(6, int(6 * fs))
+    gap = max(16, int(16 * fs))
+    r = max(6, int(5 * fs))
+    font = _legend_font(font_px)
+    labels = [REF_VIS[k]["tag"] for k in keys]
+    widths: list[int] = []
+    for label in labels:
+        bbox = font.getbbox(label)
+        widths.append(max(1, bbox[2] - bbox[0]))
+    bar_w = pad_x
+    for tw in widths:
+        bar_w += r * 2 + 8 + tw + gap
+    bar_w = bar_w - gap + pad_x
+    bar_h = r * 2 + pad_y * 2
+    bar_w = min(bar_w, vis.shape[1] - 16)
+    bar = Image.new("RGBA", (bar_w, bar_h), (0, 0, 0, 140))
+    draw = ImageDraw.Draw(bar)
+    x = pad_x
+    cy = bar_h // 2
+    for key, label, tw in zip(keys, labels, widths):
+        color = REF_VIS[key]["color"]
+        rgb = (color[2], color[1], color[0], 255)
+        draw.ellipse((x, cy - r, x + r * 2, cy + r), fill=rgb, outline=(255, 255, 255, 220))
+        draw.text((x + r * 2 + 6, cy - font_px // 2 - 1), label, font=font, fill=(255, 255, 255, 255))
+        x += r * 2 + 8 + tw + gap
+    rgb = np.asarray(bar.convert("RGB"))
+    overlay = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    alpha = np.asarray(bar.split()[-1], dtype=np.float32) / 255.0
+    y1, x1 = 8, 8
+    y2, x2 = y1 + bar_h, x1 + bar_w
+    roi = vis[y1:y2, x1:x2]
+    if roi.shape[0] != bar_h or roi.shape[1] != bar_w:
+        return
+    a = alpha[..., None]
+    vis[y1:y2, x1:x2] = (overlay.astype(np.float32) * a + roi.astype(np.float32) * (1.0 - a)).astype(
+        np.uint8
+    )
+
+
+def _legend_font(size_px: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in (
+        Path(r"C:\Windows\Fonts\msyh.ttc"),
+        Path(r"C:\Windows\Fonts\msyhbd.ttc"),
+        Path(r"C:\Windows\Fonts\mingliu.ttc"),
+    ):
+        if path.exists():
+            try:
+                return ImageFont.truetype(str(path), size_px)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def _draw_dashed_line(
+    vis: np.ndarray,
+    p0: tuple[int, int],
+    p1: tuple[int, int],
+    color: tuple[int, int, int],
+    thick: int,
+    dash: int = 8,
+    gap: int = 6,
+) -> None:
+    x0, y0 = p0
+    x1, y1 = p1
+    dist = float(np.hypot(x1 - x0, y1 - y0))
+    if dist < 1.0:
+        return
+    dx = (x1 - x0) / dist
+    dy = (y1 - y0) / dist
+    step = dash + gap
+    n = int(dist / step) + 1
+    for i in range(n):
+        t0 = i * step
+        t1 = min(dist, t0 + dash)
+        if t0 >= dist:
+            break
+        a = (int(x0 + dx * t0), int(y0 + dy * t0))
+        b = (int(x0 + dx * t1), int(y0 + dy * t1))
+        cv2.line(vis, a, b, color, thick, cv2.LINE_AA)
 
 
 def put_label(
@@ -444,12 +1233,24 @@ def annotate_and_cells(
     valid_xmin: float,
     out_margin: float = 45.0,
     show_cell_label: bool = False,
+    show_pose_skeleton: bool = False,
+    kpt_draw_conf: float = 0.25,
 ) -> tuple[np.ndarray, set[tuple[int, int]], list[str]]:
     vis = frame  # caller passes a writable preview-sized copy
     cells: set[tuple[int, int]] = set()
     logs: list[str] = []
     fs = max(0.75, frame.shape[1] / 1280.0)
     thick = max(2, int(round(2 * fs)))
+
+    for det in detections:
+        if show_pose_skeleton and "kpts_xy" in det:
+            draw_pose_skeleton(
+                vis,
+                np.asarray(det["kpts_xy"]),
+                np.asarray(det["kpts_conf"]) if det.get("kpts_conf") is not None else None,
+                min_conf=kpt_draw_conf,
+                line_scale=fs,
+            )
 
     for det in detections:
         x1, y1, x2, y2 = det["xyxy"]
@@ -466,8 +1267,14 @@ def annotate_and_cells(
             cell = world_to_cell(wx, wy, margin_cm=out_margin)
 
         cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, max(2, thick))
-        ref_color = (0, 0, 255) if used == "foot" else (255, 0, 255)
-        cv2.circle(vis, (int(fx), int(fy)), max(6, int(5 * fs)), ref_color, -1)
+        draw_ref_guide(
+            vis,
+            fx,
+            fy,
+            used,
+            det.get("ref_src"),
+            fs,
+        )
 
         label_y = y1 - 12
         if label_y < int(40 * fs):
@@ -509,6 +1316,7 @@ def annotate_and_cells(
                 + (" [low]" if low_conf else "")
             )
 
+    draw_ref_legend(vis, fs)
     return vis, cells, logs
 
 
@@ -646,6 +1454,10 @@ def detect_and_locate(
     tracker: str | None = None,
     imgsz: int = 640,
     out_margin: float = 45.0,
+    kpt_conf: float = 0.35,
+    stand_drop_ratio: float = 1.7,
+    pose_model: YOLO | None = None,
+    pose_history: PoseTrackHistory | None = None,
 ) -> tuple[list[dict], float, float]:
     t0 = time.perf_counter()
     infer_kw = dict(conf=conf, classes=[0], imgsz=imgsz, verbose=False)
@@ -658,6 +1470,9 @@ def detect_and_locate(
         )
     else:
         results = model.predict(frame, **infer_kw)
+    pose_result = None
+    if ref == "pose" and pose_model is not None:
+        pose_result = pose_model.predict(frame, **infer_kw)[0]
     detect_ms = (time.perf_counter() - t0) * 1000.0
 
     t1 = time.perf_counter()
@@ -672,6 +1487,10 @@ def detect_and_locate(
         min_h_ratio=min_h_ratio,
         min_aspect=min_aspect,
         min_bottom_ratio=min_bottom_ratio,
+        kpt_conf=kpt_conf,
+        stand_drop_ratio=stand_drop_ratio,
+        pose_result=pose_result,
+        pose_history=pose_history,
     )
     for det in dets:
         fx, fy = det["foot"]
@@ -709,6 +1528,7 @@ class AsyncTrackWorker:
 
     def __init__(self, model: YOLO, h_mat: np.ndarray, det_kw: dict, id_mapper) -> None:
         self._model = model
+        self._pose_model = det_kw.get("pose_model")
         self._h_mat = h_mat
         self._det_kw = det_kw
         self._id_mapper = id_mapper
@@ -771,6 +1591,8 @@ def render_detection_view(
     grid_occupancy: dict[tuple[int, int], list[int]] | None = None,
     show_floor_grid: bool = False,
     floor_overlay: FloorOverlayCache | None = None,
+    show_pose_skeleton: bool = False,
+    kpt_draw_conf: float = 0.25,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     # Draw on preview-sized frame (much cheaper than annotating 2880px then resize).
     view = resize_for_preview(frame, max_width)
@@ -792,6 +1614,8 @@ def render_detection_view(
         valid_xmin,
         out_margin=out_margin,
         show_cell_label=False,
+        show_pose_skeleton=show_pose_skeleton,
+        kpt_draw_conf=kpt_draw_conf,
     )
     display_cells = grid_cells if grid_cells is not None else cells
     if grid_occupancy is not None:
@@ -830,7 +1654,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="YOLO ground-ref point -> light floor grid")
     p.add_argument("--source", default=str(DEFAULT_IMAGE))
     p.add_argument("--calib", default=str(DEFAULT_CALIB))
-    p.add_argument("--model", default="yolo26s.pt", help="Ultralytics detect weights (e.g. yolo26n/s/m.pt)")
+    p.add_argument("--model", default="yolo26s.pt", help="Ultralytics weights (yolo26s.pt or yolo26s-pose.pt)")
     p.add_argument(
         "--conf",
         type=float,
@@ -840,10 +1664,41 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--ref",
-        choices=["auto", "foot", "head_drop"],
+        choices=["auto", "foot", "head_drop", "pose"],
         default="auto",
-        help="auto: foot by default; head_drop only if truncated AND cut by frame bottom "
-        "(sitting uses bbox bottom — avoids aisle foot drift)",
+        help="auto: bbox bottom, head_drop if cut by frame bottom; "
+        "pose: sit = hip X + box bottom; stand + hidden legs = drop to floor; "
+        "visible ankles otherwise",
+    )
+    p.add_argument(
+        "--kpt-conf",
+        type=float,
+        default=0.35,
+        help="min keypoint confidence to use an ankle when --ref pose",
+    )
+    p.add_argument(
+        "--show-pose-skeleton",
+        action="store_true",
+        default=None,
+        help="draw COCO-17 skeleton on camera view (default on when --ref pose)",
+    )
+    p.add_argument(
+        "--no-pose-skeleton",
+        dest="show_pose_skeleton",
+        action="store_false",
+        help="hide pose skeleton overlay",
+    )
+    p.add_argument(
+        "--kpt-draw-conf",
+        type=float,
+        default=0.25,
+        help="min keypoint confidence to draw skeleton joints/lines",
+    )
+    p.add_argument(
+        "--stand-drop-ratio",
+        type=float,
+        default=1.7,
+        help="single-frame/no-track fallback only; tracked video uses learned per-ID proportions",
     )
     p.add_argument(
         "--aspect",
@@ -1109,6 +1964,22 @@ def main() -> None:
         raise SystemExit(f"找不到校正檔：{calib_path}")
     h_mat = load_homography(calib_path)
     model = YOLO(args.model)
+    pose_model: YOLO | None = None
+    pose_history: PoseTrackHistory | None = None
+    if args.ref == "pose":
+        pose_path = pose_model_name(args.model)
+        if Path(pose_path).name.lower() == Path(args.model).name.lower():
+            raise SystemExit(
+                "--ref pose 需要 detect 權重（例如 yolo26s.pt）；"
+                f"腳踝會另跑 {pose_path}，請勿把 --model 設成 pose 版。"
+            )
+        pose_model = YOLO(pose_path)
+        if args.track:
+            pose_history = PoseTrackHistory(sit_confirm=3, max_history_age=40)
+        print(
+            f"--ref pose：偵測／追蹤仍用 {args.model}，姿態另跑 {pose_path}"
+            "（遮擋補腳只使用同一追蹤 ID 先前可靠的完整站姿）"
+        )
 
     source = args.source
     is_image = Path(source).exists() and Path(source).suffix.lower() in {
@@ -1118,6 +1989,9 @@ def main() -> None:
         ".bmp",
         ".webp",
     }
+
+    if args.show_pose_skeleton is None:
+        args.show_pose_skeleton = args.ref == "pose"
 
     if args.stride < 1:
         raise SystemExit("--stride 必須 >= 1")
@@ -1144,8 +2018,20 @@ def main() -> None:
             "靜態相機 gmc=none；BoT-SORT 不開短 ReID（長期 ID 交給 OSNet 圖庫＋座位）。"
         )
         print("畫面與 YOLO 分執行緒，預覽不因推論卡住。")
-    print(f"參考點模式：{args.ref}（紅=foot，紫=head_drop）。按 q 結束，s 存圖。")
-    print(f"預覽寬度固定 max-width={args.max_width}（影片與格子視窗皆鎖定畫面像素大小）")
+    print(
+        f"參考點模式：{args.ref}（畫面上方圖例：綠=座位，青=腳踝，橘=站立補腳，紅=框底，紫=推估）。按 q 結束，s 存圖。"
+    )
+    if args.ref == "pose":
+        print(
+            "pose：坐姿需連續 3 次證據；站立補腳需同一 raw track 先累積至少 2 次"
+            "完整站姿，之後才用該人的歷史身體比例補腳；無歷史一律退回框底。"
+        )
+        if args.show_pose_skeleton:
+            print(
+                f"骨架：COCO-17 關節＋連線（kpt-draw-conf≥{args.kpt_draw_conf:g}）；"
+                "--no-pose-skeleton 可關閉。"
+            )
+    print(f"預覽寬度固定 max-width={args.max_width}（視窗可拖曳縮放）")
     if args.stride > 1:
         print(
             f"跳幀：相機每幀都畫（框會預測跟上）；"
@@ -1174,6 +2060,10 @@ def main() -> None:
         tracker=str(tracker_path),
         imgsz=args.imgsz,
         out_margin=args.out_margin,
+        kpt_conf=args.kpt_conf,
+        stand_drop_ratio=args.stand_drop_ratio,
+        pose_model=pose_model,
+        pose_history=pose_history,
     )
     grid_cache = GridCache()
     floor_overlay = FloorOverlayCache()
@@ -1195,6 +2085,8 @@ def main() -> None:
             out_margin=args.out_margin,
             show_floor_grid=args.show_floor_grid,
             floor_overlay=floor_overlay,
+            show_pose_skeleton=args.show_pose_skeleton,
+            kpt_draw_conf=args.kpt_draw_conf,
         )
         if not args.quiet:
             for line in logs:
@@ -1308,7 +2200,7 @@ def main() -> None:
                 f"命中沿用／連續追蹤換裝則存新照／都沒中才發新 ID；"
                 f"appear≥{args.appear_thresh:.2f}，{proto_s}；"
                 f"新 ID 需連續 {args.min_hits} 次仍對不上圖庫才發號；"
-                "場上人數沒增加時優先接回空缺座位、不發新號。"
+                "桌後漏檢接回空缺、不發新號；走出畫面後外貌明顯不像才發新號。"
             )
         print(
             f"進出畫面：室內漏檢沿用約 {max(coast_frames, int(id_mapper.fps * 1.2))} 幀；"
@@ -1445,6 +2337,8 @@ def main() -> None:
                 out_margin=args.out_margin,
                 show_floor_grid=args.show_floor_grid,
                 floor_overlay=floor_overlay,
+                show_pose_skeleton=args.show_pose_skeleton,
+                kpt_draw_conf=args.kpt_draw_conf,
             )
             if det_idx == frame_idx and not args.quiet:
                 for line in logs:

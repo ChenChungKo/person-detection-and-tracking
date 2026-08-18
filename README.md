@@ -112,8 +112,36 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 
 ## 偵測 + 定位（腳點 → 格子）
 
-以 bbox 底邊中點為腳點；桌旁被擋時可用 `--ref auto` / `--ref head_drop`。  
-測試影片：`test/test.mp4`。按 `q` 結束，`s` 存圖。
+預設 `--ref auto`：bbox 底邊中點；被裁切時改頭頂下推。按 `q` 結束，`s` 存圖。視窗可拖曳縮放。
+
+`--ref pose`（`feature/pose-foot-ref`，測試中）：偵測仍用 `yolo26s.pt`，骨架另跑 `yolo26s-pose.pt`。
+
+| 情況 | 腳點 |
+|------|------|
+| 坐（連續坐姿證據） | 髖 X + 框底 |
+| 站、腳踝可見 | 腳踝 |
+| 站、下半身被擋 | 同一 ID 須先有完整站姿歷史才補腳；否則框底 |
+
+圖例：綠＝座位、青＝腳踝、橘＝歷史補腳、紅＝框底、紫＝推估。雙模型較慢，`--stride 5` 在 CPU 上仍可接近即時。
+
+```powershell
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain
+# 審查裁圖：加 --review-dump（寫入 test/reid_review/<時間>/）
+```
+
+### 骨架顯示（`--ref pose`）
+
+`--ref pose` 時會在人框上畫 COCO-17 關節與連線，方便對照坐／站／腳踝用到哪些點。骨架只是顯示，腳點仍依上表。
+
+```powershell
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain
+# 不要骨架：
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --no-pose-skeleton
+```
+
+- `--ref pose` 預設開啟骨架；加 `--no-pose-skeleton` 可關
+- `--kpt-draw-conf`：關節信心低於此值不畫（預設 0.25）
+- 腳點顏色看畫面上方圖例，與骨架顏色分開
 
 **定位對照（報告用）**
 
@@ -150,12 +178,12 @@ python pick_floor_marks.py --source test/test4.mp4 --frame 1
 
 **Stable-ID**
 - 即時圖庫 `test/reid_gallery/`：每次重跑清空；比對用記憶體向量，不讀回 jpg
-- 審查庫 `test/reid_review/`：**預設關閉**。加 `--review-dump` 才存裁圖（不參與即時比對；背景 Pillow 寫檔，避免拖慢 YOLO）
-- 圖庫只接受乾淨、低重疊的人框，避免相鄰人物污染 `first.jpg` 與外貌原型
-- 每幀以衣著色彩修正明顯換人；陌生 raw track 先短暫隔離，確認後建立新 ID
-- 同一人雙框（IoU／包覆）合併，留較舊號
-- 室內漏檢沿用約 1.2 秒；框貼畫面邊緣立刻清除（人已離開）
-- 新 ID 須連續對不上圖庫（`--min-hits` 預設 16）才發號；開頭約 **3.8–4 秒** 才會出現第一個框（`--stride 5`、約 20 fps 時：16 次偵測 × 5 幀 ÷ 20 ≈ 4 秒。`test4.mp4` 實測約第 76 幀／3.8 秒）
+- 審查庫 `test/reid_review/`：預設關；`--review-dump` 才寫裁圖（不參與即時比對）
+- 圖庫只收乾淨、低重疊框
+- 顏色改號：很不像自己、又很像另一個空缺 ID 才換
+- 回場：OSNet 仍像同一人（含換外套）→ 沿用原號。從畫面邊緣離開後，外貌低且衣服差很多 → 不因「只剩一個空號」收回，`--min-hits` 確認後發新號。桌後漏檢仍接回、不發新號
+- 陌生軌先隔離再發號；雙框合併留舊號；室內漏檢約 1.2 秒；貼邊立刻清除
+- `--min-hits` 預設 16（`--stride 5`、約 20 fps → 約 4 秒才出現第一個新號）
 
 **問題與作法**
 
@@ -164,8 +192,10 @@ python pick_floor_marks.py --source test/test4.mp4 --frame 1
 | 同一支本機影片、不同時間跑，ID 結果不同 | 以前為了跟時間軸會丟幀，電腦忙時丟得多。現在固定只處理第 `1, 1+stride, …` 幀；`--realtime` 只限播放速度，不丟追蹤幀 |
 | 預覽卡、CPU 忙時追蹤更不穩 | 追蹤幀全留；本機預覽約每 3 幀才畫一次，不改 BoT-SORT 輸入。OSNet 全身稽核改約每秒一次 |
 | `first.jpg` 混進隔壁人，之後一直配錯 | 圖庫只收乾淨、低重疊框；衣著顏色明顯不同的兩框不再合併成同一人 |
-| 藍衣／綠衣被短追蹤接錯，一秒後才改回來 | 每幀用上半身 HSV 對初次登錄顏色；明顯不像自己、又很像另一個空缺 ID 就當場改回 |
-| 新人出現在舊人前面，直接繼承舊 ID | 不像任何已知 ID 的 raw track 先隔離數幀，確認後發新號並寫圖庫，回來可配回同一號 |
+| 藍衣／綠衣被短追蹤接錯 | 上半身 HSV 對初次登錄；不像自己又像另一個空缺 ID 就改回 |
+| 畫面外穿外套再進來仍是 ID1 | 預期。OSNet 仍像同一人就沿用；不是衣服變了就發新號 |
+| 只有 ID1 時換另一個人進來 | 從畫面邊緣離開後才允許發新號；外貌低且衣服差很多才不收回 ID1。桌後漏檢仍接回 |
+| 新人出現在舊人前面，直接繼承舊 ID | 不像任何已知 ID 的軌先隔離，確認後發新號 |
 | 剛發新 ID 就崩潰（`KeyError`） | 交換檢查只比對已登錄完成的身份 |
 | 開 `--review-dump` 時追蹤變慢或不穩 | 審查圖改背景 Pillow 寫檔，不參與即時 Re-ID |
 | 影片開頭好幾秒都沒框人 | 不是漏檢，是在等新 ID 確認。預設 `--min-hits 16`、`--stride 5`、約 20 fps → 約 4 秒才發第一個號。已登錄的人再出現不必再等這段；若要更快可把 `--min-hits` 降小，但門邊碎框較容易開新號 |
@@ -232,13 +262,13 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 - 這裡的「N 次」以**偵測次數**計算（跟 `--stride` 搭配時，只算真正跑 YOLO 的那幀，不受跳幀影響其穩定邏輯）
 - `export_demo_video.py` 也支援同名的 `--stride` / `--cell-hold`
 
-## 目前建議設定（2026-08-17）
+## 目前建議設定（2026-08-18）
 
 | 項目 | 設定 |
 |------|------|
 | Homography | **v2**（`calibration/homography.json`） |
 | 定位對照 | 地上四點 A/B/C/O，見 `calibration/floor_marks.json`；`--no-floor-grid` 可關 |
-| 偵測 | `yolo26s.pt`、`--ref auto`、`--conf 0.45`、`--cell-hold 2` |
+| 偵測 | `yolo26s.pt`、`--ref auto`（腳點）；`--ref pose` 見上方；`--conf 0.45`、`--cell-hold 2` |
 | 短追蹤 | BoT-SORT（`trackers/botsort.yaml`；GMC off、短 ReID off） |
 | 長期 ID | Stable-ID + `--reid-model osnet_ain`；`--min-hits 16`；`--appear-thresh 0.34` |
 | 效能 | `--stride 5`（約每秒 4 次）；本機影片同步、固定取樣以確保可重現；RTSP 維持背景執行緒與最新幀模式 |
@@ -252,46 +282,36 @@ python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet -
 
 ## Demo 影片（左：偵測，右：格子）
 
-**目前主 demo（Stable-ID + OSNet-AIN + 地板四點 A/B/C/O）**，使用 `test/test4.mp4` 與實際 `detect_grid.py` 流程錄製。
-
-一般測試指令：
+**目前主 demo（`--ref pose` + Stable-ID + OSNet-AIN + A/B/C/O）**，`test/test4.mp4`，`--min-hits 16`。
 
 ```powershell
-python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
-```
-
-錄製同一套結果（不開預覽視窗）：
-
-```powershell
-python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --save-video test/demo_stable_id_osnet_ain.mp4 --no-show --no-realtime
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --min-hits 16
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --min-hits 16 --save-video test/demo_stable_id_osnet_ain.mp4 --no-show --no-realtime
 ```
 
 | 版本 | 影片 | WebP |
 |------|------|------|
-| **Stable-ID + OSNet-AIN / test4**（目前） | `test/demo_stable_id_osnet_ain.mp4` | `test/demo_stable_id_osnet_ain.webp` |
+| **pose + Stable-ID / test4**（目前） | `test/demo_stable_id_osnet_ain.mp4` | `test/demo_stable_id_osnet_ain.webp` |
 | Homography **v2**（舊，僅定位） | `test/demo_v2_chessboard.mp4` | `test/demo_v2_chessboard.webp` |
 | Homography **v1** | `test/demo_v1_manual.mp4` | `test/demo_v1_manual.webp` |
 
 <p align="center">
-  <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：Stable-ID + OSNet-AIN，左偵測右格子"/>
+  <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：--ref pose + Stable-ID，左偵測右格子"/>
 </p>
 
-## 狀態（2026-08-17）
+## 狀態（2026-08-18）
 
 **已完成**
-- YOLO26 官方 `model.track` + BoT-SORT 短追蹤；長期 ID 仍由 Stable-ID + OSNet-AIN  
-- 重疊雙框合併、門邊碎框較難開新號、室內漏檢短沿用／貼邊立刻清  
-- 即時圖庫與審查庫分開：審查圖不進 Re-ID；審查預設關，避免寫檔拖慢追蹤  
-- 本機影片固定追蹤幀，重跑結果不再受即時丟幀與電腦負載改變  
-- 陌生人物不再直接冒用既有 ID；短暫確認後建立可供回場比對的新 ID  
-- RTSP 保留背景 YOLO、最新幀與 TCP 降延遲；格子支援防抖與跳幀  
-- 報告用地板對照：相機／格子同一組 A/B/C/O（遠右角被桌子擋住，暫不標）  
+- YOLO26 `model.track` + BoT-SORT；長期 ID：Stable-ID + OSNet-AIN
+- `--ref pose`：坐＝髖＋框底；站＋被擋＝同一 ID 的站姿歷史補腳，否則框底
+- 回場：換裝仍像同一人則沿用；從畫面邊緣離開且外貌／衣服明顯不像才發新號
+- 重疊雙框合併、門邊碎框較難開新號、室內漏檢短沿用／貼邊立刻清
+- 本機影片固定追蹤幀；RTSP 最新幀 + TCP；格子防抖／跳幀；A/B/C/O 地板對照
 
 **尚未解決**
-- 多人遮擋／漏檢仍可能閃號（坐著、趴著、被擋時 `conf=0.45` 較易漏）  
-- 近鏡頭大框易吃到另一人 → 圖庫可能拒寫或外貌混淆  
-- `test3.mp4` 的人數多、停留短且交叉頻繁；目前 `--min-hits 16` 與陌生人隔離較保守，可能延遲或隱藏新 ID，尚待加入依框品質調整的自適應發號  
-- 換裝、跨鏡頭、畸變校正接入管線  
+- 多人遮擋／漏檢仍可能閃號；近鏡頭大框易吃到另一人
+- `test3.mp4` 交叉頻繁，`--min-hits 16` 偏保守
+- 體型／衣服都很像的換人，OSNet 仍可能配回舊號；跨鏡頭、畸變校正未接入 
 
 ## 文件
 
