@@ -114,7 +114,7 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 
 預設 `--ref auto`：bbox 底邊中點；被裁切時改頭頂下推。按 `q` 結束，`s` 存圖。視窗可拖曳縮放。
 
-`--ref pose`（`feature/pose-foot-ref`，測試中）：偵測仍用 `yolo26s.pt`，骨架另跑 `yolo26s-pose.pt`。
+`--ref pose`（`feature/pose-foot-ref`，測試中）：偵測仍用 `yolo26s.pt`，骨架另跑 `yolo26s-pose.pt`。畫面預設畫 COCO-17 關節與連線（只是顯示；腳點仍依下表）。`--no-pose-skeleton` 可關；`--kpt-draw-conf` 控制關節要多明顯才畫（預設 0.25）。
 
 | 情況 | 腳點 |
 |------|------|
