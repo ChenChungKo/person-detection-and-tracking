@@ -188,6 +188,7 @@ class StableIdMapper:
         self._gallery_first_wh: dict[int, tuple[int, int]] = {}
         self._gallery_first_feat: dict[int, np.ndarray] = {}
         self._gallery_first_color: dict[int, np.ndarray] = {}
+        self._sid_exit_border: dict[int, bool] = {}
         self._sid_born_frame: dict[int, int] = {}
         self._unbind_votes: dict[int, tuple[str, int]] = {}
         self._unknown_raw_pending: dict[int, tuple[int, int]] = {}
@@ -372,6 +373,7 @@ class StableIdMapper:
         frame_idx: int,
         used_sids: set[int],
         feat: np.ndarray | None = None,
+        color_feat: np.ndarray | None = None,
     ) -> int | None:
         """Recover ID after brief track loss (pillar occludes partial bbox)."""
         if world is None:
@@ -389,11 +391,8 @@ class StableIdMapper:
             limit = max(self._reach_limit_cm(gap), 350.0)
             if dist > limit:
                 continue
-            if feat is not None:
-                sim = self._best_proto_sim(feat, meta)
-                # Only reject if clearly another person after >1.5s.
-                if sim < 0.10 and gap > int(self.fps * 1.5):
-                    continue
+            if self._appearance_forbids_reuse(sid, feat, color_feat):
+                continue
             cand = (gap, dist, sid)
             if best is None or cand < best:
                 best = cand
@@ -405,11 +404,12 @@ class StableIdMapper:
         frame_idx: int,
         used_sids: set[int],
         feat: np.ndarray | None = None,
+        color_feat: np.ndarray | None = None,
     ) -> int | None:
         """Reuse a recently-seen free ID by desk location.
 
-        Appearance is a tie-break. Does not assume how many people are on screen:
-        a free ID at another desk is not reused just because this frame has one box.
+        Appearance is a veto, not just a tie-break: a vacant slot is not
+        reclaimed when the crop is clearly a different person.
         """
         recover_frames = max(int(self.sticky_frames), int(self.fps * 8))
         best: tuple[float, float, int] | None = None  # dist, -sim, sid
@@ -426,28 +426,68 @@ class StableIdMapper:
             limit = max(self._reach_limit_cm(gap), 250.0)
             if world is not None and dist > limit:
                 continue
+            if self._appearance_forbids_reuse(sid, feat, color_feat):
+                continue
             sim = self._best_proto_sim(feat, meta) if feat is not None else 0.0
             cand = (dist, -sim, sid)
             if best is None or cand < best:
                 best = cand
         return None if best is None else best[2]
 
-    def _recent_alive_count(self, frame_idx: int) -> int:
+    def _appearance_forbids_reuse(
+        self,
+        sid: int,
+        feat: np.ndarray | None,
+        color_feat: np.ndarray | None = None,
+    ) -> bool:
+        """True when this crop is clearly not that vacant ID."""
+        meta = self._stable.get(sid)
+        if meta is None or feat is None:
+            return False
+        sim = self._best_proto_sim(feat, meta)
+        if sim < self.appear_thresh * 0.55:
+            return True
+        enrolled = self._gallery_first_color.get(sid)
+        if (
+            enrolled is not None
+            and color_feat is not None
+            and sim < self.appear_thresh
+            and self._appear_sim(color_feat, enrolled) < 0.40
+        ):
+            return True
+        return False
+
+    def _det_color_feat(
+        self, frame: np.ndarray | None, det: dict
+    ) -> np.ndarray | None:
+        if frame is None:
+            return None
+        xyxy = det.get("xyxy")
+        if xyxy is None:
+            return None
+        return self._color_feat_from_crop(self._crop_person(frame, xyxy))
+
+    def _recent_occluded_count(self, frame_idx: int) -> int:
+        """Recent IDs last seen inside the room (not walking out the edge)."""
         window = max(int(self.sticky_frames), int(self.fps * 8))
-        return sum(
-            1
-            for meta in self._stable.values()
-            if 0 <= frame_idx - int(meta["frame"]) <= window
-        )
+        n = 0
+        for sid, meta in self._stable.items():
+            gap = frame_idx - int(meta["frame"])
+            if gap < 0 or gap > window:
+                continue
+            if self._sid_exit_border.get(sid):
+                continue
+            n += 1
+        return n
 
     def _should_refuse_mint(self, frame_idx: int, n_dets: int) -> bool:
-        """If we already have enough recent IDs for this many boxes, do not mint.
+        """Block a new ID while an interior person is only briefly missing.
 
-        A new person (more boxes than recent IDs) may still mint. Extra boxes of
-        the same body are collapsed by overlap, not by assuming a head-count.
+        A real leave (last box on the image edge) does not count, so a
+        different person walking in after ID1 left can still mint ID2.
         """
-        n_alive = self._recent_alive_count(frame_idx)
-        return n_alive > 0 and n_alive >= n_dets
+        n_occ = self._recent_occluded_count(frame_idx)
+        return n_occ > 0 and n_occ >= n_dets
 
     @staticmethod
     def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -1362,6 +1402,7 @@ class StableIdMapper:
         self._gallery_first_wh.pop(lose_sid, None)
         self._gallery_first_feat.pop(lose_sid, None)
         self._gallery_first_color.pop(lose_sid, None)
+        self._sid_exit_border.pop(lose_sid, None)
         for raw, sid in list(self._raw_to_stable.items()):
             if sid == lose_sid:
                 self._raw_to_stable[raw] = win_sid
@@ -1531,6 +1572,9 @@ class StableIdMapper:
             )
             return feats[i]
 
+        def color_at(i: int) -> np.ndarray | None:
+            return self._det_color_feat(frame, work[i])
+
         assigned: dict[int, int] = {}
         used_sids: set[int] = set()
         from_raw: set[int] = set()  # continuous ByteTrack → may learn new looks
@@ -1596,7 +1640,11 @@ class StableIdMapper:
             if i in assigned or i in pending_unknown:
                 continue
             sid = self._short_gap_recover(
-                work[i].get("world"), frame_idx, used_sids, feat_at(i)
+                work[i].get("world"),
+                frame_idx,
+                used_sids,
+                feat_at(i, force=True),
+                color_feat=color_at(i),
             )
             if sid is None:
                 continue
@@ -1698,7 +1746,11 @@ class StableIdMapper:
                     sid = cand_sid
                 else:
                     occ_sid = self._short_gap_recover(
-                        d.get("world"), frame_idx, used_sids, probe
+                        d.get("world"),
+                        frame_idx,
+                        used_sids,
+                        probe,
+                        color_feat=color_at(i),
                     )
                     if occ_sid is not None:
                         sid = occ_sid
@@ -1719,6 +1771,7 @@ class StableIdMapper:
                                 frame_idx,
                                 used_sids,
                                 probe,
+                                color_feat=color_at(i),
                             )
                             if reuse_sid is not None:
                                 sid = reuse_sid
@@ -1738,7 +1791,11 @@ class StableIdMapper:
                                 )
                                 if final_sid is None:
                                     final_sid = self._short_gap_recover(
-                                        d.get("world"), frame_idx, used_sids, probe
+                                        d.get("world"),
+                                        frame_idx,
+                                        used_sids,
+                                        probe,
+                                        color_feat=color_at(i),
                                     )
                                 if final_sid is None:
                                     final_sid = self._merge_duplicate(
@@ -1755,6 +1812,7 @@ class StableIdMapper:
                                         frame_idx,
                                         used_sids,
                                         probe,
+                                        color_feat=color_at(i),
                                     )
                                 if final_sid is not None:
                                     sid = final_sid
@@ -1797,6 +1855,7 @@ class StableIdMapper:
                         frame_idx,
                         used_sids,
                         probe,
+                        color_feat=color_at(i),
                     )
                 if alt is None:
                     if self._should_refuse_mint(frame_idx, len(work)):
@@ -1876,6 +1935,7 @@ class StableIdMapper:
                     frame_idx,
                     used_sids,
                     cur_feat,
+                    color_feat=color_at(i),
                 )
                 if alt is None:
                     if self._should_refuse_mint(frame_idx, len(work)):
@@ -1914,6 +1974,7 @@ class StableIdMapper:
             prev["wx"] = float(wx)
             prev["wy"] = float(wy)
             self._stable[sid] = prev
+            self._sid_exit_border[sid] = self._box_at_border(d, frame)
             used_sids.add(sid)
             assigned_world[sid] = (float(wx), float(wy))
             conf = d.get("conf")

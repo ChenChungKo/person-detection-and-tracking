@@ -431,12 +431,15 @@ def draw_grid(
 
 
 def show_grid_window(win: str, grid_bgr: np.ndarray) -> bool:
-    """Show grid at 1:1 pixel size to avoid OpenCV upscale blur."""
+    """Show the occupancy grid; window can be resized after it opens."""
     return show_fixed_window(win, grid_bgr)
 
 
 def show_fixed_window(win: str, image_bgr: np.ndarray) -> bool:
-    """Show image with window size locked to the image pixel size.
+    """Show image in a resizable window.
+
+    The first frame sets the window to the image pixel size; later frames keep
+    whatever size you drag it to.
 
     Returns False if the window was closed (so callers can exit cleanly).
     """
@@ -447,9 +450,8 @@ def show_fixed_window(win: str, image_bgr: np.ndarray) -> bool:
     try:
         if win not in ready:
             cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win, w, h)
             ready.add(win)
-        # Keep size fixed every frame (matches preview pixels; ignores manual drag)
-        cv2.resizeWindow(win, w, h)
         cv2.imshow(win, image_bgr)
         # Closed via title-bar X → property becomes negative.
         if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
