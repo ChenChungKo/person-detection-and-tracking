@@ -175,10 +175,78 @@ def load_homography(path: Path) -> np.ndarray:
     return np.array(payload["homography"], dtype=np.float64)
 
 
+class WorldCompensator:
+    """Affine correction fitted from measured world errors."""
+
+    def __init__(self, affine_2x3: np.ndarray, source: Path, num_points: int) -> None:
+        self._affine = affine_2x3.astype(np.float64)
+        self.source = source
+        self.num_points = int(num_points)
+
+    @classmethod
+    def from_report(cls, path: Path) -> "WorldCompensator | None":
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("samples") or []
+        src: list[list[float]] = []
+        dst: list[list[float]] = []
+        for row in rows:
+            pred = row.get("pred_world_xy")
+            truth = row.get("truth_world_xy")
+            if pred is None or truth is None:
+                continue
+            if len(pred) != 2 or len(truth) != 2:
+                continue
+            src.append([float(pred[0]), float(pred[1])])
+            dst.append([float(truth[0]), float(truth[1])])
+        if len(src) < 3:
+            return None
+        src_arr = np.array(src, dtype=np.float64)
+        dst_arr = np.array(dst, dtype=np.float64)
+        design: list[list[float]] = []
+        target: list[float] = []
+        for (x, y), (tx, ty) in zip(src_arr, dst_arr):
+            design.append([x, y, 1.0, 0.0, 0.0, 0.0])
+            target.append(tx)
+            design.append([0.0, 0.0, 0.0, x, y, 1.0])
+            target.append(ty)
+        params, *_ = np.linalg.lstsq(
+            np.array(design, dtype=np.float64),
+            np.array(target, dtype=np.float64),
+            rcond=None,
+        )
+        affine = np.array(
+            [
+                [params[0], params[1], params[2]],
+                [params[3], params[4], params[5]],
+            ],
+            dtype=np.float64,
+        )
+        return cls(affine, path, len(src))
+
+    def apply(self, wx: float, wy: float) -> tuple[float, float]:
+        vec = np.array([wx, wy, 1.0], dtype=np.float64)
+        out = self._affine @ vec
+        return float(out[0]), float(out[1])
+
+
 def image_to_world(h_mat: np.ndarray, x: float, y: float) -> tuple[float, float]:
     pts = np.array([[[x, y]]], dtype=np.float64)
     world = cv2.perspectiveTransform(pts, h_mat)[0, 0]
     return float(world[0]), float(world[1])
+
+
+def image_to_world_corrected(
+    h_mat: np.ndarray,
+    x: float,
+    y: float,
+    compensator: WorldCompensator | None = None,
+) -> tuple[float, float]:
+    wx, wy = image_to_world(h_mat, x, y)
+    if compensator is None:
+        return wx, wy
+    return compensator.apply(wx, wy)
 
 
 def world_to_image(h_inv: np.ndarray, x: float, y: float) -> tuple[float, float]:
@@ -1230,6 +1298,7 @@ def annotate_and_cells(
     frame: np.ndarray,
     detections: list[dict],
     h_mat: np.ndarray,
+    compensator: WorldCompensator | None,
     valid_xmin: float,
     out_margin: float = 45.0,
     show_cell_label: bool = False,
@@ -1263,7 +1332,7 @@ def annotate_and_cells(
             wx, wy = det["world"]
             cell = det["cell"]
         else:
-            wx, wy = image_to_world(h_mat, fx, fy)
+            wx, wy = image_to_world_corrected(h_mat, fx, fy, compensator)
             cell = world_to_cell(wx, wy, margin_cm=out_margin)
 
         cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, max(2, thick))
@@ -1443,6 +1512,7 @@ def detect_and_locate(
     frame: np.ndarray,
     model: YOLO,
     h_mat: np.ndarray,
+    compensator: WorldCompensator | None,
     conf: float,
     ref: str,
     aspect: float,
@@ -1494,7 +1564,7 @@ def detect_and_locate(
     )
     for det in dets:
         fx, fy = det["foot"]
-        wx, wy = image_to_world(h_mat, fx, fy)
+        wx, wy = image_to_world_corrected(h_mat, fx, fy, compensator)
         det["world"] = (wx, wy)
         det["cell"] = world_to_cell(wx, wy, margin_cm=out_margin)
     # Drop floating FPs: box sits mid-frame but Homography shoots far outside.
@@ -1581,6 +1651,7 @@ def render_detection_view(
     frame: np.ndarray,
     dets: list[dict],
     h_mat: np.ndarray,
+    compensator: WorldCompensator | None,
     valid_xmin: float,
     timing: tuple[float, float] | None = None,
     cached: bool = False,
@@ -1611,6 +1682,7 @@ def render_detection_view(
         view,
         draw_dets,
         h_mat,
+        compensator,
         valid_xmin,
         out_margin=out_margin,
         show_cell_label=False,
@@ -1654,6 +1726,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="YOLO ground-ref point -> light floor grid")
     p.add_argument("--source", default=str(DEFAULT_IMAGE))
     p.add_argument("--calib", default=str(DEFAULT_CALIB))
+    p.add_argument(
+        "--error-comp",
+        default="",
+        help="optional homography_error_report.json; fit a world-space affine correction from measured points",
+    )
     p.add_argument("--model", default="yolo26s.pt", help="Ultralytics weights (yolo26s.pt or yolo26s-pose.pt)")
     p.add_argument(
         "--conf",
@@ -1963,6 +2040,14 @@ def main() -> None:
     if not calib_path.exists():
         raise SystemExit(f"找不到校正檔：{calib_path}")
     h_mat = load_homography(calib_path)
+    compensator: WorldCompensator | None = None
+    if args.error_comp:
+        comp_path = Path(args.error_comp)
+        compensator = WorldCompensator.from_report(comp_path)
+        if compensator is None:
+            print(f"警告：無法從誤差報告建立補償：{comp_path}")
+        else:
+            print(f"世界座標補償：{compensator.source}（{compensator.num_points} 點 affine）")
     model = YOLO(args.model)
     pose_model: YOLO | None = None
     pose_history: PoseTrackHistory | None = None
@@ -2049,6 +2134,7 @@ def main() -> None:
         print("計時：顯示於格子上方（detect=辨識，locate=定位）。")
 
     det_kw = dict(
+        compensator=compensator,
         conf=args.conf,
         ref=args.ref,
         aspect=args.aspect,
@@ -2077,6 +2163,7 @@ def main() -> None:
             frame,
             dets,
             h_mat,
+            compensator,
             args.valid_xmin,
             timing=timing,
             cached=False,
@@ -2328,6 +2415,7 @@ def main() -> None:
                 frame,
                 draw_dets,
                 h_mat,
+                compensator,
                 args.valid_xmin,
                 timing=last_timing,
                 cached=det_idx != frame_idx,

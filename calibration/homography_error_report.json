@@ -1,0 +1,88 @@
+{
+  "created_at": "2026-08-18T08:17:20.929905+00:00",
+  "calib": "C:\\5Gjump\\calibration\\homography.json",
+  "image": "calibration\\chessboard_floor\\capture.jpg",
+  "num_points": 4,
+  "mean_error_cm": 31.91802167329864,
+  "max_error_cm": 90.06045202529728,
+  "median_error_cm": 18.045672252528817,
+  "samples": [
+    {
+      "image_xy": [
+        1269.0,
+        1588.5
+      ],
+      "pred_world_xy": [
+        214.75570365176995,
+        448.49946627046626
+      ],
+      "truth_world_xy": [
+        215.0,
+        450.0
+      ],
+      "error_cm": 1.5202901628396408,
+      "error_xy_cm": [
+        -0.2442963482300513,
+        -1.5005337295337426
+      ]
+    },
+    {
+      "image_xy": [
+        1188.0,
+        931.5
+      ],
+      "pred_world_xy": [
+        210.04909230440026,
+        117.97753171504388
+      ],
+      "truth_world_xy": [
+        215.0,
+        135.0
+      ],
+      "error_cm": 17.727828787606384,
+      "error_xy_cm": [
+        -4.950907695599739,
+        -17.02246828495612
+      ]
+    },
+    {
+      "image_xy": [
+        1003.5,
+        1053.0
+      ],
+      "pred_world_xy": [
+        160.2365168729367,
+        209.44708687310865
+      ],
+      "truth_world_xy": [
+        170.0,
+        225.0
+      ],
+      "error_cm": 18.36351571745125,
+      "error_xy_cm": [
+        -9.763483127063296,
+        -15.552913126891355
+      ]
+    },
+    {
+      "image_xy": [
+        2736.0,
+        1435.5
+      ],
+      "pred_world_xy": [
+        452.79473636403037,
+        425.9300827594741
+      ],
+      "truth_world_xy": [
+        395.0,
+        495.0
+      ],
+      "error_cm": 90.06045202529728,
+      "error_xy_cm": [
+        57.79473636403037,
+        -69.06991724052591
+      ]
+    }
+  ],
+  "note": "Real localization error = |H(click) - tape-measured world|. This is NOT the chessboard fit residual (mean_reproj_error_cm)."
+}

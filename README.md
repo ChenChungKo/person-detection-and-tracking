@@ -54,11 +54,45 @@ python test_rtsp.py
 | **v1** | `calibration/homography_v1_manual.json` | 手動點選磁磚角（`calibrate_boundary.py`） | 點擊量測誤差約 **8.9 cm** |
 | **v2** | `calibration/homography_v2_chessboard.json` | 地板大棋盤格自動角點（`calibrate_chessboard_floor.py`） | 目前預設；點擊量測誤差約 **3.8 cm** |
 
-預設腳本讀 `calibration/homography.json`（目前＝**v2**）。要比對 v1 時加上 `--calib`：
+預設腳本讀 `calibration/homography.json`（目前＝**v2，原始畫面標定，未套鏡頭去畸變**）。要比對 v1 時加上 `--calib`：
 
 ```powershell
 python detect_grid.py --source test/test.mp4 --calib calibration/homography_v1_manual.json
 python detect_grid.py --source test/test.mp4 --calib calibration/homography_v2_chessboard.json
+```
+
+### 四點實測補償（目前有在用）
+
+Homography 在棋盤附近準，離板子遠（尤其近端右側）會有系統性偏差。  
+用 `verify_homography.py --measure-error` 在地上量 4 個已知點，存成 `calibration/homography_error_report.json`，再在定位時加 `--error-comp`：先 Homography，再做世界座標 affine 修正。
+
+在這 4 個點上，平均誤差約 **32 cm → 6 cm**（最大約 **90 cm → 10 cm**）。格子一格約 45 cm，中間走道常常還是同一格，右側／外推區比較看得出差。
+
+```powershell
+python verify_homography.py --measure-error --image calibration/chessboard_floor/capture.jpg
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
+```
+
+`verify_homography.py` 也可加同一份 `--error-comp`，點擊時看的是補償後座標。
+
+### 鏡頭內參（有檔、日常不用）
+
+A4 手持棋盤估過 Tapo C230 內參，檔案還在，**`detect_grid.py` 目前不讀、也不去畸變**：
+
+| 檔案 | 用途 |
+|------|------|
+| `calibration/camera_intrinsics.json` | `cv2.calibrateCamera` 內參＋畸變係數 |
+| `calibration/lens_frames/`、`calibration/lens_chessboard/` | 內參拍攝／棋盤圖 |
+| `calibrate_lens.py`、`make_lens_chessboard.py` | 拍幀、估內參 |
+
+試過：先 `undistort` 再重估地板 Homography。棋盤附近略好，但廣角邊緣矯正過強（A 點會算出畫面外，右側外推變差），所以**沒有接進即時定位**。
+
+重跑地板 Homography 時，`calibrate_chessboard_floor.py calibrate` 若偵測到 `camera_intrinsics.json` 會**自動套用去畸變**。目前不要這樣做；若一定要重標，請明確不要帶內參（或先把該檔移走）。
+
+```powershell
+# 僅在要重做內參實驗時
+python calibrate_lens.py capture --source "rtsp://帳號:密碼@攝影機IP:554/stream1"
+python calibrate_lens.py calibrate --preview
 ```
 
 座標系：
@@ -125,7 +159,7 @@ python detect_person.py --source "rtsp://帳號:密碼@攝影機IP:554/stream1" 
 圖例：綠＝座位、青＝腳踝、橘＝歷史補腳、紅＝框底、紫＝推估。雙模型較慢，`--stride 5` 在 CPU 上仍可接近即時。
 
 ```powershell
-python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
 # 審查裁圖：加 --review-dump（寫入 test/reid_review/<時間>/）
 ```
 
@@ -201,18 +235,18 @@ python pick_floor_marks.py --source test/test4.mp4 --frame 1
 | 影片開頭好幾秒都沒框人 | 不是漏檢，是在等新 ID 確認。預設 `--min-hits 16`、`--stride 5`、約 20 fps → 約 4 秒才發第一個號。已登錄的人再出現不必再等這段；若要更快可把 `--min-hits` 降小，但門邊碎框較容易開新號 |
 
 ```powershell
-# 建議（test4，含 A/B/C/O）
-python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
+# 建議（test4，含 A/B/C/O + 四點補償）
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
 
 # 單人影片
-python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
+python detect_grid.py --source test/test.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
 
 # 要存錯圖審查時再加
 python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain --review-dump
 
 # RTSP
 $env:OPENCV_FFMPEG_CAPTURE_OPTIONS = "rtsp_transport;tcp"
-python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
+python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
 
 # 只要人框、不要 ID
 python detect_person.py --source test/test.mp4 --no-map

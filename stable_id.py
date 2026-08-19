@@ -502,7 +502,7 @@ class StableIdMapper:
         if encoder is not None:
             return encoder.embed_xyxy(frame, xyxy)
         # Same full YOLO person box as OSNet / gallery (not a torso-only crop).
-        parsed = self._box_wh(frame, xyxy)
+        parsed = StableIdMapper._box_wh(frame, xyxy)
         if parsed is None:
             return None
         x1, y1, x2, y2, _bw, _bh = parsed

@@ -1,0 +1,15 @@
+---
+description: Always use the project .venv Python, never system py -3.14
+alwaysApply: true
+---
+
+# Python 環境
+
+這個專案只有一個虛擬環境：`C:\5Gjump\.venv`（Python 3.14.6，含 ultralytics / torch / torchreid / OSNet）。
+
+執行任何 Python 指令時：
+
+- 用 `C:\5Gjump\.venv\Scripts\python.exe` 或先 `.\.venv\Scripts\Activate.ps1`
+- **不要**用 `py -3.14`、`py`、或 `C:\Users\User\AppData\Local\Programs\Python\Python314\python.exe`（那是建立 venv 的系統 Python，套件不完整，`--reid-model osnet_ain` 會落到 HSV）
+
+安裝套件也要對這個 venv：`.\.venv\Scripts\python.exe -m pip install ...`
