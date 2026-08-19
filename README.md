@@ -319,24 +319,24 @@ python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref pose 
 
 ## Demo 影片（左：偵測，右：格子）
 
-**目前主 demo（`--ref pose` + Stable-ID + OSNet-AIN + A/B/C/O）**，`test/test4.mp4`，`--min-hits 16`。
+**目前主 demo（`--ref pose` + Stable-ID + OSNet-AIN + A/B/C/O + 四點補償）**，`test/test4.mp4`，`--min-hits 16`。
 
 ```powershell
-python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --min-hits 16
-python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --min-hits 16 --save-video test/demo_stable_id_osnet_ain.mp4 --no-show --no-realtime
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json --save-video test/demo_stable_id_osnet_ain.mp4 --no-show --no-realtime
 ```
 
 | 版本 | 影片 | WebP |
 |------|------|------|
-| **pose + Stable-ID / test4**（目前） | `test/demo_stable_id_osnet_ain.mp4` | `test/demo_stable_id_osnet_ain.webp` |
+| **pose + 四點補償 / test4**（目前） | `test/demo_stable_id_osnet_ain.mp4` | `test/demo_stable_id_osnet_ain.webp` |
 | Homography **v2**（舊，僅定位） | `test/demo_v2_chessboard.mp4` | `test/demo_v2_chessboard.webp` |
 | Homography **v1** | `test/demo_v1_manual.mp4` | `test/demo_v1_manual.webp` |
 
 <p align="center">
-  <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：--ref pose + Stable-ID，左偵測右格子"/>
+  <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：--ref pose + 四點補償，左偵測右格子"/>
 </p>
 
-## 狀態（2026-08-18）
+## 狀態（2026-08-19）
 
 **已完成**
 - YOLO26 `model.track` + BoT-SORT；長期 ID：Stable-ID + OSNet-AIN
@@ -344,11 +344,13 @@ python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet -
 - 回場：換裝仍像同一人則沿用；從畫面邊緣離開且外貌／衣服明顯不像才發新號
 - 重疊雙框合併、門邊碎框較難開新號、室內漏檢短沿用／貼邊立刻清
 - 本機影片固定追蹤幀；RTSP 最新幀 + TCP；格子防抖／跳幀；A/B/C/O 地板對照
+- 四點實測補償（`--error-comp`）；鏡頭內參有檔但日常不去畸變
 
 **尚未解決**
 - 多人遮擋／漏檢仍可能閃號；近鏡頭大框易吃到另一人
 - `test3.mp4` 交叉頻繁，`--min-hits 16` 偏保守
-- 體型／衣服都很像的換人，OSNet 仍可能配回舊號；跨鏡頭、畸變校正未接入 
+- 體型／衣服都很像的換人，OSNet 仍可能配回舊號；廣角邊緣單靠內參去畸變效果不佳
+- 桌後遮擋時腳點仍可能跳格（補償主要修 Homography 系統偏差，不是腳點） 
 
 ## 文件
 
