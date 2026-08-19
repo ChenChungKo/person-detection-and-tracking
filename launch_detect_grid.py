@@ -64,7 +64,7 @@ class Launcher(tk.Tk):
         max_seconds: float = 0,
     ) -> None:
         super().__init__()
-        self.title("detect_grid 啟動")
+        self.title("detect_grid launcher GUI")
         self.minsize(900, 720)
         self._stop_ev = threading.Event()
         self._pause_ev = threading.Event()

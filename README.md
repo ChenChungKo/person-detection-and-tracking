@@ -20,6 +20,18 @@ pip install -r requirements.txt
 
 首次偵測會下載 `yolo26s.pt`（也可改 `yolo26n.pt` / `yolo26m.pt`）。`--ref pose` 會再載入 `yolo26s-pose.pt`。
 
+## detect_grid launcher GUI
+
+圖形啟動頁：選本機影片或 RTSP、用拉桿或輸入框改參數，按 Run 後左格子、右監視器。
+
+```powershell
+python launch_detect_grid.py
+```
+
+操作範例（`test/test4.mp4`）：[`test/demo_gui_launcher.mp4`](test/demo_gui_launcher.mp4)
+
+重錄整個視窗：`python launch_detect_grid.py --auto-run --record test/demo_gui_launcher.mp4`
+
 ## 建議指令
 
 本機 `test4`（pose + OSNet-AIN + 四點補償 + A/B/C/O）：
@@ -196,8 +208,7 @@ python grid_occupancy.py --x 215 --y 360
 python export_demo_video.py
 ```
 
-- `launch_detect_grid.py`：啟動頁。選本機影片或 RTSP、調參數後按 Run；左格子、右監視器。預設 `test/test4.mp4`。
-  錄製整個視窗（test4 範例）：`python launch_detect_grid.py --auto-run --record test/demo_gui_launcher.mp4`
+- `launch_detect_grid.py`：見上方「detect_grid launcher GUI」。
 - `test_rtsp.py`：只測串流（TCP、預覽 ≤1280，仍讀 2880×1620）。無視窗：`--no-preview --frames 60`
 - `detect_person.py --no-map`：只要 YOLO 人框
 - `grid_occupancy.py`：點監視器地板看格子（黃＝佔用）。刻度參考 `test/floor_grid_generated.jpg`
