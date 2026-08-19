@@ -296,20 +296,23 @@ python detect_grid.py --source test/test.mp4 --cell-hold 2
 - 這裡的「N 次」以**偵測次數**計算（跟 `--stride` 搭配時，只算真正跑 YOLO 的那幀，不受跳幀影響其穩定邏輯）
 - `export_demo_video.py` 也支援同名的 `--stride` / `--cell-hold`
 
-## 目前建議設定（2026-08-18）
+## 目前建議設定（2026-08-19）
 
 | 項目 | 設定 |
 |------|------|
-| Homography | **v2**（`calibration/homography.json`） |
+| Homography | **v2**（`calibration/homography.json`，**不去畸變**） |
+| 定位補償 | `--error-comp calibration/homography_error_report.json`（四點實測 affine） |
+| 鏡頭內參 | `camera_intrinsics.json` 有檔；**`detect_grid.py` 不套用** |
 | 定位對照 | 地上四點 A/B/C/O，見 `calibration/floor_marks.json`；`--no-floor-grid` 可關 |
-| 偵測 | `yolo26s.pt`、`--ref auto`（腳點）；`--ref pose` 見上方；`--conf 0.45`、`--cell-hold 2` |
+| 偵測 | `yolo26s.pt`、`--ref pose`、`--conf 0.45`、`--cell-hold 2` |
 | 短追蹤 | BoT-SORT（`trackers/botsort.yaml`；GMC off、短 ReID off） |
 | 長期 ID | Stable-ID + `--reid-model osnet_ain`；`--min-hits 16`；`--appear-thresh 0.34` |
 | 效能 | `--stride 5`（約每秒 4 次）；本機影片同步、固定取樣以確保可重現；RTSP 維持背景執行緒與最新幀模式 |
 | 審查庫 | 預設關；`--review-dump` 寫入 `test/reid_review/<時間>/ID***/` |
 
 ```powershell
-python detect_grid.py --source test/test4.mp4 --ref auto --cell-hold 2 --quiet --reid-model osnet_ain
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
+python detect_grid.py --source "rtsp://帳號:密碼@IP:554/stream1" --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
 ```
 
 舊校正：`--calib calibration/homography_v1_manual.json`；舊桌區灰格：`--valid-xmin 170`。舊短追蹤：`--tracker trackers/bytetrack_stable.yaml`。
