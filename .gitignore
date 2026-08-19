@@ -19,3 +19,6 @@ test/reid_gallery_demo/
 Thumbs.db
 test/reid_gallery/
 test/reid_review/
+dist/
+build/
+*.spec

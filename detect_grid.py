@@ -25,6 +25,7 @@ import os
 import threading
 import time
 import warnings
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -46,13 +47,15 @@ from grid_occupancy import (
     show_grid_window,
     world_to_cell,
 )
+from app_paths import app_root
 from latest_frame import LatestFrameCapture
 from stable_id import StableIdMapper
 
-DEFAULT_IMAGE = Path(__file__).resolve().parent / "test" / "static_frame.jpg"
-DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
-DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "detect_grid_preview.jpg"
-DEFAULT_TRACKER = Path(__file__).resolve().parent / "trackers" / "botsort.yaml"
+_ROOT = app_root()
+DEFAULT_IMAGE = _ROOT / "test" / "static_frame.jpg"
+DEFAULT_CALIB = _ROOT / "calibration" / "homography.json"
+DEFAULT_OUT = _ROOT / "test" / "detect_grid_preview.jpg"
+DEFAULT_TRACKER = _ROOT / "trackers" / "botsort.yaml"
 # COCO pose: 11/12=hip, 13/14=knee, 15/16=ankle
 _HIP_L, _HIP_R = 11, 12
 _KNEE_L, _KNEE_R = 13, 14
@@ -309,12 +312,33 @@ class FloorOverlayCache:
             )
 
 
-def open_capture(source: str) -> cv2.VideoCapture | None:
+def open_capture(source: str, timeout_s: float = 8.0) -> cv2.VideoCapture | None:
     if source.lower().startswith("rtsp://"):
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return cap if cap.isOpened() else None
+        holder: dict[str, cv2.VideoCapture] = {}
+
+        def _open() -> None:
+            cap = cv2.VideoCapture()
+            timeout_ms = int(max(1000.0, timeout_s * 1000.0))
+            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
+            if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout_ms)
+            cap.open(source, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            holder["cap"] = cap
+
+        worker = threading.Thread(target=_open, name="rtsp-open", daemon=True)
+        worker.start()
+        worker.join(timeout_s)
+        if worker.is_alive():
+            print(f"RTSP 連線逾時（{timeout_s:.0f}s），請檢查網址與帳密。")
+            return None
+        cap = holder.get("cap")
+        if cap is None or not cap.isOpened():
+            print("無法開啟 RTSP（常見原因：帳密錯誤 401、網址打錯、攝影機離線）。")
+            return None
+        return cap
     if source.isdigit():
         cap = cv2.VideoCapture(int(source))
         return cap if cap.isOpened() else None
@@ -1725,7 +1749,7 @@ def render_detection_view(
     return vis, grid, logs
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="YOLO ground-ref point -> light floor grid")
     p.add_argument("--source", default=str(DEFAULT_IMAGE))
     p.add_argument("--calib", default=str(DEFAULT_CALIB))
@@ -1986,7 +2010,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--gallery-dir",
-        default=str(Path(__file__).resolve().parent / "test" / "reid_gallery"),
+        default=str(app_root() / "test" / "reid_gallery"),
         help="save per-ID appearance crop images here (cleared each run)",
     )
     p.add_argument(
@@ -1996,7 +2020,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--review-dir",
-        default=str(Path(__file__).resolve().parent / "test" / "reid_review"),
+        default=str(app_root() / "test" / "reid_review"),
         help="per-run review crops for later cleanup (not used for live Re-ID)",
     )
     p.add_argument(
@@ -2034,11 +2058,17 @@ def parse_args() -> argparse.Namespace:
         help="Stable-ID appearance: osnet_ain / osnet / yolo26n-reid.onnx "
         "(BoT-SORT short ReID is set in trackers/botsort.yaml)",
     )
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(
+    argv: list[str] | None = None,
+    *,
+    on_preview: Callable[[np.ndarray, np.ndarray], None] | None = None,
+    stop_event: threading.Event | None = None,
+    pause_event: threading.Event | None = None,
+) -> None:
+    args = parse_args(argv)
     calib_path = Path(args.calib)
     if not calib_path.exists():
         raise SystemExit(f"找不到校正檔：{calib_path}")
@@ -2135,6 +2165,13 @@ def main() -> None:
         if frame is None:
             raise SystemExit(f"無法讀取影像：{source}")
         vis, grid = process_frame(frame)
+        if on_preview is not None:
+            on_preview(vis, grid)
+        if args.no_show:
+            if stop_event is not None:
+                while not stop_event.is_set():
+                    time.sleep(0.05)
+            return
         while True:
             if not show_fixed_window(cam_win, vis) or not show_grid_window(grid_win, grid):
                 break
@@ -2161,14 +2198,20 @@ def main() -> None:
     }
     reader: LatestFrameCapture | None = LatestFrameCapture(cap) if use_latest else None
     if use_latest:
-        for _ in range(50):
+        deadline = time.perf_counter() + 8.0
+        while time.perf_counter() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                reader.release()
+                return
             ok, frame = reader.read()
             if ok and frame is not None:
                 break
             time.sleep(0.05)
         else:
             reader.release()
-            raise SystemExit("RTSP 連線後未收到畫面。")
+            raise SystemExit(
+                "RTSP 沒收到畫面。若出現 401 Unauthorized，請把網址裡的帳號密碼改成攝影機真實帳密。"
+            )
 
     video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     if video_fps <= 1e-3:
@@ -2268,6 +2311,17 @@ def main() -> None:
         t_play0 = time.perf_counter()
         log_fps = video_fps if (is_file_video or use_latest) else 20.0
         while True:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if pause_event is not None and is_file_video and pause_event.is_set():
+                pause_t0 = time.perf_counter()
+                while pause_event.is_set():
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    time.sleep(0.05)
+                t_play0 += time.perf_counter() - pause_t0
+                if stop_event is not None and stop_event.is_set():
+                    break
             if reader is not None:
                 ok, frame = reader.read()
                 if not ok or frame is None:
@@ -2370,6 +2424,8 @@ def main() -> None:
                     if not video_writer.isOpened():
                         raise RuntimeError(f"無法建立影片：{save_path}")
                 video_writer.write(demo_frame)
+            if on_preview is not None:
+                on_preview(vis, grid)
             if not args.no_show:
                 if not show_fixed_window(cam_win, vis) or not show_grid_window(
                     grid_win, grid
@@ -2377,6 +2433,10 @@ def main() -> None:
                     break
 
             if args.no_show:
+                if use_realtime:
+                    ahead = frame_idx / video_fps - (time.perf_counter() - t_play0)
+                    if ahead > 0.005:
+                        time.sleep(ahead)
                 key = -1
             elif use_realtime:
                 # If we are ahead of the timeline, wait a bit.

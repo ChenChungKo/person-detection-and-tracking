@@ -19,9 +19,11 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-DEFAULT_CALIB = Path(__file__).resolve().parent / "calibration" / "homography.json"
-DEFAULT_IMAGE = Path(__file__).resolve().parent / "test" / "static_frame.jpg"
-DEFAULT_OUT = Path(__file__).resolve().parent / "test" / "grid_lit_preview.jpg"
+from app_paths import app_root
+
+DEFAULT_CALIB = app_root() / "calibration" / "homography.json"
+DEFAULT_IMAGE = app_root() / "test" / "static_frame.jpg"
+DEFAULT_OUT = app_root() / "test" / "grid_lit_preview.jpg"
 
 # Windows TTF for crisp labels (OpenCV putText is blurry on many displays)
 _FONT_REGULAR: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None
@@ -91,7 +93,7 @@ MARK_COLORS_RGB: dict[str, tuple[int, int, int]] = {
     "C": (40, 200, 90),
     "O": (255, 230, 0),
 }
-DEFAULT_FLOOR_MARKS_PATH = Path(__file__).resolve().parent / "calibration" / "floor_marks.json"
+DEFAULT_FLOOR_MARKS_PATH = app_root() / "calibration" / "floor_marks.json"
 # A near-left, B far-left, C near-right, O aisle center.
 _DEFAULT_MARK_XY: dict[str, tuple[float, float]] = {
     "A": (170.0, 450.0),
