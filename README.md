@@ -9,7 +9,7 @@
 
 ## 環境
 
-請用專案虛擬環境 `C:\5Gjump\.venv`（VS Code：`Python: Select Interpreter` → `.venv`）。不要用系統的 `py`／`Python314`，否則 OSNet 會落到 HSV。
+請用專案虛擬環境 `C:\5Gjump\.venv`（VS Code：`Python: Select Interpreter` → `.venv`）。
 
 ```powershell
 cd C:\5Gjump
