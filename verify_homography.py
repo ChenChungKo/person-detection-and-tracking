@@ -29,6 +29,74 @@ DEFAULT_FALLBACK_IMAGE = Path(__file__).resolve().parent / "test" / "static_fram
 DEFAULT_ERROR_OUT = Path(__file__).resolve().parent / "calibration" / "homography_error_report.json"
 
 
+class WorldCompensator:
+    """Affine correction fitted from measured world errors."""
+
+    def __init__(self, affine_2x3: np.ndarray, source: Path, num_points: int) -> None:
+        self._affine = affine_2x3.astype(np.float64)
+        self.source = source
+        self.num_points = int(num_points)
+
+    @classmethod
+    def from_report(cls, path: Path) -> "WorldCompensator | None":
+        if not path.exists():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("samples") or []
+        src: list[list[float]] = []
+        dst: list[list[float]] = []
+        for row in rows:
+            pred = row.get("pred_world_xy")
+            truth = row.get("truth_world_xy")
+            if pred is None or truth is None:
+                continue
+            if len(pred) != 2 or len(truth) != 2:
+                continue
+            src.append([float(pred[0]), float(pred[1])])
+            dst.append([float(truth[0]), float(truth[1])])
+        if len(src) < 3:
+            return None
+        design: list[list[float]] = []
+        target: list[float] = []
+        for (x, y), (tx, ty) in zip(src, dst):
+            design.append([x, y, 1.0, 0.0, 0.0, 0.0])
+            target.append(tx)
+            design.append([0.0, 0.0, 0.0, x, y, 1.0])
+            target.append(ty)
+        params, *_ = np.linalg.lstsq(
+            np.array(design, dtype=np.float64),
+            np.array(target, dtype=np.float64),
+            rcond=None,
+        )
+        affine = np.array(
+            [
+                [params[0], params[1], params[2]],
+                [params[3], params[4], params[5]],
+            ],
+            dtype=np.float64,
+        )
+        return cls(affine, path, len(src))
+
+    def apply(self, wx: float, wy: float) -> tuple[float, float]:
+        vec = np.array([wx, wy, 1.0], dtype=np.float64)
+        out = self._affine @ vec
+        return float(out[0]), float(out[1])
+
+
+def image_to_world_corrected(
+    h_mat: np.ndarray,
+    x: float,
+    y: float,
+    compensator: WorldCompensator | None = None,
+) -> tuple[float, float]:
+    pts = np.array([[[x, y]]], dtype=np.float64)
+    world = cv2.perspectiveTransform(pts, h_mat)[0, 0]
+    wx, wy = float(world[0]), float(world[1])
+    if compensator is None:
+        return wx, wy
+    return compensator.apply(wx, wy)
+
+
 def imread_unicode(path: Path) -> np.ndarray | None:
     data = np.fromfile(str(path), dtype=np.uint8)
     if data.size == 0:
@@ -49,6 +117,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Verify Homography by clicking / measure real error")
     p.add_argument("--calib", default=str(DEFAULT_CALIB), help="homography.json path")
     p.add_argument("--image", default="", help="Override image path (optional)")
+    p.add_argument(
+        "--error-comp",
+        default="",
+        help="optional homography_error_report.json; apply world-space affine correction after Homography",
+    )
     p.add_argument("--max-width", type=int, default=1280)
     p.add_argument(
         "--measure-error",
@@ -89,6 +162,13 @@ def main() -> None:
     payload = json.loads(calib_path.read_text(encoding="utf-8"))
     h_mat = np.array(payload["homography"], dtype=np.float64)
     roi = payload.get("roi") or {}
+    compensator: WorldCompensator | None = None
+    if args.error_comp:
+        compensator = WorldCompensator.from_report(Path(args.error_comp))
+        if compensator is None:
+            print(f"警告：無法從誤差報告建立補償：{args.error_comp}")
+        else:
+            print(f"世界座標補償：{compensator.source}（{compensator.num_points} 點 affine）")
 
     if args.image:
         image_path = Path(args.image)
@@ -125,9 +205,7 @@ def main() -> None:
             return
         full_x = x / scale
         full_y = y / scale
-        pts = np.array([[[full_x, full_y]]], dtype=np.float64)
-        world = cv2.perspectiveTransform(pts, h_mat)[0, 0]
-        wx, wy = float(world[0]), float(world[1])
+        wx, wy = image_to_world_corrected(h_mat, full_x, full_y, compensator)
         note = ""
         if roi:
             xmin = float(roi.get("x_min_cm", 0))

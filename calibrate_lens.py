@@ -23,11 +23,14 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+from latest_frame import LatestFrameCapture
 
 if sys.stdout.encoding is None or sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -99,37 +102,50 @@ def cmd_capture(args: argparse.Namespace) -> None:
     cap = open_capture(args.source)
     if cap is None:
         raise SystemExit(f"無法開啟來源：{args.source}")
+    reader = LatestFrameCapture(cap)
 
     win = "Lens Calibration Capture"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     print(f"棋盤格內角點：{pattern_size[0]}x{pattern_size[1]}，方格 {args.square_cm:g}cm")
     print("把板子拿到鏡頭前，填滿畫面一部分，多角度、多距離、多位置（含四個角落）。")
-    print("偵測到棋盤格時畫面會出現彩色角點；按 s 存檔，q 結束。")
+    print("偵測到棋盤格（綠色 FOUND）才能按 s 存檔；沒偵測到不會存。q 結束。")
     print(f"目前已有 {n} 張，建議累積到 15~20 張再進入 calibrate 階段。")
+    print("預覽只處理最新幀，棋盤偵測隔幾幀跑一次，避免 RTSP 卡住。")
+
+    last_found = False
+    last_corners: np.ndarray | None = None
+    frame_i = 0
+    detect_every = max(1, int(args.detect_every))
 
     try:
         while True:
-            ok, frame = cap.read()
+            ok, frame = reader.read()
             if not ok or frame is None:
-                print("讀取失敗或結束。")
-                break
+                if not reader.is_alive():
+                    print("讀取失敗或結束。")
+                    break
+                time.sleep(0.01)
+                continue
 
+            frame_i += 1
             view, scale = resize_for_preview(frame, args.max_width)
-            gray_preview = cv2.cvtColor(view, cv2.COLOR_BGR2GRAY)
-            found_preview, corners_preview = cv2.findChessboardCorners(
-                gray_preview, pattern_size, flags=FIND_FLAGS
-            )
+            if frame_i % detect_every == 0:
+                gray_preview = cv2.cvtColor(view, cv2.COLOR_BGR2GRAY)
+                last_found, corners_preview = cv2.findChessboardCorners(
+                    gray_preview, pattern_size, flags=FIND_FLAGS
+                )
+                last_corners = corners_preview if last_found else None
             canvas = view.copy()
-            if found_preview:
-                cv2.drawChessboardCorners(canvas, pattern_size, corners_preview, found_preview)
-            status = "FOUND (press s to save)" if found_preview else "not found"
+            if last_found and last_corners is not None:
+                cv2.drawChessboardCorners(canvas, pattern_size, last_corners, True)
+            status = "FOUND (press s to save)" if last_found else "not found (cannot save)"
             cv2.putText(
                 canvas,
                 f"{status}  saved={n}",
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
-                (0, 255, 0) if found_preview else (0, 0, 255),
+                (0, 255, 0) if last_found else (0, 0, 255),
                 2,
                 cv2.LINE_AA,
             )
@@ -137,10 +153,13 @@ def cmd_capture(args: argparse.Namespace) -> None:
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord("s"):
+                if not last_found:
+                    print("  未偵測到棋盤格，無法存檔。等到畫面變綠色 FOUND 再按 s。")
+                    continue
                 gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 corners_full = find_corners(gray_full, pattern_size)
                 if corners_full is None:
-                    print("  存檔失敗：這一幀在全解析度下偵測不到棋盤格，調整角度/距離再試。")
+                    print("  預覽有偵測到，但全解析度失敗，請再對準後重試。")
                     continue
                 n += 1
                 path = out_dir / f"frame_{n:03d}.jpg"
@@ -149,7 +168,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
             elif key in (ord("q"), 27):
                 break
     finally:
-        cap.release()
+        reader.release()
         cv2.destroyAllWindows()
 
     print(f"共 {n} 張，存放於 {out_dir}")
@@ -163,7 +182,7 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
     if len(paths) < 5:
         raise SystemExit(f"照片太少（{len(paths)} 張），建議至少 10~15 張：{frames_dir}")
 
-    objp = np.zeros((pattern_size[0] * pattern_size[1], 3), dtype=np.float64)
+    objp = np.zeros((pattern_size[0] * pattern_size[1], 3), dtype=np.float32)
     objp[:, :2] = np.mgrid[0:pattern_size[0], 0:pattern_size[1]].T.reshape(-1, 2) * args.square_cm
 
     objpoints: list[np.ndarray] = []
@@ -199,7 +218,11 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
     per_view_errors = []
     for i in range(len(objpoints)):
         projected, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], camera_matrix, dist_coeffs)
-        err = cv2.norm(imgpoints[i], projected, cv2.NORM_L2) / len(projected)
+        err = cv2.norm(
+            imgpoints[i].reshape(-1, 2),
+            projected.reshape(-1, 2),
+            cv2.NORM_L2,
+        ) / len(projected)
         per_view_errors.append(float(err))
 
     mean_err_px = float(np.mean(per_view_errors))
@@ -252,6 +275,12 @@ def parse_args() -> argparse.Namespace:
     pc.add_argument("--rows", type=int, default=6, help="inner corners down")
     pc.add_argument("--square-cm", type=float, default=2.5, help="physical square edge length (cm)")
     pc.add_argument("--max-width", type=int, default=1280)
+    pc.add_argument(
+        "--detect-every",
+        type=int,
+        default=3,
+        help="run chessboard detection every N preview frames (default 3)",
+    )
     pc.set_defaults(func=cmd_capture)
 
     pcal = sub.add_parser("calibrate", help="compute intrinsics from saved frames")

@@ -1,0 +1,64 @@
+{
+  "created_at": "2026-08-18T06:35:39.716493+00:00",
+  "image_size_wh": [
+    2880,
+    1620
+  ],
+  "pattern_inner_corners": [
+    7,
+    6
+  ],
+  "square_cm": 2.5,
+  "num_images_used": 21,
+  "num_images_total": 21,
+  "used_files": [
+    "frame_001.jpg",
+    "frame_002.jpg",
+    "frame_003.jpg",
+    "frame_004.jpg",
+    "frame_005.jpg",
+    "frame_006.jpg",
+    "frame_007.jpg",
+    "frame_008.jpg",
+    "frame_009.jpg",
+    "frame_010.jpg",
+    "frame_011.jpg",
+    "frame_012.jpg",
+    "frame_013.jpg",
+    "frame_014.jpg",
+    "frame_015.jpg",
+    "frame_016.jpg",
+    "frame_017.jpg",
+    "frame_018.jpg",
+    "frame_019.jpg",
+    "frame_020.jpg",
+    "frame_021.jpg"
+  ],
+  "rms_reproj_error_px": 1.159604634879884,
+  "mean_per_view_reproj_error_px": 0.07652590960313807,
+  "camera_matrix": [
+    [
+      1950.9726267605038,
+      0.0,
+      1482.2452489903114
+    ],
+    [
+      0.0,
+      1947.558992880904,
+      623.9275196022772
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "dist_coeffs": [
+    -0.4131607019446604,
+    0.19446816630168506,
+    0.010807188425741097,
+    -0.002810811481961842,
+    -0.051568804658325675
+  ],
+  "note": "cv2.calibrateCamera intrinsics; use cv2.undistort(frame, camera_matrix, dist_coeffs) before Homography for best floor-plane accuracy."
+}
