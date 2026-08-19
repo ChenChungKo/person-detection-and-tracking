@@ -45,7 +45,7 @@ RTSP 把 `--source` 換成 `rtsp://帳號:密碼@IP:554/stream1` 即可（自動
   <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：左偵測右格子"/>
 </p>
 
-目前主 demo：`test/demo_stable_id_osnet_ain.mp4`（同上設定、`--min-hits 16`）。舊版僅定位對照仍在倉庫：`test/demo_v2_chessboard.webp`、`test/demo_v1_manual.webp`。
+目前主 demo：`test/demo_stable_id_osnet_ain.mp4`（同上設定、`--min-hits 16`）。啟動頁操作範例（test4）：`test/demo_gui_launcher.mp4`。舊版僅定位對照仍在倉庫：`test/demo_v2_chessboard.webp`、`test/demo_v1_manual.webp`。
 
 ### 目前設定
 
@@ -188,6 +188,7 @@ python verify_homography.py
 ## 其它腳本
 
 ```powershell
+python launch_detect_grid.py
 python test_rtsp.py "rtsp://帳號:密碼@攝影機IP:554/stream1"
 python detect_person.py --source test/test.mp4 --no-map
 python grid_occupancy.py
@@ -195,6 +196,8 @@ python grid_occupancy.py --x 215 --y 360
 python export_demo_video.py
 ```
 
+- `launch_detect_grid.py`：啟動頁。選本機影片或 RTSP、調參數後按 Run；左格子、右監視器。預設 `test/test4.mp4`。
+  錄製整個視窗（test4 範例）：`python launch_detect_grid.py --auto-run --record test/demo_gui_launcher.mp4`
 - `test_rtsp.py`：只測串流（TCP、預覽 ≤1280，仍讀 2880×1620）。無視窗：`--no-preview --frames 60`
 - `detect_person.py --no-map`：只要 YOLO 人框
 - `grid_occupancy.py`：點監視器地板看格子（黃＝佔用）。刻度參考 `test/floor_grid_generated.jpg`

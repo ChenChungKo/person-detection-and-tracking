@@ -7,7 +7,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
+from app_paths import app_root
+
+ROOT = app_root()
 OSNET_DIR = ROOT / "models" / "osnet"
 OSNET_HF_REPO = "kaiyangzhou/osnet"
 

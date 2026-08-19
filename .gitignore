@@ -14,8 +14,12 @@ models/osnet/
 !test/demo_v1_manual.mp4
 !test/demo_v2_chessboard.mp4
 !test/demo_stable_id_osnet_ain.mp4
+!test/demo_gui_launcher.mp4
 test/reid_gallery_demo/
 .DS_Store
 Thumbs.db
 test/reid_gallery/
 test/reid_review/
+dist/
+build/
+*.spec
