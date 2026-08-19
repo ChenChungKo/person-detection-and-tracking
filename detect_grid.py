@@ -18,10 +18,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import threading
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -2046,8 +2049,6 @@ def main() -> None:
         compensator = WorldCompensator.from_report(comp_path)
         if compensator is None:
             print(f"警告：無法從誤差報告建立補償：{comp_path}")
-        else:
-            print(f"世界座標補償：{compensator.source}（{compensator.num_points} 點 affine）")
     model = YOLO(args.model)
     pose_model: YOLO | None = None
     pose_history: PoseTrackHistory | None = None
@@ -2061,10 +2062,6 @@ def main() -> None:
         pose_model = YOLO(pose_path)
         if args.track:
             pose_history = PoseTrackHistory(sit_confirm=3, max_history_age=40)
-        print(
-            f"--ref pose：偵測／追蹤仍用 {args.model}，姿態另跑 {pose_path}"
-            "（遮擋補腳只使用同一追蹤 ID 先前可靠的完整站姿）"
-        )
 
     source = args.source
     is_image = Path(source).exists() and Path(source).suffix.lower() in {
@@ -2087,51 +2084,6 @@ def main() -> None:
 
     cam_win = "Detect + Grid"
     grid_win = "Grid"
-    if args.track:
-        print(
-            f"偵測＋追蹤：YOLO（{args.model}）+ BoT-SORT（{tracker_path.name}）"
-            f" persist=True，conf={args.conf}，imgsz={args.imgsz}，stride={args.stride}"
-        )
-    else:
-        print(
-            f"偵測：YOLO（{args.model}），conf={args.conf}，"
-            f"imgsz={args.imgsz}（每幀獨立，無 ID／追蹤）"
-        )
-    if args.track:
-        print(
-            "官方 track：同一支影片連續幀 model.track(persist=True)；"
-            "靜態相機 gmc=none；BoT-SORT 不開短 ReID（長期 ID 交給 OSNet 圖庫＋座位）。"
-        )
-        print("畫面與 YOLO 分執行緒，預覽不因推論卡住。")
-    print(
-        f"參考點模式：{args.ref}（畫面上方圖例：綠=座位，青=腳踝，橘=站立補腳，紅=框底，紫=推估）。按 q 結束，s 存圖。"
-    )
-    if args.ref == "pose":
-        print(
-            "pose：坐姿需連續 3 次證據；站立補腳需同一 raw track 先累積至少 2 次"
-            "完整站姿，之後才用該人的歷史身體比例補腳；無歷史一律退回框底。"
-        )
-        if args.show_pose_skeleton:
-            print(
-                f"骨架：COCO-17 關節＋連線（kpt-draw-conf≥{args.kpt_draw_conf:g}）；"
-                "--no-pose-skeleton 可關閉。"
-            )
-    print(f"預覽寬度固定 max-width={args.max_width}（視窗可拖曳縮放）")
-    if args.stride > 1:
-        print(
-            f"跳幀：相機每幀都畫（框會預測跟上）；"
-            f"YOLO 與格子佔用每 {args.stride} 幀才更新"
-            f"（再加 cell-hold={args.cell_hold}，格子比較連續、比較不閃）。"
-        )
-    if args.cell_hold > 1:
-        print(f"防抖：格子需連續 {args.cell_hold} 次偵測結果一致才會點亮／熄滅。")
-    if args.out_margin > 0:
-        print(
-            f"OUT 容差：世界座標超出格子 ≤ {args.out_margin:g} cm 時夾回邊緣格"
-            "（--out-margin 0 關閉）。"
-        )
-    if not args.no_timing:
-        print("計時：顯示於格子上方（detect=辨識，locate=定位）。")
 
     det_kw = dict(
         compensator=compensator,
@@ -2153,8 +2105,6 @@ def main() -> None:
     )
     grid_cache = GridCache()
     floor_overlay = FloorOverlayCache()
-    if args.show_floor_grid:
-        print("定位對照：四點 A/B/C/O（可手動選：python pick_floor_marks.py）；人框只標 ID。")
 
     def process_frame(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         dets, detect_ms, locate_ms = detect_and_locate(frame, model, h_mat, **det_kw)
@@ -2211,7 +2161,6 @@ def main() -> None:
     }
     reader: LatestFrameCapture | None = LatestFrameCapture(cap) if use_latest else None
     if use_latest:
-        print("RTSP：啟用最新幀讀取（推論慢時丟棄舊幀，降低延遲感）")
         for _ in range(50):
             ok, frame = reader.read()
             if ok and frame is not None:
@@ -2225,11 +2174,6 @@ def main() -> None:
     if video_fps <= 1e-3:
         video_fps = 20.0
     use_realtime = bool(args.realtime and is_file_video)
-    if use_realtime:
-        print(
-            f"本機影片：以約 {video_fps:.1f} fps 為播放上限；"
-            "推論慢時播放會變慢，但不丟追蹤幀。"
-        )
 
     stabilizer = CellStabilizer(args.cell_hold)
     confirmed_cells: set[tuple[int, int]] = set()
@@ -2241,12 +2185,14 @@ def main() -> None:
             from reid_encoder import PersonReIDEncoder, resolve_reid_model
 
             model_name = resolve_reid_model(args.reid_model)
-            print(f"載入 Re-ID：{model_name} …")
-            reid_encoder = PersonReIDEncoder(model_name)
-            print(
-                f"Re-ID 就緒：{reid_encoder.model_name} "
-                f"[backend={reid_encoder.backend}]（Stable-ID 長期圖庫）。"
-            )
+            buf = io.StringIO()
+            with (
+                contextlib.redirect_stdout(buf),
+                contextlib.redirect_stderr(buf),
+                warnings.catch_warnings(),
+            ):
+                warnings.simplefilter("ignore")
+                reid_encoder = PersonReIDEncoder(model_name)
         except Exception as exc:  # noqa: BLE001
             print(f"Re-ID 載入失敗，改回 HSV：{exc}")
             reid_encoder = None
@@ -2272,67 +2218,47 @@ def main() -> None:
         ),
         review_every=args.review_every,
     )
-    if args.track:
-        if args.single_person:
-            print("ID 穩定層：單人強制接回（demo，非真實辨識）")
-        else:
-            appear_mode = "Re-ID" if reid_encoder is not None else "HSV"
-            proto_s = (
-                "不限外貌原型數"
-                if args.max_prototypes <= 0
-                else f"每人最多 {args.max_prototypes} 種外貌原型"
-            )
-            print(
-                f"ID 穩定層：{appear_mode}｜YOLO框人 → temp 比對過去 ID 照片 → "
-                f"命中沿用／連續追蹤換裝則存新照／都沒中才發新 ID；"
-                f"appear≥{args.appear_thresh:.2f}，{proto_s}；"
-                f"新 ID 需連續 {args.min_hits} 次仍對不上圖庫才發號；"
-                "桌後漏檢接回空缺、不發新號；走出畫面後外貌明顯不像才發新號。"
-            )
-        print(
-            f"進出畫面：室內漏檢沿用約 {max(coast_frames, int(id_mapper.fps * 1.2))} 幀；"
-            "貼畫面邊緣的框立刻清除（人已離開），不把殘框留在場上。"
-        )
-        if not args.no_gallery_dump:
-            print(
-                f"外貌圖庫：{args.gallery_dir}（ID***/；temp/current.jpg=當前比對圖；"
-                f"每次重跑清空，只供即時比對）"
-            )
-        if id_mapper.review is not None:
-            print(
-                f"審查資料庫：{id_mapper.review.session_dir} "
-                f"（每個 ID 約每 {args.review_every} 幀一張，背景 Pillow 寫檔，"
-                "不參與即時比對；錯圖可之後刪）"
-            )
-        else:
-            print("審查資料庫：關閉（預設；要存錯圖審查請加 --review-dump）")
-        print(
-            f"誤檢過濾：conf≥{args.conf}，min_bottom={args.min_bottom_ratio}，"
-            f"min_aspect={args.min_aspect}，min_h={args.min_h_ratio}"
-        )
-        if args.log_id:
-            print("ID 變化會印 [ID-CHANGE]（時刻 / elapsed / video / frame）。")
-        print("格子視窗會標示各 ID 所在格（不同人不同底色）。")
 
-    # Local files must be reproducible: process the fixed stride frames
-    # synchronously so BoT-SORT always sees 1, 1+stride, 1+2*stride, ...
-    # RTSP remains asynchronous/latest-frame because low live latency matters
-    # more than replay determinism there.
+    pose_tag = pose_model_name(args.model) if args.ref == "pose" else None
+    parts = [f"YOLO {args.model}"]
+    if pose_tag:
+        parts.append(f"pose {Path(pose_tag).name}")
+    if args.track:
+        parts.append(f"BoT-SORT {tracker_path.name}")
+    else:
+        parts.append("無追蹤")
+    parts.append(
+        f"conf={args.conf:g} imgsz={args.imgsz} stride={args.stride} cell-hold={args.cell_hold}"
+    )
+    print(" | ".join(parts))
+    extras: list[str] = [f"--ref {args.ref}"]
+    if compensator is not None:
+        extras.append(f"補償 {compensator.num_points} 點")
+    if args.track:
+        extras.append("OSNet" if reid_encoder is not None else "HSV")
+        extras.append(f"min-hits={args.min_hits}")
+    if args.out_margin > 0:
+        extras.append(f"OUT≤{args.out_margin:g}cm")
+    if use_latest:
+        extras.append("RTSP 最新幀")
+    elif is_file_video:
+        extras.append(f"本機 {video_fps:.0f}fps")
+    extras.append("q 結束  s 存圖")
+    print("  " + "  ·  ".join(extras))
+    if args.single_person:
+        print("  警告：--single-person（demo，非真實辨識）")
+    if id_mapper.review is not None:
+        print(f"  審查庫：{id_mapper.review.session_dir}")
+    save_path = Path(args.save_video).resolve() if args.save_video else None
+    video_writer: cv2.VideoWriter | None = None
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  錄製：{save_path}")
     worker = (
         None
         if is_file_video
         else AsyncTrackWorker(model, h_mat, det_kw, id_mapper if args.track else None)
     )
-    if is_file_video:
-        print(
-            f"本機影片：固定取樣第 1、{1 + args.stride}、"
-            f"{1 + 2 * args.stride}…幀；同一影片重跑使用相同追蹤幀。"
-        )
-    save_path = Path(args.save_video).resolve() if args.save_video else None
-    video_writer: cv2.VideoWriter | None = None
-    if save_path is not None:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"錄製展示影片：{save_path}")
     try:
         frame_idx = 0
         last_dets: list[dict] = []
