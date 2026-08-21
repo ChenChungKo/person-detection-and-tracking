@@ -216,6 +216,7 @@ python export_demo_video.py
 
 ## 報告
 
+- [8/21](PPT%20report/報告8_21.pdf)
 - [8/7](PPT%20report/報告8_7.pdf)
 - [7/24](PPT%20report/報告7_24.pdf)
 - [7/10](PPT%20report/報告7_10.pdf)
