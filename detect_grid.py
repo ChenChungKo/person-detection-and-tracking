@@ -67,7 +67,9 @@ REF_VIS = {
     "foot": {"color": (0, 0, 255), "tag": "框底"},
     "head_drop": {"color": (255, 0, 255), "tag": "推估"},
 }
-# COCO-17 skeleton (0-indexed), same topology as YOLO pose
+# COCO-17: 0-4 are head (nose/eyes/ears). Preview skips the head so the
+# camera view stays readable; localization still uses the full pose model.
+_HEAD_KPTS = frozenset({0, 1, 2, 3, 4})
 _COCO_SKELETON: list[tuple[int, int]] = [
     (15, 13),
     (13, 11),
@@ -81,12 +83,6 @@ _COCO_SKELETON: list[tuple[int, int]] = [
     (6, 8),
     (7, 9),
     (8, 10),
-    (0, 1),
-    (0, 2),
-    (1, 3),
-    (2, 4),
-    (0, 5),
-    (0, 6),
 ]
 # BGR limb colors: legs, torso, arms, face (YOLO pose style)
 _LIMB_COLORS: list[tuple[int, int, int]] = [
@@ -102,12 +98,6 @@ _LIMB_COLORS: list[tuple[int, int, int]] = [
     (255, 128, 0),
     (255, 128, 0),
     (255, 128, 0),
-    (0, 255, 0),
-    (0, 255, 0),
-    (0, 255, 0),
-    (0, 255, 0),
-    (0, 255, 0),
-    (0, 255, 0),
 ]
 _KPT_COLORS: list[tuple[int, int, int]] = [
     (0, 255, 0),
@@ -886,17 +876,20 @@ def draw_pose_skeleton(
     min_conf: float = 0.25,
     line_scale: float = 1.0,
 ) -> None:
-    """Draw COCO-17 skeleton on the preview frame (YOLO pose style)."""
-    thick = max(2, int(round(3 * line_scale)))
-    radius = max(3, int(round(4 * line_scale)))
+    """Draw a faded body skeleton; head keypoints are omitted from preview."""
+    thick = max(1, int(round(1.6 * line_scale)))
+    radius = max(2, int(round(2.2 * line_scale)))
+    overlay = vis.copy()
     for edge_i, (a, b) in enumerate(_COCO_SKELETON):
+        if a in _HEAD_KPTS or b in _HEAD_KPTS:
+            continue
         pa = _kpt_visible(kpts_xy, kpts_conf, a, min_conf)
         pb = _kpt_visible(kpts_xy, kpts_conf, b, min_conf)
         if pa is None or pb is None:
             continue
         color = _LIMB_COLORS[edge_i] if edge_i < len(_LIMB_COLORS) else (200, 200, 200)
         cv2.line(
-            vis,
+            overlay,
             (int(round(pa[0])), int(round(pa[1]))),
             (int(round(pb[0])), int(round(pb[1]))),
             color,
@@ -904,17 +897,20 @@ def draw_pose_skeleton(
             cv2.LINE_AA,
         )
     for idx in range(min(len(kpts_xy), len(_KPT_COLORS))):
+        if idx in _HEAD_KPTS:
+            continue
         pt = _kpt_visible(kpts_xy, kpts_conf, idx, min_conf)
         if pt is None:
             continue
         cv2.circle(
-            vis,
+            overlay,
             (int(round(pt[0])), int(round(pt[1]))),
             radius,
             _KPT_COLORS[idx],
             -1,
             cv2.LINE_AA,
         )
+    cv2.addWeighted(overlay, 0.38, vis, 0.62, 0, vis)
 
 
 def is_plausible_person_box(
