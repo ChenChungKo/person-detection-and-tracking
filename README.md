@@ -57,7 +57,7 @@ RTSP 把 `--source` 換成 `rtsp://帳號:密碼@IP:554/stream1` 即可（自動
   <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：左偵測右格子"/>
 </p>
 
-目前主 demo：`test/demo_stable_id_osnet_ain.mp4`（同上設定、`--min-hits 16`）。舊版僅定位對照仍在倉庫：`test/demo_v2_chessboard.webp`、`test/demo_v1_manual.webp`。
+目前主 demo：`test/demo_stable_id_osnet_ain.mp4`（`test4` + pose + OSNet-AIN、`--min-hits 16`；含 dirty-crop 不發號、分身框隱藏、短漏偵防搶號）。舊版僅定位對照仍在倉庫：`test/demo_v2_chessboard.webp`、`test/demo_v1_manual.webp`。
 
 ### 目前設定
 
