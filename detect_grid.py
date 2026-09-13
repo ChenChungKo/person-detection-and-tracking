@@ -1202,7 +1202,7 @@ def draw_ref_guide(
 
 
 def draw_ref_legend(vis: np.ndarray, fs: float) -> None:
-    """One-line color key at the top of the camera view."""
+    """One-line color key below the camera OSD timestamp."""
     keys = ("seat", "pose", "stand_drop", "foot", "head_drop")
     font_px = max(16, int(18 * fs))
     pad_x = max(10, int(10 * fs))
@@ -1234,7 +1234,8 @@ def draw_ref_legend(vis: np.ndarray, fs: float) -> None:
     rgb = np.asarray(bar.convert("RGB"))
     overlay = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     alpha = np.asarray(bar.split()[-1], dtype=np.float32) / 255.0
-    y1, x1 = 8, 8
+    # Tapo / camera OSD timestamp sits in the top-left; keep the key below it.
+    y1, x1 = 8 + int(36 * fs), 8
     y2, x2 = y1 + bar_h, x1 + bar_w
     roi = vis[y1:y2, x1:x2]
     if roi.shape[0] != bar_h or roi.shape[1] != bar_w:
