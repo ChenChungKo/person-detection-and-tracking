@@ -2024,7 +2024,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--review-every",
         type=int,
         default=10,
-        help="save one review crop per ID every N video frames (default 10 ≈ 0.5s)",
+        help="save one review crop per ID on a fixed N-frame grid "
+        "(default 10 → f00010, f00020, …; ≈ 0.5s at 20fps)",
     )
     p.add_argument(
         "--review-dump",
@@ -2372,6 +2373,12 @@ def main(
                     if id_key != last_id_key:
                         log_id_change(det_idx, log_fps, t_play0, last_id_key, id_key)
                         last_id_key = id_key
+            if id_mapper.review is not None and last_dets:
+                id_mapper.dump_review(
+                    box_coaster.extrapolate(last_dets, frame_idx),
+                    frame,
+                    frame_idx,
+                )
             # Full-resolution resize + annotation + two GUI windows are
             # expensive on this 2880x1620 CPU-only setup. Keep every tracking
             # frame, but render a deterministic ~9 fps preview between them.

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from stable_id import StableIdMapper
+from stable_id import StableIdMapper, review_frame_due
 
 H, W = 720, 1280
 # ~120x320, aspect ~2.7, well inside the gallery-quality window.
@@ -436,6 +436,47 @@ class EnrollWhenCleanTests(unittest.TestCase):
             ),
             0.55,
         )
+
+    def test_far_same_clothes_cannot_steal_vacant_id(self) -> None:
+        """RTSP ID3: two dark shirts at different desks must not ping-pong."""
+        mapper = StableIdMapper(
+            min_hits=1, encoder=None, gallery_dir=None, fps=20.0
+        )
+        mapper.apply(
+            [_det(7, A_SEP, (100.0, 80.0))], 1, _frame((A_SEP, BLUE))
+        )
+        out = mapper.apply(
+            [_det(88, B_SEP, (700.0, 500.0))],
+            40,
+            _frame((B_SEP, BLUE)),
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertNotEqual(by_raw.get(88), 1, f"far classmate stole ID1: {out}")
+
+    def test_color_reclaim_ignores_far_same_clothes(self) -> None:
+        mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
+        mapper.apply(
+            [_det(7, A_SEP, (100.0, 80.0))], 1, _frame((A_SEP, BLUE))
+        )
+        frame = _frame((B_SEP, BLUE))
+        color = mapper._color_feat_from_crop(mapper._crop_person(frame, B_SEP))
+        self.assertIsNone(
+            mapper._color_reclaim(color, set(), world=(700.0, 500.0))
+        )
+        self.assertEqual(
+            mapper._color_reclaim(color, set(), world=(120.0, 90.0)),
+            1,
+        )
+
+
+class ReviewDumpGridTests(unittest.TestCase):
+    def test_saves_on_fixed_tens_not_shifted_by_a_miss(self) -> None:
+        self.assertFalse(review_frame_due(196, 10, -10**9))
+        self.assertTrue(review_frame_due(200, 10, -10**9))
+        self.assertFalse(review_frame_due(201, 10, 200))
+        self.assertFalse(review_frame_due(211, 10, 200))
+        self.assertTrue(review_frame_due(210, 10, 200))
+        self.assertTrue(review_frame_due(220, 10, 200))
 
 
 if __name__ == "__main__":

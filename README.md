@@ -47,7 +47,7 @@ RTSP 把 `--source` 換成 `rtsp://帳號:密碼@IP:554/stream1` 即可（自動
 | 加上 | 作用 |
 |------|------|
 | `--no-pose-skeleton` | 不畫 COCO-17 骨架 |
-| `--review-dump` | 裁圖寫入 `test/reid_review/<時間>/`（不參與即時比對） |
+| `--review-dump` | 審查裁圖寫入 `test/reid_review/<開跑時間>/`（不參與即時比對；檔名 `f00160`＝第 160 幀） |
 | `--save-video 路徑.mp4 --no-show --no-realtime` | 錄左右對照影片 |
 | `--no-track` | 只要人框、不要 ID |
 | `--no-floor-grid` | 關掉地上 A/B/C/O |
@@ -71,7 +71,7 @@ RTSP 把 `--source` 換成 `rtsp://帳號:密碼@IP:554/stream1` 即可（自動
 | 短追蹤 | BoT-SORT（`trackers/botsort.yaml`；GMC off、短 ReID off） |
 | 長期 ID | Stable-ID + `--reid-model osnet_ain`；`--min-hits 16`；`--appear-thresh 0.34` |
 | 效能 | `--stride 5`（約每秒 4 次 YOLO）；本機固定取樣、RTSP 最新幀 |
-| 審查庫 | 預設關 |
+| 審查庫 | 預設關；`--review-dump` 才寫。檔名 `fNNNNN`＝本次第幾幀，RTSP 約 20 fps（`f00160` ≈ 開跑後 8 秒） |
 
 舊校正：`--calib calibration/homography_v1_manual.json`。舊桌區灰格：`--valid-xmin 170`。舊短追蹤：`--tracker trackers/bytetrack_stable.yaml`。
 
@@ -96,11 +96,28 @@ RTSP 把 `--source` 換成 `rtsp://帳號:密碼@IP:554/stream1` 即可（自動
 長期 ID：YOLO 框人 → 比對圖庫 → 命中沿用／連續追蹤換裝則存新原型／都沒中才發新號。
 
 - 即時圖庫 `test/reid_gallery/`：每次重跑清空；比對用記憶體向量
-- 審查庫 `test/reid_review/`：預設關；`--review-dump` 才寫裁圖
+- 審查庫 `test/reid_review/`：預設關；`--review-dump` 才寫裁圖（見下方）
 - 圖庫只收乾淨、低重疊框
 - 回場：OSNet 仍像同一人（含換外套）→ 沿用。從畫面**邊緣**離開後，外貌低且衣服差很多 → 不因「只剩一個空號」收回，等 `--min-hits` 後發新號。桌後漏檢仍接回、不發新號
 - 陌生軌先隔離再發號；雙框合併留舊號；室內漏檢約 1.2 秒；貼邊立刻清除殘框
 - `--min-hits 16`、`--stride 5`、約 20 fps → 開頭約 4 秒才出現第一個新號（已登錄的人再出現不必再等）。ID 變化會印 `[ID-CHANGE]`
+
+### 審查庫檔名
+
+路徑：`test/reid_review/<開跑時間>/ID001/f00160.jpg`。只給人看，不寫回即時向量。
+
+`f00160` **不是** 1 分 60 秒，是**這次開跑後的第 160 幀**。時間從按下開始、第一張畫面進來算起。
+
+```
+秒數 ≈ 幀號 ÷ fps
+```
+
+| 來源 | fps | `f00160` | `f00200` | `f01200` |
+|------|-----|----------|----------|----------|
+| RTSP（Stable-ID 固定按 20 fps 算） | 20 | 8.0 秒 | 10.0 秒 | 1 分 0 秒 |
+| 本機影片 | 檔案標示的 FPS | 160 ÷ 該 fps | 200 ÷ 該 fps | 1200 ÷ 該 fps |
+
+預設 `--review-every 10`：每個已發號的 ID 固定在第 10、20、30…幀各存一張（約 20 fps 時 0.5 秒一張）。漏標就空掉那一格，後面檔名仍對齊卡點，不會變成 211、221。沒有穩定 ID 的 `person` 不存。
 
 ## 跳幀、即時與格子防抖
 

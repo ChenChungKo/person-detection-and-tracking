@@ -25,6 +25,15 @@ import numpy as np
 from PIL import Image
 
 
+def review_frame_due(frame_idx: int, every_frames: int, last_saved: int) -> bool:
+    """Save on a fixed grid (10, 20, 30…) so missed ticks do not shift later names."""
+    n = max(1, int(every_frames))
+    idx = int(frame_idx)
+    if idx <= int(last_saved):
+        return False
+    return idx % n == 0
+
+
 class ReviewDumper:
     """Background file dump for later human cleanup. Not used for live Re-ID.
 
@@ -48,7 +57,7 @@ class ReviewDumper:
         self.session_dir = Path(root) / stamp
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self._last_frame: dict[int, int] = {}
-        self._q: queue.Queue[tuple[Path, np.ndarray] | None] = queue.Queue(maxsize=24)
+        self._q: queue.Queue[tuple[Path, np.ndarray] | None] = queue.Queue(maxsize=64)
         self._thread = threading.Thread(
             target=self._writer, name="review-dump", daemon=True
         )
@@ -84,7 +93,7 @@ class ReviewDumper:
         frame_idx: int,
     ) -> None:
         last = self._last_frame.get(sid, -10**9)
-        if frame_idx - last < self.every_frames:
+        if not review_frame_due(frame_idx, self.every_frames, last):
             return
         x1, y1, x2, y2 = [int(v) for v in xyxy]
         h, w = frame.shape[:2]
@@ -106,6 +115,7 @@ class ReviewDumper:
             self._last_frame[sid] = frame_idx
         except queue.Full:
             return
+
 
 
 class StableIdMapper:
@@ -563,6 +573,15 @@ class StableIdMapper:
             sim = self._best_color_sim(color_feat, sid)
             if sim < min_sim:
                 continue
+            meta = self._stable.get(sid)
+            if world is not None and meta is not None:
+                dist = self._dist(
+                    world, (float(meta["wx"]), float(meta["wy"]))
+                )
+                # Same-clothes reclaim is for the original desk, not a
+                # classmate across the room (RTSP ID3 ping-pong).
+                if dist > 220.0:
+                    continue
             cand = (sim, -int(sid))
             if best is None or cand > best:
                 best = cand
@@ -1357,9 +1376,10 @@ class StableIdMapper:
     ) -> bool:
         """Allow same-person re-entry; block two-person merges.
 
-        Strong appearance (same person walking across the room) may rematch
-        a free ID without a distance cap. Weak appearance still needs to be
-        nearby, otherwise a classmate inherits the vacant ID.
+        A vacant ID may only be claimed nearby while it was last seen recently.
+        Clothing similarity is not a distance waiver — two dark shirts at
+        different desks must not ping-pong the same ID.
+        After a longer leave, appearance-only rematch is allowed again.
         """
         if sid not in self._stable:
             return False
@@ -1377,8 +1397,11 @@ class StableIdMapper:
             need = self.appear_thresh
         if sim < need:
             return False
-        strong = sim >= self.appear_thresh + 0.10
-        if world is not None and gap <= recent and not strong:
+        if gap <= recent:
+            if world is None:
+                # No floor position: similar dark/light clothes must not
+                # inherit a vacant ID while the owner may still be in view.
+                return sim >= self.appear_thresh + 0.20
             dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
             limit = min(max(self._reach_limit_cm(gap), 180.0), 300.0)
             if dist > limit:
@@ -1635,15 +1658,15 @@ class StableIdMapper:
                 continue
             color_sim = self._best_color_sim(color_feat, sid)
             clothes_lock = color_sim >= 0.55
-            if not clothes_lock and not self._rematch_allowed(
+            if not self._rematch_allowed(
                 sid, feat, world, frame_idx, last_chance=last_chance
             ):
                 continue
             sim = self._best_proto_sim(feat, meta)
+            score = float(sim)
             dist = 0.0
             if world is not None:
                 dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
-            score = float(sim)
             if clothes_lock:
                 # Same shirt as an older ID: keep ID2, do not follow ID3's last walk.
                 score += 0.20 + 0.05 * max(0, 8 - int(sid))
@@ -1659,7 +1682,8 @@ class StableIdMapper:
                 best = cand
         if best is None:
             return None, -1.0
-        return -best[3], best[1]
+        return -best[3], float(best[1])
+
 
     def _retire_young_sid(self, lose_sid: int, win_sid: int, frame_idx: int) -> None:
         """Drop a freshly minted split-ID so leave/re-enter keeps ID1."""
@@ -1751,6 +1775,15 @@ class StableIdMapper:
                     self._raw_to_stable[int(raw)] = win_sid
                 self._retire_young_sid(lose_sid, win_sid, frame_idx)
         return [d for d, k in zip(out, keep) if k]
+
+    def dump_review(
+        self,
+        out: list[dict],
+        frame: np.ndarray | None,
+        frame_idx: int,
+    ) -> None:
+        """Public hook so display frames can save on the 10/20/30… grid."""
+        self._dump_review(out, frame, frame_idx)
 
     def _dump_review(
         self,
