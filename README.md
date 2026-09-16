@@ -67,7 +67,7 @@ RTSP 把 `--source` 換成 `rtsp://帳號:密碼@IP:554/stream1` 即可（自動
 | 定位補償 | `--error-comp calibration/homography_error_report.json` |
 | 鏡頭內參 | `camera_intrinsics.json` 有檔；**`detect_grid.py` 不套用** |
 | 定位對照 | A/B/C/O，見 `calibration/floor_marks.json` |
-| 偵測 | `yolo26s.pt`、`--ref pose`、`--conf 0.45`、`--cell-hold 2` |
+| 偵測 | `yolo26s.pt`、`--ref pose`、`--conf 0.45`、`--cell-hold 2`（每人黏一格，見下方） |
 | 短追蹤 | BoT-SORT（`trackers/botsort.yaml`；GMC off、短 ReID off） |
 | 長期 ID | Stable-ID + `--reid-model osnet_ain`；`--min-hits 16`；`--appear-thresh 0.34` |
 | 效能 | `--stride 5`（約每秒 4 次 YOLO）；本機固定取樣、RTSP 最新幀 |
@@ -125,9 +125,31 @@ RTSP 把 `--source` 換成 `rtsp://帳號:密碼@IP:554/stream1` 即可（自動
 |------|------|------|
 | `--stride N`（預設 5） | 降低運算量 | 每 N 幀跑一次 YOLO；中間幀沿用並預測跟上。格子標 `cached` 代表沿用 |
 | `LatestFrameCapture` | RTSP 降低落後感 | 推論慢時丟緩衝區舊幀，永遠處理最新畫面。本機 `.mp4` **不**啟用 |
-| `--cell-hold N`（預設 2） | 格子不閃 | 連續 N **次偵測**一致才亮／滅（跟 stride 搭配時只算真正跑 YOLO 的幀） |
+| `--cell-hold N`（預設 2） | 有 ID 就亮、格線上不閃 | 格子跟**人**黏，不是整格投票。詳見下一節 |
 
 本機影片固定處理第 `1, 1+stride, 1+2×stride, …` 幀，同一支影片重跑 ID 才對得上。`--realtime`（預設開）只限制播放不超過來源 FPS，推論慢時會變慢，但不會為了搶時間軸而丟追蹤幀。
+
+### 格子為何曾忽暗忽亮（`--cell-hold`）
+
+左邊人框／ID 是「這次有人就畫」。右邊格子以前是「哪一格連續 N 次偵測都有人」才亮、都沒人才滅，畫的時候還要 **當下腳點 ∩ 已確認格子**。
+
+人站在格線上時，腳點會在相鄰兩格（A、B）之間跳：
+
+| | 舊方法（整格投票） | 現在（每個 ID 黏一格） |
+|--|-------------------|------------------------|
+| 第一次算到格子 | 要連續 2 次才亮 → 已有 ID，格子還可能是黑的 | 立刻亮 |
+| 腳在 A、B 間晃 | 這一拍腳在 B、已確認卻是 A → 兩格都對不上 → **整格先滅** | 維持上一格 |
+| `--cell-hold 1` | 格子完全跟當下腳點 → 左右格對閃 | 關掉黏住，同樣會對閃 |
+
+請保持 **`--cell-hold 2`**（GUI 預設也是 2）。不要為了「比較快亮」改成 1。
+
+真的走過去：連續 2 次 YOLO 都在隔壁才換格。跨兩格以上（不是緊鄰）立刻換。中間漏算一拍先留燈，連續兩次都沒格子才滅。腳點算出地板外（`cell` 為空）仍會暗，那是定位沒落在地圖上，不是跨線閃爍。
+
+`test4` 建議指令維持：
+
+```powershell
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
+```
 
 ## 定位對照（A/B/C/O）
 

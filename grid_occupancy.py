@@ -259,6 +259,78 @@ def id_bgr_color(track_id: int) -> tuple[int, int, int]:
     return (int(b), int(g), int(r))
 
 
+class CellStabilizer:
+    """Per-person sticky floor cell.
+
+    Lights on the first valid reading so an IDed person is not waiting for
+    a second YOLO run. Adjacent hops (standing on a grid line) keep the last
+    cell until the neighbour wins ``hold`` consecutive detection runs. A
+    longer step switches immediately. A brief missing cell keeps the last
+    light for ``hold`` runs, then clears.
+    """
+
+    def __init__(self, hold: int = 2) -> None:
+        self.hold = max(1, int(hold))
+        self._cell: dict[int, tuple[int, int]] = {}
+        self._pending: dict[int, tuple[tuple[int, int], int]] = {}
+        self._miss: dict[int, int] = {}
+
+    @staticmethod
+    def _adjacent(a: tuple[int, int], b: tuple[int, int]) -> bool:
+        return max(abs(a[0] - b[0]), abs(a[1] - b[1])) == 1
+
+    def update(self, dets: list[dict]) -> dict[tuple[int, int], list[int]]:
+        seen: set[int] = set()
+        for det in dets:
+            tid = det.get("track_id")
+            if tid is None:
+                continue
+            tid = int(tid)
+            seen.add(tid)
+            cell = det.get("cell")
+            if cell is None:
+                self._note_miss(tid)
+                continue
+            self._miss[tid] = 0
+            self._assign(tid, (int(cell[0]), int(cell[1])))
+        for tid in list(self._cell):
+            if tid not in seen:
+                self._note_miss(tid)
+        occ: dict[tuple[int, int], list[int]] = {}
+        for tid, cell in self._cell.items():
+            occ.setdefault(cell, []).append(tid)
+        for cell, ids in occ.items():
+            occ[cell] = sorted(ids)
+        return occ
+
+    def _note_miss(self, tid: int) -> None:
+        if tid not in self._cell:
+            self._pending.pop(tid, None)
+            return
+        self._miss[tid] = self._miss.get(tid, 0) + 1
+        self._pending.pop(tid, None)
+        if self._miss[tid] >= self.hold:
+            self._cell.pop(tid, None)
+            self._miss.pop(tid, None)
+
+    def _assign(self, tid: int, cell: tuple[int, int]) -> None:
+        cur = self._cell.get(tid)
+        if cur is None or cell == cur or self.hold <= 1 or not self._adjacent(cur, cell):
+            self._cell[tid] = cell
+            self._pending.pop(tid, None)
+            return
+        pending = self._pending.get(tid)
+        if pending is None or pending[0] != cell:
+            self._pending[tid] = (cell, 1)
+            return
+        n = pending[1] + 1
+        if n >= self.hold:
+            self._cell[tid] = cell
+            self._pending.pop(tid, None)
+        else:
+            self._pending[tid] = (cell, n)
+
+
 # Cached empty board (axes + title) so 2-person redraws stay cheap.
 _EMPTY_GRID_CACHE: dict[tuple[float, int], Image.Image] = {}
 

@@ -37,6 +37,7 @@ from ultralytics import YOLO
 from grid_occupancy import (
     FLOOR_MARKS,
     X_EDGES,
+    CellStabilizer,
     cell_label,
     draw_grid,
     id_bgr_color,
@@ -1496,42 +1497,6 @@ def draw_multi_grid(cells: set[tuple[int, int]], valid_xmin: float) -> np.ndarra
     return base
 
 
-class CellStabilizer:
-    """Debounce grid-cell occupancy against per-detection jitter.
-
-    A cell only lights up after appearing in ``hold`` consecutive detection
-    RUNS (not rendered/cached frames), and only turns off after being absent
-    for ``hold`` consecutive runs. This keeps small bbox jitter (e.g. a
-    slight body twist) from flickering between adjacent cells.
-    """
-
-    def __init__(self, hold: int = 2) -> None:
-        self.hold = max(1, hold)
-        self._on_streak: dict[tuple[int, int], int] = {}
-        self._off_streak: dict[tuple[int, int], int] = {}
-        self._confirmed: set[tuple[int, int]] = set()
-
-    def update(self, raw_cells: set[tuple[int, int]]) -> set[tuple[int, int]]:
-        tracked = set(self._on_streak) | set(self._off_streak) | raw_cells | self._confirmed
-        for cell in tracked:
-            if cell in raw_cells:
-                self._on_streak[cell] = self._on_streak.get(cell, 0) + 1
-                self._off_streak[cell] = 0
-                if self._on_streak[cell] >= self.hold:
-                    self._confirmed.add(cell)
-            else:
-                self._off_streak[cell] = self._off_streak.get(cell, 0) + 1
-                self._on_streak[cell] = 0
-                if self._off_streak[cell] >= self.hold:
-                    self._confirmed.discard(cell)
-        # Drop fully-idle cells so the dicts do not grow without bound.
-        for cell in list(self._on_streak):
-            if self._on_streak[cell] == 0 and cell not in self._confirmed:
-                self._on_streak.pop(cell, None)
-                self._off_streak.pop(cell, None)
-        return set(self._confirmed)
-
-
 def detect_and_locate(
     frame: np.ndarray,
     model: YOLO,
@@ -1887,8 +1852,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cell-hold",
         type=int,
         default=2,
-        help="a cell only lights/clears after N consecutive DETECTION RUNS agree "
-        "(counted in stride units, not raw frames); 1 disables debounce",
+        help="adjacent-cell stickiness in detection runs (default 2: light on "
+        "first hit, keep the last cell while standing on a grid line; "
+        "1 disables stickiness). Counted in stride units, not raw frames",
     )
     p.add_argument(
         "--track",
@@ -2217,7 +2183,7 @@ def main(
     use_realtime = bool(args.realtime and is_file_video)
 
     stabilizer = CellStabilizer(args.cell_hold)
-    confirmed_cells: set[tuple[int, int]] = set()
+    occupancy: dict[tuple[int, int], list[int]] = {}
     box_coaster = DetectionCoaster()
 
     reid_encoder = None
@@ -2360,8 +2326,7 @@ def main(
                 last_dets = dets
                 last_timing = None if args.no_timing else timing
                 box_coaster.observe(last_dets, det_idx if det_idx else frame_idx)
-                raw_cells = {d["cell"] for d in last_dets if d.get("cell") is not None}
-                confirmed_cells = stabilizer.update(raw_cells)
+                occupancy = stabilizer.update(last_dets)
                 if det_kw.get("track") and args.log_id:
                     id_key = tuple(
                         sorted(
@@ -2403,7 +2368,7 @@ def main(
                 args.valid_xmin,
                 timing=last_timing,
                 cached=det_idx != frame_idx,
-                grid_cells=confirmed_cells,
+                grid_occupancy=occupancy,
                 max_width=args.max_width,
                 grid_cache=grid_cache,
                 out_margin=args.out_margin,

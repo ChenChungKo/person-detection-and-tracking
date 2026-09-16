@@ -75,8 +75,8 @@ def parse_args() -> argparse.Namespace:
         "--cell-hold",
         type=int,
         default=2,
-        help="a cell only lights/clears after N consecutive DETECTION RUNS agree "
-        "(counted in stride units, not raw frames); 1 disables debounce",
+        help="light on first hit; keep last cell while standing on a grid line "
+        "for N detection runs (1 disables stickiness)",
     )
     p.add_argument("--no-track", action="store_true", help="disable ByteTrack + Stable-ID")
     p.add_argument("--tracker", default=str(DEFAULT_TRACKER))
@@ -182,7 +182,7 @@ def main() -> None:
         print(f"Re-ID 就緒：{enc.model_name}")
 
     stabilizer = CellStabilizer(args.cell_hold)
-    confirmed_cells: set[tuple[int, int]] = set()
+    occupancy: dict[tuple[int, int], list[int]] = {}
     box_coaster = DetectionCoaster()
     grid_cache = GridCache()
 
@@ -218,8 +218,7 @@ def main() -> None:
                 box_coaster.observe(last_dets, frame_idx)
                 last_timing = None if args.no_timing else (detect_ms, locate_ms)
                 detect_runs += 1
-                raw_cells = {d["cell"] for d in last_dets if d.get("cell") is not None}
-                confirmed_cells = stabilizer.update(raw_cells)
+                occupancy = stabilizer.update(last_dets)
                 draw_dets = last_dets
             else:
                 draw_dets = box_coaster.extrapolate(last_dets, frame_idx)
@@ -232,7 +231,7 @@ def main() -> None:
                 args.valid_xmin,
                 timing=timing,
                 cached=not run_detect,
-                grid_cells=confirmed_cells,
+                grid_occupancy=occupancy,
                 grid_cache=grid_cache,
                 out_margin=args.out_margin,
             )
