@@ -17,6 +17,7 @@ from __future__ import annotations
 import queue
 import shutil
 import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -207,6 +208,10 @@ class StableIdMapper:
         self._sid_raw_owner: dict[int, int] = {}
         self._unbind_votes: dict[int, tuple[str, int]] = {}
         self._unknown_raw_pending: dict[int, tuple[int, int]] = {}
+        # Short-term appearance queue (HMP / UnFCtrack IDSD). Enrollment
+        # ``_gallery_first_feat`` is the frozen long-term anchor (IDSR).
+        self._feat_hist: dict[int, deque[np.ndarray]] = {}
+        self._feat_hist_len = 8
         self._temp_dir: Path | None = None
         if self.gallery_dir is not None:
             if self.gallery_dir.exists():
@@ -758,11 +763,11 @@ class StableIdMapper:
         new_feat: np.ndarray | None,
         allow_new: bool = True,
     ) -> tuple[dict, int | None, bool]:
-        """EMA nearest prototype, or append a new look on clothing change.
+        """EMA short-term prototypes; never wash the enrollment slot.
 
-        Returns (meta, proto_index_to_snapshot, is_new_or_replaced).
-        When ``allow_new`` is False (gallery rematch), never enroll a divergent
-        stranger look under this ID — only EMA an existing close match.
+        ``feats[0]`` is the long-term identity anchor (HMP). Clothing change
+        on a continuous track still appends a new look. Rematch may only EMA
+        slots after 0, never the anchor.
         """
         if new_feat is None:
             return meta, None, False
@@ -775,28 +780,100 @@ class StableIdMapper:
         sims = [self._appear_sim(new_feat, p) for p in protos]
         best_i = int(np.argmax(sims))
         best_sim = float(sims[best_i])
+        ema_alpha = 0.85 if allow_new else 0.95
 
         if best_sim >= self.proto_new_thresh:
-            protos[best_i] = self._blend_feat(protos[best_i], new_feat, alpha=0.85)
-            snap_i, is_new = best_i, False
+            if best_i == 0:
+                if len(protos) == 1:
+                    if allow_new:
+                        protos.append(
+                            self._blend_feat(protos[0], new_feat, alpha=ema_alpha)
+                        )
+                        snap_i, is_new = 1, True
+                    else:
+                        snap_i, is_new = 0, False
+                else:
+                    j = 1 + int(np.argmax(sims[1:]))
+                    protos[j] = self._blend_feat(
+                        protos[j], new_feat, alpha=ema_alpha
+                    )
+                    snap_i, is_new = j, False
+            else:
+                protos[best_i] = self._blend_feat(
+                    protos[best_i], new_feat, alpha=ema_alpha
+                )
+                snap_i, is_new = best_i, False
         elif allow_new:
-            # Continuous same track + large look shift (jacket off): add proto.
             unlimited = self.max_prototypes <= 0
             if unlimited or len(protos) < self.max_prototypes:
                 protos.append(new_feat)
                 snap_i, is_new = len(protos) - 1, True
             else:
-                worst_i = int(np.argmin(sims))
-                protos[worst_i] = new_feat
-                snap_i, is_new = worst_i, True
+                rest = sims[1:] if len(protos) > 1 else sims
+                worst_i = (
+                    1 + int(np.argmin(rest)) if len(protos) > 1 else 0
+                )
+                if worst_i == 0:
+                    protos.append(new_feat)
+                    snap_i, is_new = len(protos) - 1, True
+                else:
+                    protos[worst_i] = new_feat
+                    snap_i, is_new = worst_i, True
         else:
-            # Rematch path: do not pollute gallery with a different person.
-            protos[best_i] = self._blend_feat(protos[best_i], new_feat, alpha=0.95)
-            snap_i, is_new = best_i, False
+            if best_i == 0:
+                snap_i, is_new = 0, False
+            else:
+                protos[best_i] = self._blend_feat(
+                    protos[best_i], new_feat, alpha=0.95
+                )
+                snap_i, is_new = best_i, False
 
         meta["feats"] = protos
-        meta["feat"] = protos[best_i] if best_sim >= self.proto_new_thresh else protos[-1]
+        meta["feat"] = protos[0]
         return meta, snap_i, is_new
+
+    def _push_feat_hist(self, sid: int, feat: np.ndarray | None) -> None:
+        if feat is None:
+            return
+        q = self._feat_hist.setdefault(
+            sid, deque(maxlen=max(4, int(self._feat_hist_len)))
+        )
+        q.append(np.asarray(feat, dtype=np.float32).copy())
+
+    def _restore_enrollment_anchor(self, sid: int) -> bool:
+        """Drop polluted live prototypes; keep the enrollment look (IDSR)."""
+        first = self._gallery_first_feat.get(sid)
+        meta = self._stable.get(sid)
+        if first is None or meta is None:
+            protos = self._proto_list(meta) if meta is not None else []
+            if not protos or meta is None:
+                return False
+            first = protos[0]
+        meta["feats"] = [first.copy()]
+        meta["feat"] = first.copy()
+        self._stable[sid] = meta
+        self._feat_hist.pop(sid, None)
+        return True
+
+    def _should_restore_enrollment(
+        self,
+        sid: int,
+        feat: np.ndarray | None,
+        world: tuple[float, float] | None,
+    ) -> bool:
+        """Unlike the enrollment anchor and too far to be the same walk."""
+        if feat is None or sid not in self._stable:
+            return False
+        first = self._gallery_first_feat.get(sid)
+        if first is None:
+            return False
+        if self._appear_sim(feat, first) >= self.appear_thresh:
+            return False
+        meta = self._stable[sid]
+        if world is None:
+            return False
+        dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
+        return dist > 180.0
 
     @staticmethod
     def _box_wh(
@@ -1584,7 +1661,11 @@ class StableIdMapper:
         feat_at,
         frame_idx: int,
     ) -> None:
-        """Break ByteTrack links that clearly belong to another gallery ID."""
+        """Break ByteTrack links that clearly belong to another gallery ID.
+
+        Compare against the enrollment anchor, not the live prototypes — those
+        may already contain the swapped body (UnFCtrack IDSR).
+        """
         for i in list(from_raw):
             sid = assigned.get(i)
             if sid is None or sid not in self._stable:
@@ -1593,13 +1674,18 @@ class StableIdMapper:
             if feat is None:
                 continue
             meta = self._stable[sid]
-            own = self._best_proto_sim(feat, meta)
+            anchor = self._gallery_first_feat.get(sid)
+            own_live = self._best_proto_sim(feat, meta)
+            own = (
+                self._appear_sim(feat, anchor) if anchor is not None else own_live
+            )
             world = work[i].get("world")
             # Impossible jump in a few frames → tracker swapped bodies.
             if world is not None:
                 dist = self._dist(world, (float(meta["wx"]), float(meta["wy"])))
                 max_jump = max(160.0, self.max_speed_cm_s * (2.5 / self.fps) + 60.0)
                 if dist > max_jump and own < self.appear_thresh + 0.05:
+                    self._restore_enrollment_anchor(sid)
                     used_sids.discard(sid)
                     assigned.pop(i, None)
                     from_raw.discard(i)
@@ -1613,6 +1699,9 @@ class StableIdMapper:
                 if other == sid or other in used_sids:
                     continue
                 osim = self._best_proto_sim(feat, ometa)
+                other_anchor = self._gallery_first_feat.get(other)
+                if other_anchor is not None:
+                    osim = max(osim, self._appear_sim(feat, other_anchor))
                 if best_other is None or osim > best_other[0]:
                     best_other = (osim, other)
             if (
@@ -1628,6 +1717,7 @@ class StableIdMapper:
                 if self._unbind_votes[key][1] < 3:
                     continue
                 self._unbind_votes.pop(key, None)
+                self._restore_enrollment_anchor(sid)
                 used_sids.discard(sid)
                 assigned.pop(i, None)
                 from_raw.discard(i)
@@ -1705,6 +1795,7 @@ class StableIdMapper:
         self._gallery_first_color.pop(lose_sid, None)
         self._gallery_latest_color.pop(lose_sid, None)
         self._sid_exit_border.pop(lose_sid, None)
+        self._feat_hist.pop(lose_sid, None)
         lose_owner = self._sid_raw_owner.pop(lose_sid, None)
         if win_sid not in self._sid_raw_owner and lose_owner is not None:
             self._sid_raw_owner[win_sid] = lose_owner
@@ -2354,9 +2445,25 @@ class StableIdMapper:
             # forever when stride=5 yields frames 1,6,11,...
             embed_every = int(self.fps) if len(work) >= 2 else 10
             last_embed = self._sid_last_embed_frame.get(sid, -10**9)
+            world_now = d.get("world")
+            jumped = False
+            if (
+                not is_first_for_sid
+                and world_now is not None
+                and sid in self._stable
+            ):
+                prev_w = self._stable[sid]
+                jumped = (
+                    self._dist(
+                        world_now,
+                        (float(prev_w["wx"]), float(prev_w["wy"])),
+                    )
+                    > 180.0
+                )
             need_feat = (
                 is_first_for_sid
                 or i not in from_raw
+                or jumped
                 or frame_idx - last_embed >= embed_every
             )
             cur_feat = feat_at(i, force=need_feat) if need_feat else None
@@ -2376,6 +2483,7 @@ class StableIdMapper:
                     cur_feat, sid, used_sids - {sid}
                 )
                 if better is not None and better not in used_sids:
+                    self._restore_enrollment_anchor(sid)
                     used_sids.discard(sid)
                     sid = better
                     is_first_for_sid = sid not in self._stable
@@ -2459,6 +2567,20 @@ class StableIdMapper:
                 from_raw.discard(i)
                 self._emit_unlabeled(out, d, raw)
                 continue
+            if (
+                cur_feat is not None
+                and not is_first_for_sid
+                and self._should_restore_enrollment(sid, cur_feat, d.get("world"))
+            ):
+                self._restore_enrollment_anchor(sid)
+                if raw is not None:
+                    self._raw_to_stable.pop(int(raw), None)
+                used_sids.discard(sid)
+                assigned.pop(i, None)
+                assigned_world.pop(sid, None)
+                from_raw.discard(i)
+                self._emit_unlabeled(out, d, raw)
+                continue
             allow_new_proto = (
                 (i in from_raw or is_first_for_sid)
                 and not prev.get("outfit_frozen", False)
@@ -2478,6 +2600,7 @@ class StableIdMapper:
                 prev, snap_i, is_new_proto = self._update_prototypes(
                     prev, cur_feat, allow_new=allow_new_proto
                 )
+                self._push_feat_hist(sid, cur_feat)
             else:
                 snap_i, is_new_proto = None, False
             prev["frame"] = frame_idx

@@ -468,6 +468,40 @@ class EnrollWhenCleanTests(unittest.TestCase):
             1,
         )
 
+    def test_enrollment_anchor_is_not_ema_washed(self) -> None:
+        mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
+        feat = mapper.appearance_feat(_frame((A_SEP, BLUE)), A_SEP)
+        self.assertIsNotNone(feat)
+        meta = {"feats": [feat.copy()], "feat": feat.copy()}
+        mapper._update_prototypes(meta, feat, allow_new=True)
+        self.assertTrue(np.allclose(meta["feats"][0], feat))
+        self.assertGreaterEqual(len(meta["feats"]), 1)
+
+    def test_far_unlike_look_restores_anchor_and_drops_id(self) -> None:
+        """Polluted extra prototype must not keep ID1 on a far, different person."""
+        mapper = StableIdMapper(
+            min_hits=1, encoder=None, gallery_dir=None, fps=20.0
+        )
+        mapper.apply(
+            [_det(7, A_SEP, (100.0, 80.0))], 1, _frame((A_SEP, BLUE))
+        )
+        first = mapper._gallery_first_feat[1]
+        thief = mapper.appearance_feat(_frame((B_SEP, RED)), B_SEP)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(thief)
+        self.assertLess(mapper._appear_sim(first, thief), mapper.appear_thresh)
+        mapper._stable[1]["feats"] = [first.copy(), thief.copy()]
+        out = mapper.apply(
+            [_det(7, B_SEP, (700.0, 500.0))],
+            20,
+            _frame((B_SEP, RED)),
+        )
+        protos = mapper._proto_list(mapper._stable[1])
+        self.assertEqual(len(protos), 1)
+        self.assertGreater(mapper._appear_sim(protos[0], first), 0.95)
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertNotEqual(by_raw.get(7), 1, f"polluted ID1 followed the thief: {out}")
+
 
 class ReviewDumpGridTests(unittest.TestCase):
     def test_saves_on_fixed_tens_not_shifted_by_a_miss(self) -> None:
