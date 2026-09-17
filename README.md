@@ -29,7 +29,7 @@ python launch_detect_grid.py
 ```
 
 <p align="center">
-  <img src="test/demo_gui_launcher.jpg" alt="detect_grid launcher GUI（test4）" width="100%" />
+  <img src="test/demo_gui_launcher.jpg" alt="detect_grid launcher GUI（test4，5 個 Stable-ID）" width="100%" />
 </p>
 
 ## 建議指令
@@ -54,10 +54,10 @@ RTSP 把 `--source` 換成 `rtsp://帳號:密碼@IP:554/stream1` 即可（自動
 | `--realtime` / `--no-realtime` | 本機影片是否限播放速度（都不丟追蹤幀） |
 
 <p align="center">
-  <img src="test/demo_stable_id_osnet_ain.webp" width="100%" alt="Demo：左偵測右格子"/>
+  <img src="test/review_videos/test4_review.webp" width="100%" alt="Demo：左偵測右格子"/>
 </p>
 
-目前主 demo：`test/demo_stable_id_osnet_ain.mp4`（`test4` + pose + OSNet-AIN、`--min-hits 16`；含 dirty-crop 不發號、分身框隱藏、短漏偵防搶號）。舊版僅定位對照仍在倉庫：`test/demo_v2_chessboard.webp`、`test/demo_v1_manual.webp`。
+目前主 demo：`test/review_videos/test4_review.mp4`（`test4` + pose + OSNet-AIN、`--min-hits 16`；含 dirty-crop 不發號、分身框隱藏、短漏偵防搶號、遠距 walker 不黏搶 ID）。舊版僅定位對照仍在倉庫：`test/demo_v2_chessboard.webp`、`test/demo_v1_manual.webp`。
 
 ### 目前設定
 
@@ -67,7 +67,7 @@ RTSP 把 `--source` 換成 `rtsp://帳號:密碼@IP:554/stream1` 即可（自動
 | 定位補償 | `--error-comp calibration/homography_error_report.json` |
 | 鏡頭內參 | `camera_intrinsics.json` 有檔；**`detect_grid.py` 不套用** |
 | 定位對照 | A/B/C/O，見 `calibration/floor_marks.json` |
-| 偵測 | `yolo26s.pt`、`--ref pose`、`--conf 0.45`、`--cell-hold 2`（每人黏一格，見下方） |
+| 偵測 | `yolo26s.pt`、`--ref pose`、`--conf 0.35`、`--cell-hold 2`（每人黏一格，見下方） |
 | 短追蹤 | BoT-SORT（`trackers/botsort.yaml`；GMC off、短 ReID off） |
 | 長期 ID | Stable-ID + `--reid-model osnet_ain`；`--min-hits 16`；`--appear-thresh 0.34` |
 | 效能 | `--stride 5`（約每秒 4 次 YOLO）；本機固定取樣、RTSP 最新幀 |
