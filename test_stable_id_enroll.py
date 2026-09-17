@@ -119,6 +119,113 @@ class EnrollWhenCleanTests(unittest.TestCase):
         self.assertEqual(by_raw.get(7), 1)
         self.assertEqual(by_raw.get(88), 2)
 
+    def test_occluder_does_not_inherit_vacant_id1(self) -> None:
+        """Walker covering ID1 must stay unlabeled; ID1 returns when clear."""
+        mapper = StableIdMapper(
+            min_hits=1, encoder=None, gallery_dir=None, fps=20.0
+        )
+        desk = A_SEP
+        near = (140, 180, 260, 500)  # overlaps / near ID1's desk
+        mapper.apply(
+            [_det(7, desk, (100.0, 80.0))], 1, _frame((desk, BLUE))
+        )
+        # Only the walker is visible near the desk (ID1 occluded).
+        occluded = mapper.apply(
+            [_det(88, near, (130.0, 80.0))],
+            6,
+            _frame((near, RED)),
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in occluded}
+        self.assertNotEqual(
+            by_raw.get(88), 1, f"walker stole vacant ID1: {occluded}"
+        )
+        # Original person reappears alone → reclaim ID1.
+        back = mapper.apply(
+            [_det(7, desk, (100.0, 80.0))],
+            20,
+            _frame((desk, BLUE)),
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in back}
+        self.assertEqual(by_raw.get(7), 1, f"ID1 not restored: {back}")
+
+    def test_continuous_raw_teleport_does_not_keep_id1(self) -> None:
+        """Same BoT-SORT raw jumping onto a differently dressed walker drops ID1."""
+        mapper = StableIdMapper(
+            min_hits=1, encoder=None, gallery_dir=None, fps=20.0
+        )
+        mapper.apply(
+            [_det(7, A_SEP, (100.0, 80.0))], 1, _frame((A_SEP, BLUE))
+        )
+        # Someone still at the old seat + wrong clothes on the jumped raw.
+        out = mapper.apply(
+            [
+                _det(7, B_SEP, (700.0, 500.0)),
+                _det(22, A_SEP, (100.0, 80.0)),
+            ],
+            6,
+            _frame((B_SEP, RED), (A_SEP, BLUE)),
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertNotEqual(
+            by_raw.get(7), 1, f"teleported raw kept ID1: {out}"
+        )
+        self.assertEqual(by_raw.get(22), 1, f"seat lost ID1: {out}")
+
+    def test_same_desk_raw_renumber_keeps_id1(self) -> None:
+        """BoT-SORT switching raw at the same seat must not blank ID1."""
+        mapper = StableIdMapper(
+            min_hits=1, encoder=None, gallery_dir=None, fps=20.0
+        )
+        mapper.apply(
+            [_det(7, A_SEP, (100.0, 80.0))], 1, _frame((A_SEP, BLUE))
+        )
+        out = mapper.apply(
+            [_det(99, A_SEP, (105.0, 82.0))],
+            6,
+            _frame((A_SEP, BLUE)),
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertEqual(by_raw.get(99), 1, f"same-desk renumber lost ID1: {out}")
+
+    def test_short_gap_id_not_blanked_by_overlap_conflict(self) -> None:
+        """A recovered ID must stay labelled even if the crop overlaps a neighbor."""
+        mapper = StableIdMapper(
+            min_hits=1, encoder=None, gallery_dir=None, fps=20.0
+        )
+        mapper.apply(
+            [_det(7, A_SEP, (100.0, 80.0))], 1, _frame((A_SEP, BLUE))
+        )
+        # New raw at the same desk, slightly overlapping a second person.
+        near = (140, 180, 260, 500)
+        out = mapper.apply(
+            [
+                _det(99, A_OVER, (105.0, 80.0)),
+                _det(22, near, (160.0, 80.0)),
+            ],
+            6,
+            _frame((A_OVER, BLUE), (near, RED)),
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertEqual(
+            by_raw.get(99), 1, f"recovered ID1 became person: {out}"
+        )
+
+    def test_same_person_walk_keeps_id_across_jump(self) -> None:
+        """A real walk with matching clothes must not flicker off ID1."""
+        mapper = StableIdMapper(
+            min_hits=1, encoder=None, gallery_dir=None, fps=20.0
+        )
+        mapper.apply(
+            [_det(7, A_SEP, (100.0, 80.0))], 1, _frame((A_SEP, BLUE))
+        )
+        out = mapper.apply(
+            [_det(7, B_SEP, (450.0, 80.0))],
+            6,
+            _frame((B_SEP, BLUE)),
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertEqual(by_raw.get(7), 1, f"walk lost ID1: {out}")
+
     def test_new_raw_can_reclaim_after_owner_reservation_expires(self) -> None:
         mapper = StableIdMapper(
             min_hits=1, encoder=None, gallery_dir=None, fps=20.0
@@ -294,6 +401,37 @@ class EnrollWhenCleanTests(unittest.TestCase):
         by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
         self.assertEqual(by_raw.get(99), 1, f"walking did not reclaim ID1: {out}")
 
+    def test_short_walk_reclaims_instead_of_minting(self) -> None:
+        """Track break while walking ~3.5m in 2s must keep ID1 (test3 ID5/6)."""
+        mapper = StableIdMapper(
+            min_hits=1,
+            encoder=None,
+            gallery_dir=None,
+            fps=20.0,
+            max_dist_cm=800.0,
+            max_speed_cm_s=200.0,
+        )
+        mapper.apply(
+            [_det(7, A_SEP, (100.0, 80.0))], 1, _frame((A_SEP, BLUE))
+        )
+        out = mapper.apply(
+            [_det(88, B_SEP, (450.0, 80.0))],
+            40,
+            _frame((B_SEP, BLUE)),
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertEqual(by_raw.get(88), 1, f"walker minted a second ID: {out}")
+        self.assertNotIn(2, _ids(out))
+
+    def test_full_person_touching_edge_is_not_an_exit(self) -> None:
+        mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
+        edge = (W - 130, 180, W - 2, 520)
+        det = {**_det(7, edge, (500.0, 80.0)), "raw_track_id": 7, "track_id": 1}
+        self.assertFalse(mapper._box_at_border(det, _frame((edge, BLUE))))
+        sliver = (W - 20, 200, W - 1, 280)
+        slim = {**_det(8, sliver, (500.0, 80.0)), "raw_track_id": 8, "track_id": 2}
+        self.assertTrue(mapper._box_at_border(slim, _frame((sliver, BLUE))))
+
     def test_split_outfit_crop_does_not_enroll(self) -> None:
         mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
         box = A_SEP
@@ -302,7 +440,10 @@ class EnrollWhenCleanTests(unittest.TestCase):
         mid = (x1 + x2) // 2
         frame[y1:y2, x1:mid] = (20, 40, 210)
         frame[y1:y2, mid:x2] = (210, 40, 20)
-        self.assertFalse(mapper._can_enroll_new_id(frame, box, 0.85, []))
+        other = (x1 + 40, y1 + 10, x2 + 70, y2)
+        self.assertFalse(mapper._can_enroll_new_id(frame, box, 0.85, [other]))
+        # Furniture next to a seated person is not a second body.
+        self.assertTrue(mapper._can_enroll_new_id(frame, box, 0.85, []))
 
 
     def test_different_clothes_do_not_steal_vacant_id1(self) -> None:
@@ -364,6 +505,21 @@ class EnrollWhenCleanTests(unittest.TestCase):
         self.assertNotIn(2, ids, f"split a second ID: {_ids(out)}")
         self.assertEqual(set(ids), {1})
 
+    def test_adjacent_seated_classmates_get_two_ids(self) -> None:
+        """A person sitting beside ID1 must mint, not stay a flickering person."""
+        mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
+        neighbor = (240, 180, 360, 500)
+        both = [
+            _det(7, A_SEP, (100.0, 80.0)),
+            _det(88, neighbor, (140.0, 80.0)),  # 40cm: old merge swallowed this
+        ]
+        frame = _frame((A_SEP, BLUE), (neighbor, RED))
+        mapper.apply(both, 1, frame)
+        out = mapper.apply(both, 2, frame)
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertEqual(by_raw.get(7), 1, f"lost ID1: {out}")
+        self.assertEqual(by_raw.get(88), 2, f"neighbor stayed unlabeled: {out}")
+
     def test_far_duplicate_of_occupied_id_is_hidden(self) -> None:
         """A split box of an ID already on screen is dropped, not shown as person."""
         mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
@@ -381,6 +537,119 @@ class EnrollWhenCleanTests(unittest.TestCase):
         self.assertEqual(by_raw.get(7), 1)
         self.assertNotIn(88, by_raw, f"duplicate box still drawn: {out}")
         self.assertNotIn(2, _ids(out))
+
+    def test_id_plus_person_nested_split_hides_person(self) -> None:
+        """An IDed body plus a nested unlabeled fragment must not show both."""
+        mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
+        big = A_SEP
+        frag = (100, 220, 180, 420)  # nested inside A_SEP
+        mapper.apply([_det(7, big, (100.0, 80.0))], 1, _frame((big, BLUE)))
+        out = mapper.apply(
+            [
+                _det(7, big, (100.0, 80.0)),
+                _det(88, frag, (105.0, 85.0)),
+            ],
+            2,
+            _frame((big, BLUE), (frag, BLUE)),
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertEqual(by_raw.get(7), 1)
+        self.assertNotIn(88, by_raw, f"ID and person both drawn: {out}")
+        self.assertEqual(len(out), 1)
+
+    def test_far_overlapping_walker_does_not_inherit_id1_via_collapse(
+        self,
+    ) -> None:
+        """test4 ~58s: edge walker overlaps seated ID1 but must not sticky-bind."""
+        mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
+        # Fit inside the 1280x720 synthetic frame used by these tests.
+        seat = (900, 180, 1050, 480)
+        walker = (920, 100, 1270, 700)  # overlaps seat; far world point
+        mapper.apply(
+            [_det(7, seat, (490.0, 328.0))], 1, _frame((seat, BLUE))
+        )
+        out = mapper.apply(
+            [
+                _det(7, seat, (490.0, 328.0)),
+                _det(99, walker, (375.0, 530.0)),
+            ],
+            2,
+            _frame((seat, BLUE), (walker, RED)),
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertEqual(by_raw.get(7), 1)
+        # Walker may still be drawn as person, but must not own ID1.
+        self.assertNotEqual(by_raw.get(99), 1, f"walker took ID1: {out}")
+        self.assertNotEqual(
+            mapper._raw_to_stable.get(99), 1, f"walker raw bound to ID1: {out}"
+        )
+        # Next frame: walker alone must not keep ID1 via sticky raw.
+        alone = mapper.apply(
+            [_det(99, walker, (370.0, 520.0))],
+            3,
+            _frame((walker, RED)),
+        )
+        alone_raw = {d.get("raw_track_id"): d.get("track_id") for d in alone}
+        self.assertNotEqual(
+            alone_raw.get(99), 1, f"next frame teleported ID1: {alone}"
+        )
+
+    def test_nearby_same_clothes_classmate_keeps_a_box(self) -> None:
+        """A classmate at the next seat must not be hidden as ID1's ghost."""
+        mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
+        neighbor = (240, 180, 360, 500)
+        both = [
+            _det(7, A_SEP, (100.0, 80.0)),
+            _det(88, neighbor, (160.0, 80.0)),
+        ]
+        frame = _frame((A_SEP, BLUE), (neighbor, BLUE))
+        mapper.apply(both, 1, frame)
+        out = mapper.apply(both, 2, frame)
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertEqual(by_raw.get(7), 1)
+        self.assertIn(88, by_raw, f"classmate box dropped: {out}")
+
+    def test_crowd_light_overlap_keeps_both_boxes(self) -> None:
+        """Seated classmates with IoU ~0.20 must both stay visible."""
+        mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
+        a = A_SEP
+        b = (160, 180, 280, 500)
+        both = [
+            _det(7, a, (100.0, 80.0)),
+            _det(88, b, (140.0, 80.0)),
+        ]
+        frame = _frame((a, BLUE), (b, BLUE))
+        mapper.apply(both, 1, frame)
+        out = mapper.apply(both, 2, frame)
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertIn(7, by_raw, f"lost left box: {out}")
+        self.assertIn(88, by_raw, f"crowd overlap dropped a person: {out}")
+
+    def test_hold_missing_survives_crowd_mega_box(self) -> None:
+        """A YOLO blob covering several people must not erase a known ID."""
+        mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
+        small = A_SEP
+        mega = (40, 80, 520, 560)
+        mapper._last_out = [
+            {
+                **_det(7, small, (100.0, 80.0)),
+                "raw_track_id": 7,
+                "track_id": 1,
+            }
+        ]
+        mapper._last_out_frame = 1
+        mapper._sid_last_real[1] = 1
+        current = [
+            {
+                **_det(9, mega, (300.0, 90.0)),
+                "raw_track_id": 9,
+                "track_id": 2,
+            }
+        ]
+        out = mapper._hold_missing_interior(current, 2, _frame())
+        sids = _ids(out)
+        self.assertIn(1, sids, f"mega-box swallowed ID1: {out}")
+        self.assertGreaterEqual(len(out), 2)
 
     def test_clear_newcomer_still_gets_its_own_id(self) -> None:
         """Hiding split boxes must not starve a real second person of an ID."""
@@ -501,6 +770,75 @@ class EnrollWhenCleanTests(unittest.TestCase):
         self.assertGreater(mapper._appear_sim(protos[0], first), 0.95)
         by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
         self.assertNotEqual(by_raw.get(7), 1, f"polluted ID1 followed the thief: {out}")
+
+    def test_crossing_crowd_does_not_restore(self) -> None:
+        """Overlapping people keep sticky IDs; do not restore-loop."""
+        mapper = StableIdMapper(
+            min_hits=1, encoder=None, gallery_dir=None, fps=20.0
+        )
+        mapper.apply(
+            [_det(7, A_SEP, (100.0, 80.0))], 1, _frame((A_SEP, BLUE))
+        )
+        first = mapper._gallery_first_feat[1]
+        thief = mapper.appearance_feat(_frame((B_SEP, RED)), B_SEP)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(thief)
+        mapper._stable[1]["feats"] = [first.copy(), thief.copy()]
+        # Overlap at the *same* desk — sticky raw must keep ID1; restore must
+        # not fire just because the crop briefly looks unlike enrollment.
+        crowd = [
+            _det(7, A_OVER, (120.0, 80.0)),
+            _det(22, B_OVER, (140.0, 80.0)),
+        ]
+        out = mapper.apply(
+            crowd, 20, _frame((A_OVER, RED), (B_OVER, BLUE))
+        )
+        by_raw = {d.get("raw_track_id"): d.get("track_id") for d in out}
+        self.assertEqual(
+            by_raw.get(7), 1, f"crossing restored ID1 off raw7: {out}"
+        )
+
+    def test_two_visible_people_do_not_restore(self) -> None:
+        """Restore is only for a lone far unlike crop, not a crowded frame."""
+        mapper = StableIdMapper(
+            min_hits=1, encoder=None, gallery_dir=None, fps=20.0
+        )
+        mapper.apply(
+            [_det(7, A_SEP, (100.0, 80.0))], 1, _frame((A_SEP, BLUE))
+        )
+        thief = mapper.appearance_feat(_frame((B_SEP, RED)), B_SEP)
+        self.assertIsNotNone(thief)
+        crowd = [
+            _det(7, B_SEP, (700.0, 500.0)),
+            _det(88, A_SEP, (100.0, 80.0)),
+        ]
+        self.assertFalse(
+            mapper._should_restore_enrollment(
+                1, thief, (700.0, 500.0), frame_idx=20, work=crowd
+            )
+        )
+        self.assertTrue(
+            mapper._should_restore_enrollment(
+                1,
+                thief,
+                (700.0, 500.0),
+                frame_idx=20,
+                work=[_det(7, B_SEP, (700.0, 500.0))],
+            )
+        )
+
+    def test_separated_desks_are_not_a_crossing_scene(self) -> None:
+        mapper = StableIdMapper(min_hits=1, encoder=None, gallery_dir=None)
+        far = [
+            _det(7, A_SEP, (100.0, 80.0)),
+            _det(88, B_SEP, (700.0, 500.0)),
+        ]
+        self.assertFalse(mapper._is_crossing_scene(far))
+        over = [
+            _det(7, A_OVER, (120.0, 80.0)),
+            _det(22, B_OVER, (140.0, 80.0)),
+        ]
+        self.assertTrue(mapper._is_crossing_scene(over))
 
 
 class ReviewDumpGridTests(unittest.TestCase):

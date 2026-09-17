@@ -57,6 +57,26 @@ DEFAULT_IMAGE = _ROOT / "test" / "static_frame.jpg"
 DEFAULT_CALIB = _ROOT / "calibration" / "homography.json"
 DEFAULT_OUT = _ROOT / "test" / "detect_grid_preview.jpg"
 DEFAULT_TRACKER = _ROOT / "trackers" / "botsort.yaml"
+
+
+def _activate_new_tracks_immediately() -> None:
+    """ByteTrack hides a new person until they match twice (is_activated).
+
+    With --stride 5 that second hit is often missed, so back-row classmates
+    never appear. Stable-ID already waits --min-hits before minting an ID.
+    """
+    from ultralytics.trackers.byte_tracker import STrack
+
+    if getattr(STrack.activate, "_immediate", False):
+        return
+    orig = STrack.activate
+
+    def activate(self, kalman_filter, frame_id: int):
+        orig(self, kalman_filter, frame_id)
+        self.is_activated = True
+
+    activate._immediate = True  # type: ignore[attr-defined]
+    STrack.activate = activate  # type: ignore[method-assign]
 # COCO pose: 11/12=hip, 13/14=knee, 15/16=ankle
 _HIP_L, _HIP_R = 11, 12
 _KNEE_L, _KNEE_R = 13, 14
@@ -671,11 +691,22 @@ class PoseTrackHistory:
     This follows the safer PETL4SD-style order: current visible joints, temporal
     body proportions, then bbox fallback. It never invents a standing extension
     for a track that has not first supplied a trustworthy full-body sample.
+
+    Output foot points are EMA-smoothed and mode changes need a short confirm
+    window — left/far desks often flip pose↔stand_drop and make the grid drift.
     """
 
-    def __init__(self, sit_confirm: int = 3, max_history_age: int = 40) -> None:
+    def __init__(
+        self,
+        sit_confirm: int = 3,
+        max_history_age: int = 40,
+        mode_confirm: int = 2,
+        foot_alpha: float = 0.35,
+    ) -> None:
         self.sit_confirm = max(1, int(sit_confirm))
         self.max_history_age = max(1, int(max_history_age))
+        self.mode_confirm = max(1, int(mode_confirm))
+        self.foot_alpha = float(np.clip(foot_alpha, 0.05, 1.0))
         self._tracks: dict[int, dict] = {}
 
     @staticmethod
@@ -688,6 +719,52 @@ class PoseTrackHistory:
                 (1.0 - alpha) * old[1] + alpha * new[1],
             )
         return (1.0 - alpha) * old + alpha * new
+
+    def _finalize(
+        self,
+        state: dict,
+        foot: tuple[float, float] | None,
+        mode: str,
+        src: list[tuple[float, float]],
+    ) -> tuple[tuple[float, float] | None, str, list[tuple[float, float]]]:
+        """Stick mode briefly and EMA-smooth the accepted ground point."""
+        if foot is None:
+            # Keep last accepted foot while pose is briefly unsure (sit ramp /
+            # occlusion) so extract_foot_detections does not jump to box-bottom.
+            last = state.get("last_foot")
+            if last is not None:
+                return last, str(state.get("last_mode") or "foot"), src
+            return None, mode, src
+
+        last_mode = state.get("last_mode")
+        if last_mode is None or last_mode == mode or self.mode_confirm <= 1:
+            state["pending_mode"] = None
+            state["last_mode"] = mode
+            used = mode
+        else:
+            pending = state.get("pending_mode")
+            if pending is None or pending[0] != mode:
+                state["pending_mode"] = (mode, 1)
+                used = last_mode
+                # Hold previous foot geometry for this frame.
+                if state.get("last_raw_foot") is not None:
+                    foot = state["last_raw_foot"]
+            else:
+                n = int(pending[1]) + 1
+                if n >= self.mode_confirm:
+                    state["pending_mode"] = None
+                    state["last_mode"] = mode
+                    used = mode
+                else:
+                    state["pending_mode"] = (mode, n)
+                    used = last_mode
+                    if state.get("last_raw_foot") is not None:
+                        foot = state["last_raw_foot"]
+
+        state["last_raw_foot"] = foot
+        smoothed = self._ema(state.get("last_foot"), foot, self.foot_alpha)
+        state["last_foot"] = smoothed
+        return smoothed, used, src
 
     def resolve(
         self,
@@ -713,6 +790,10 @@ class PoseTrackHistory:
                 "torso": None,
                 "hip_to_foot": None,
                 "shoulder_to_foot": None,
+                "last_foot": None,
+                "last_raw_foot": None,
+                "last_mode": None,
+                "pending_mode": None,
             },
         )
         state["history_age"] += 1
@@ -765,13 +846,24 @@ class PoseTrackHistory:
         if sit_evidence:
             if state["sit_hits"] >= self.sit_confirm and hips is not None:
                 hx = min(max(hips[0], x1), x2)
-                return (hx, float(y2)), "seat", [hips]
-            return None, "foot", []
+                return self._finalize(state, (hx, float(y2)), "seat", [hips])
+            # Still sitting-ish: prefer hip+box-bottom over None→auto foot jump.
+            if hips is not None:
+                hx = min(max(hips[0], x1), x2)
+                return self._finalize(state, (hx, float(y2)), "seat", [hips])
+            return self._finalize(state, None, "foot", [])
+
+        # Mid-frame: desk occlusion zone. Prefer hip + box bottom over ankles
+        # (table-edge fakes) and over stand_drop (through-table extrapolation).
+        mid_desk = y2 < 0.72 * float(frame_h)
+        if mid_desk and hips is not None:
+            hx = min(max(hips[0], x1), x2)
+            return self._finalize(state, (hx, float(y2)), "seat", [hips])
 
         if full_body and ankle is not None:
             ax = min(max(ankle[0], x1), x2)
             ay = min(max(ankle[1], y1), float(frame_h - 1))
-            return (ax, ay), "pose", []
+            return self._finalize(state, (ax, ay), "pose", [])
 
         usable_history = (
             state["full_hits"] >= 2
@@ -795,16 +887,16 @@ class PoseTrackHistory:
             if foot is not None and src is not None:
                 fx = min(max(foot[0], x1), x2)
                 fy = min(max(foot[1], y2), float(frame_h - 1))
-                return (fx, fy), "stand_drop", [src]
+                return self._finalize(state, (fx, fy), "stand_drop", [src])
 
         # Trust a current ankle only when it resembles a complete visible leg.
         if ankle is not None and legs_cut is False:
             ax = min(max(ankle[0], x1), x2)
             ay = min(max(ankle[1], y1), float(frame_h - 1))
-            return (ax, ay), "pose", []
+            return self._finalize(state, (ax, ay), "pose", [])
 
-        # No trustworthy history: explicitly decline to extrapolate.
-        return None, "foot", []
+        # No trustworthy history: keep last foot if any, else decline.
+        return self._finalize(state, None, "foot", [])
 
 
 def pose_ground_from_keypoints(
@@ -924,7 +1016,7 @@ def is_plausible_person_box(
     min_h_ratio: float = 0.06,
     min_aspect: float = 0.8,
     min_bottom_ratio: float = 0.12,
-    max_aspect: float = 4.5,
+    max_aspect: float = 6.5,
 ) -> bool:
     """Drop only obvious non-person fragments (hands / top-of-frame monitors).
 
@@ -934,9 +1026,9 @@ def is_plausible_person_box(
     bh = max(1.0, y2 - y1)
     if bh < min_h_ratio * frame_h:
         return False
-    if bh < 80:
+    if bh < 56:
         return False
-    if bw < max(40, 0.02 * frame_w):
+    if bw < max(36, 0.015 * frame_w):
         return False
     aspect = bh / bw
     if aspect < min_aspect:
@@ -945,7 +1037,7 @@ def is_plausible_person_box(
         return False
     if y2 < min_bottom_ratio * frame_h:
         return False
-    if (bw * bh) < 0.004 * frame_w * frame_h:
+    if (bw * bh) < 0.0015 * frame_w * frame_h:
         return False
     return True
 
@@ -1497,6 +1589,51 @@ def draw_multi_grid(cells: set[tuple[int, int]], valid_xmin: float) -> np.ndarra
     return base
 
 
+def _box_contain_frac(
+    outer: tuple[float, float, float, float],
+    inner: tuple[float, float, float, float],
+) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in outer]
+    bx1, by1, bx2, by2 = [float(v) for v in inner]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0.0:
+        return 0.0
+    ba = max(1.0, (bx2 - bx1) * (by2 - by1))
+    return inter / ba
+
+
+def drop_parent_person_blobs(dets: list[dict]) -> list[dict]:
+    """Drop a huge box that already contains another person detection.
+
+    Crowded frames often yield one mega-box around two people plus the
+    individual boxes. Keeping the blob hides everyone inside it.
+    """
+    n = len(dets)
+    if n < 2:
+        return dets
+    boxes = [d["xyxy"] for d in dets]
+    areas = [
+        max(1.0, (b[2] - b[0]) * (b[3] - b[1]))
+        for b in boxes
+    ]
+    keep = [True] * n
+    for i in range(n):
+        for j in range(n):
+            if i == j or not keep[j]:
+                continue
+            if areas[i] < 1.8 * areas[j]:
+                continue
+            if areas[j] < 0.18 * areas[i]:
+                # Tiny fragment inside a person (head/hand), not a second body.
+                continue
+            if _box_contain_frac(boxes[i], boxes[j]) >= 0.75:
+                keep[i] = False
+                break
+    return [d for d, k in zip(dets, keep) if k]
+
+
 def detect_and_locate(
     frame: np.ndarray,
     model: YOLO,
@@ -1512,6 +1649,7 @@ def detect_and_locate(
     track: bool = True,
     tracker: str | None = None,
     imgsz: int = 640,
+    iou: float = 0.85,
     out_margin: float = 45.0,
     kpt_conf: float = 0.35,
     stand_drop_ratio: float = 1.7,
@@ -1519,8 +1657,9 @@ def detect_and_locate(
     pose_history: PoseTrackHistory | None = None,
 ) -> tuple[list[dict], float, float]:
     t0 = time.perf_counter()
-    infer_kw = dict(conf=conf, classes=[0], imgsz=imgsz, verbose=False)
+    infer_kw = dict(conf=conf, classes=[0], imgsz=imgsz, verbose=False, iou=iou)
     if track:
+        _activate_new_tracks_immediately()
         results = model.track(
             frame,
             persist=True,
@@ -1569,11 +1708,16 @@ def detect_and_locate(
             or wx > 530.0 + out_margin * 2
             or wy > 540.0 + out_margin * 2
         )
-        elevated = y2 < 0.50 * frame_h
-        if far_out and elevated:
+        # Wall monitors / bad feet land far outside. Keep near-edge snap, but
+        # drop gross OUT points that made Stable-ID teleport on test/test4.
+        if far_out and (wy < -100.0 or wx < -100.0 or wy > 650.0 or wx > 650.0):
+            continue
+        # Wall monitors sit in the top band. Far seated classmates are lower
+        # (y2 ≈ 0.43–0.55) but their box-bottom homography often lands OUT.
+        if far_out and y2 < 0.38 * frame_h:
             continue
         cleaned.append(det)
-    dets = cleaned
+    dets = drop_parent_person_blobs(cleaned)
     locate_ms = (time.perf_counter() - t1) * 1000.0
     return dets, detect_ms, locate_ms
 
@@ -1724,8 +1868,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--conf",
         type=float,
-        default=0.45,
-        help="YOLO confidence (default 0.45; lower to 0.1 keeps more seated/far people, "
+        default=0.35,
+        help="YOLO confidence (default 0.35; lower to 0.1 keeps more seated/far people, "
         "higher drops monitors and door-edge fragments)",
     )
     p.add_argument(
@@ -1881,6 +2025,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="YOLO inference size (default 640; higher is slower)",
     )
     p.add_argument(
+        "--iou",
+        type=float,
+        default=0.85,
+        help="NMS IoU (default 0.85; higher keeps overlapping people in a crowd, "
+        "lower merges them into one box)",
+    )
+    p.add_argument(
         "--realtime",
         dest="realtime",
         action="store_true",
@@ -1921,8 +2072,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--id-max-dist",
         type=float,
-        default=400.0,
-        help="cap on floor rematch distance (cm)",
+        default=800.0,
+        help="cap on floor rematch distance (cm; default 800 ≈ walk across the room)",
     )
     p.add_argument(
         "--id-max-gap",
@@ -2091,6 +2242,7 @@ def main(
         track=args.track and not is_image,
         tracker=str(tracker_path),
         imgsz=args.imgsz,
+        iou=args.iou,
         out_margin=args.out_margin,
         kpt_conf=args.kpt_conf,
         stand_drop_ratio=args.stand_drop_ratio,
