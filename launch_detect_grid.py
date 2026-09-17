@@ -62,8 +62,6 @@ class Launcher(tk.Tk):
         record_path: str | None = None,
         auto_run: bool = False,
         max_seconds: float = 0,
-        screenshot_path: str | None = None,
-        screenshot_min_ids: int = 0,
     ) -> None:
         super().__init__()
         self.title("detect_grid launcher GUI")
@@ -75,7 +73,6 @@ class Launcher(tk.Tk):
         self._grid: np.ndarray | None = None
         self._paint_scheduled = False
         self._photo_grid: ImageTk.PhotoImage | None = None
-        self._photo_video: ImageTk.PhotoImage | None = None
         self._quit_after_run = False
 
         self.source_kind = tk.StringVar(value="file")
@@ -105,13 +102,8 @@ class Launcher(tk.Tk):
         self._record_path = record_path
         self._record_writer: cv2.VideoWriter | None = None
         self._record_size: tuple[int, int] | None = None
-        self._screenshot_path = screenshot_path
-        self._screenshot_min_ids = max(0, int(screenshot_min_ids))
-        self._screenshot_saved = False
-        if record_path or auto_run or screenshot_path:
+        if record_path or auto_run:
             self.geometry("1400x900")
-        if screenshot_path:
-            self.after(200, self._layout_screenshot_panes)
         if record_path:
             self.after(300, self._record_tick)
         if auto_run:
@@ -119,139 +111,41 @@ class Launcher(tk.Tk):
         if max_seconds > 0:
             self.after(int(900 + max_seconds * 1000), self._stop)
 
-    def _layout_screenshot_panes(self) -> None:
-        """Match the original README shot: grid ~40%, video ~60%."""
-        self.update_idletasks()
-        try:
-            self.views.sashpos(0, 560)
-        except tk.TclError:
-            pass
-
-    def _grab_printwindow(self) -> np.ndarray | None:
-        """Capture this Tk toplevel via Win32 PrintWindow (avoids lock-screen grabs)."""
-        if sys.platform != "win32":
-            return None
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.windll.user32
-        gdi32 = ctypes.windll.gdi32
-        hwnd = int(self.winfo_id())
-        # Climb to the real toplevel HWND Tk owns.
-        GA_ROOT = 2
-        root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
-        rect = wintypes.RECT()
-        if not user32.GetWindowRect(root, ctypes.byref(rect)):
-            return None
-        w = int(rect.right - rect.left)
-        h = int(rect.bottom - rect.top)
-        if w < 32 or h < 32:
-            return None
-        hdc_screen = user32.GetDC(0)
-        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-        hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
-        old = gdi32.SelectObject(hdc_mem, hbmp)
-        # PW_RENDERFULLCONTENT = 2 (Win8.1+)
-        ok = user32.PrintWindow(root, hdc_mem, 2)
-        if not ok:
-            ok = user32.PrintWindow(root, hdc_mem, 0)
-        buf_len = w * h * 4
-        buf = ctypes.create_string_buffer(buf_len)
-        class BITMAPINFOHEADER(ctypes.Structure):
-            _fields_ = [
-                ("biSize", wintypes.DWORD),
-                ("biWidth", wintypes.LONG),
-                ("biHeight", wintypes.LONG),
-                ("biPlanes", wintypes.WORD),
-                ("biBitCount", wintypes.WORD),
-                ("biCompression", wintypes.DWORD),
-                ("biSizeImage", wintypes.DWORD),
-                ("biXPelsPerMeter", wintypes.LONG),
-                ("biYPelsPerMeter", wintypes.LONG),
-                ("biClrUsed", wintypes.DWORD),
-                ("biClrImportant", wintypes.DWORD),
-            ]
-
-        bmi = BITMAPINFOHEADER()
-        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.biWidth = w
-        bmi.biHeight = -h  # top-down
-        bmi.biPlanes = 1
-        bmi.biBitCount = 32
-        bmi.biCompression = 0
-        gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bmi), 0)
-        gdi32.SelectObject(hdc_mem, old)
-        gdi32.DeleteObject(hbmp)
-        gdi32.DeleteDC(hdc_mem)
-        user32.ReleaseDC(0, hdc_screen)
-        if not ok:
-            return None
-        bgra = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
-        bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
-        # Crop to client area so README shots match the original 1400x900 layout
-        # (no Windows title bar).
-        client = wintypes.RECT()
-        if user32.GetClientRect(root, ctypes.byref(client)):
-            pt = wintypes.POINT(0, 0)
-            if user32.ClientToScreen(root, ctypes.byref(pt)):
-                cx = max(0, int(pt.x - rect.left))
-                cy = max(0, int(pt.y - rect.top))
-                cw = int(client.right - client.left)
-                ch = int(client.bottom - client.top)
-                if cw >= 32 and ch >= 32 and cy + ch <= h and cx + cw <= w:
-                    bgr = bgr[cy : cy + ch, cx : cx + cw]
-        return bgr
-
-    @staticmethod
-    def _looks_like_gui(frame: np.ndarray) -> bool:
-        """Reject lock-screen / blank grabs."""
-        if frame is None or frame.size == 0:
-            return False
-        h, w = frame.shape[:2]
-        if h < 600 or w < 900:
-            return False
-        # Control chrome near top should be light gray, not vivid blue wallpaper.
-        top = frame[:120].astype(np.float32)
-        mean = top.mean(axis=(0, 1))  # BGR
-        if mean[0] > 140 and mean[2] < 90:  # blue-dominant lock screen
-            return False
-        # Bottom half should have some contrast once panels paint.
-        bot = frame[h // 2 :]
-        if float(bot.std()) < 8.0:
-            return False
-        return True
-
     def _grab_window_bgr(self) -> np.ndarray | None:
         from PIL import ImageGrab
 
         self.update_idletasks()
-        try:
-            self.lift()
-            self.focus_force()
-        except tk.TclError:
-            pass
-        printed = self._grab_printwindow()
-        if printed is not None and self._looks_like_gui(printed):
-            return printed
         x = int(self.winfo_rootx())
         y = int(self.winfo_rooty())
         w = int(self.winfo_width())
         h = int(self.winfo_height())
         if w < 32 or h < 32:
             return None
-        img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+        img = None
+        try:
+            img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+        except OSError:
+            img = None
+        if img is None:
+            try:
+                import ctypes
+
+                hwnd = ctypes.windll.user32.GetAncestor(int(self.winfo_id()), 2)
+                img = ImageGrab.grab(window=int(hwnd or self.winfo_id()))
+            except OSError:
+                return None
         rgb = np.array(img)
         if rgb.size == 0:
             return None
-        frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        if not self._looks_like_gui(frame):
-            return None
-        return frame
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
     def _record_tick(self) -> None:
         if not self._record_path:
             return
-        frame = self._grab_window_bgr()
+        try:
+            frame = self._grab_window_bgr()
+        except OSError:
+            frame = None
         if frame is not None:
             h, w = frame.shape[:2]
             if self._record_writer is None:
@@ -542,45 +436,6 @@ class Launcher(tk.Tk):
         line = text.strip()
         if line:
             self.after(0, self.status.set, line.replace("\n", "  "))
-            self.after(0, self._maybe_save_screenshot_from_status, line)
-
-    @staticmethod
-    def _count_ids_in_status(line: str) -> int:
-        tail = line.split("→")[-1] if "→" in line else line.split("->")[-1]
-        found: set[int] = set()
-        for token in tail.replace(",", " ").split():
-            if token.startswith("ID") and token[2:].isdigit():
-                found.add(int(token[2:]))
-        return len(found)
-
-    def _maybe_save_screenshot_from_status(self, line: str) -> None:
-        if self._screenshot_saved or not self._screenshot_path:
-            return
-        need = self._screenshot_min_ids
-        if need > 0 and self._count_ids_in_status(line) < need:
-            return
-        if need <= 0 and self._vis is None:
-            return
-        self.update_idletasks()
-        self.after(400, self._write_screenshot)
-
-    def _write_screenshot(self) -> None:
-        if self._screenshot_saved or not self._screenshot_path:
-            return
-        # Ensure panels are painted before grab.
-        self._paint()
-        self.update_idletasks()
-        self.update()
-        frame = self._grab_window_bgr()
-        if frame is None:
-            return
-        path = Path(self._screenshot_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(path), frame)
-        self._screenshot_saved = True
-        self.status.set(f"已存截圖：{path}")
-        self._stop()
-        self.after(400, self.destroy)
 
     def _push_frame(self, vis: np.ndarray, grid: np.ndarray) -> None:
         self._vis = vis.copy()
@@ -713,13 +568,6 @@ def parse_launcher_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--auto-run", action="store_true", help="開啟後自動 Run（預設 test4）")
     p.add_argument("--record", default="", help="把整個啟動視窗錄成 mp4")
     p.add_argument("--max-seconds", type=float, default=0, help="自動 Run 後最多跑幾秒（0=整支影片）")
-    p.add_argument("--screenshot", default="", help="存一張啟動視窗截圖後結束")
-    p.add_argument(
-        "--screenshot-min-ids",
-        type=int,
-        default=0,
-        help="截圖前 status 至少要有幾個 Stable-ID（0=有畫面就存）",
-    )
     return p.parse_args(argv)
 
 
@@ -736,10 +584,8 @@ def main() -> None:
         record_path=args.record or None,
         auto_run=args.auto_run,
         max_seconds=args.max_seconds,
-        screenshot_path=args.screenshot or None,
-        screenshot_min_ids=args.screenshot_min_ids,
     )
-    app._quit_after_run = bool(args.record or args.screenshot)
+    app._quit_after_run = bool(args.record)
     app.mainloop()
 
 
