@@ -177,7 +177,20 @@ class Launcher(tk.Tk):
         if not ok:
             return None
         bgra = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
-        return cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
+        bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
+        # Crop to client area so README shots match the original 1400x900 layout
+        # (no Windows title bar).
+        client = wintypes.RECT()
+        if user32.GetClientRect(root, ctypes.byref(client)):
+            pt = wintypes.POINT(0, 0)
+            if user32.ClientToScreen(root, ctypes.byref(pt)):
+                cx = max(0, int(pt.x - rect.left))
+                cy = max(0, int(pt.y - rect.top))
+                cw = int(client.right - client.left)
+                ch = int(client.bottom - client.top)
+                if cw >= 32 and ch >= 32 and cy + ch <= h and cx + cw <= w:
+                    bgr = bgr[cy : cy + ch, cx : cx + cw]
+        return bgr
 
     @staticmethod
     def _looks_like_gui(frame: np.ndarray) -> bool:
@@ -539,7 +552,7 @@ class Launcher(tk.Tk):
         if need <= 0 and self._vis is None:
             return
         self.update_idletasks()
-        self.after(150, self._write_screenshot)
+        self.after(400, self._write_screenshot)
 
     def _write_screenshot(self) -> None:
         if self._screenshot_saved or not self._screenshot_path:
