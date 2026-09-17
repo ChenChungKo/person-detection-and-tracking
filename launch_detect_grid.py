@@ -121,7 +121,19 @@ class Launcher(tk.Tk):
         h = int(self.winfo_height())
         if w < 32 or h < 32:
             return None
-        img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+        img = None
+        try:
+            img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+        except OSError:
+            img = None
+        if img is None:
+            try:
+                import ctypes
+
+                hwnd = ctypes.windll.user32.GetAncestor(int(self.winfo_id()), 2)
+                img = ImageGrab.grab(window=int(hwnd or self.winfo_id()))
+            except OSError:
+                return None
         rgb = np.array(img)
         if rgb.size == 0:
             return None
@@ -130,7 +142,10 @@ class Launcher(tk.Tk):
     def _record_tick(self) -> None:
         if not self._record_path:
             return
-        frame = self._grab_window_bgr()
+        try:
+            frame = self._grab_window_bgr()
+        except OSError:
+            frame = None
         if frame is not None:
             h, w = frame.shape[:2]
             if self._record_writer is None:
