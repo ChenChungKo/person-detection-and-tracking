@@ -29,7 +29,7 @@ python launch_detect_grid.py
 ```
 
 <p align="center">
-  <img src="test/demo_gui_launcher.jpg" alt="detect_grid launcher GUI（test4，5 個 Stable-ID）" width="100%" />
+  <img src="test/demo_gui.jpg" alt="detect_grid launcher GUI（test4，5 個 Stable-ID）" width="100%" />
 </p>
 
 ## 建議指令

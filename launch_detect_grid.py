@@ -110,12 +110,22 @@ class Launcher(tk.Tk):
         self._screenshot_saved = False
         if record_path or auto_run or screenshot_path:
             self.geometry("1400x900")
+        if screenshot_path:
+            self.after(200, self._layout_screenshot_panes)
         if record_path:
             self.after(300, self._record_tick)
         if auto_run:
             self.after(900, self._run)
         if max_seconds > 0:
             self.after(int(900 + max_seconds * 1000), self._stop)
+
+    def _layout_screenshot_panes(self) -> None:
+        """Match the original README shot: grid ~40%, video ~60%."""
+        self.update_idletasks()
+        try:
+            self.views.sashpos(0, 560)
+        except tk.TclError:
+            pass
 
     def _grab_printwindow(self) -> np.ndarray | None:
         """Capture this Tk toplevel via Win32 PrintWindow (avoids lock-screen grabs)."""
