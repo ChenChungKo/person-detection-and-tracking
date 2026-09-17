@@ -2,7 +2,7 @@
 tracker_type: bytetrack
 track_high_thresh: 0.35
 track_low_thresh: 0.1
-new_track_thresh: 0.65
+new_track_thresh: 0.35
 # Short buffer: long holds made boxes linger after people left the frame.
 # Stable-ID gallery / sticky recovers identity after longer occlusions.
 track_buffer: 30

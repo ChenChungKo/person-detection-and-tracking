@@ -80,7 +80,7 @@ class Launcher(tk.Tk):
         self.rtsp_url = tk.StringVar(value=DEFAULT_RTSP)
         self.ref = tk.StringVar(value="pose")
         self.reid_model = tk.StringVar(value="osnet_ain")
-        self.conf = tk.DoubleVar(value=0.45)
+        self.conf = tk.DoubleVar(value=0.35)
         self.stride = tk.IntVar(value=5)
         self.cell_hold = tk.IntVar(value=2)
         self.min_hits = tk.IntVar(value=16)
