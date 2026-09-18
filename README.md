@@ -257,7 +257,7 @@ python export_demo_video.py
 ## 報告
 
 - [9/18](PPT%20report/報告9_18.pdf)（[PPT](PPT%20report/報告9_18.pptx)）
-- [8/21](PPT%20report/報告8_21.pdf)
-- [8/7](PPT%20report/報告8_7.pdf)
-- [7/24](PPT%20report/報告7_24.pdf)
-- [7/10](PPT%20report/報告7_10.pdf)
+- [8/21](PPT%20report/報告8_21.pdf)（[PPT](PPT%20report/報告8_21.pptx)）
+- [8/7](PPT%20report/報告8_7.pdf)（[PPT](PPT%20report/報告8_7.pptx)）
+- [7/24](PPT%20report/報告7_24.pdf)（[PPT](PPT%20report/報告7_24.pptx)）
+- [7/10](PPT%20report/報告7_10.pdf)（[PPT](PPT%20report/報告7_10.pptx)）
