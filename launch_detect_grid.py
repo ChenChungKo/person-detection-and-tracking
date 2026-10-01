@@ -21,7 +21,10 @@ from app_paths import app_root
 ROOT = app_root()
 DEFAULT_VIDEO = ROOT / "test" / "test4.mp4"
 DEFAULT_RTSP = "rtsp://oriongo:123456789@192.168.0.200:554/stream1"
+DEFAULT_CALIB_CHESS = ROOT / "calibration" / "homography.json"
+DEFAULT_CALIB_CHARUCO = ROOT / "calibration" / "homography_charuco.json"
 DEFAULT_ERROR_COMP = ROOT / "calibration" / "homography_error_report.json"
+ERROR_COMP_CHARUCO = ROOT / "calibration" / "charuco_floor" / "error_report.json"
 
 
 def _fit_contain(bgr: np.ndarray, box_w: int, box_h: int) -> np.ndarray:
@@ -87,6 +90,7 @@ class Launcher(tk.Tk):
         self.out_margin = tk.DoubleVar(value=45.0)
         self.skeleton = tk.BooleanVar(value=True)
         self.track = tk.BooleanVar(value=True)
+        self.floor_method = tk.StringVar(value="chessboard")
         self.error_comp = tk.BooleanVar(value=DEFAULT_ERROR_COMP.exists())
         self.floor_grid = tk.BooleanVar(value=True)
         self.quiet = tk.BooleanVar(value=True)
@@ -205,6 +209,13 @@ class Launcher(tk.Tk):
 
         opts = ttk.Frame(frm)
         opts.grid(row=4, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(opts, text="校正").pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            opts, text="棋盤", variable=self.floor_method, value="chessboard", command=self._refresh_cmd
+        ).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Radiobutton(
+            opts, text="ChArUco", variable=self.floor_method, value="charuco", command=self._refresh_cmd
+        ).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Label(opts, text="腳點").pack(side=tk.LEFT)
         ttk.Combobox(
             opts, textvariable=self.ref, values=("pose", "auto", "foot", "head_drop"), width=12, state="readonly"
@@ -347,6 +358,7 @@ class Launcher(tk.Tk):
             self.reid_model,
             self.skeleton,
             self.track,
+            self.floor_method,
             self.error_comp,
             self.floor_grid,
             self.quiet,
@@ -389,11 +401,19 @@ class Launcher(tk.Tk):
             return self.rtsp_url.get().strip()
         return self.video_path.get().strip()
 
+    def _calib_paths(self) -> tuple[Path, Path]:
+        if self.floor_method.get() == "charuco":
+            return DEFAULT_CALIB_CHARUCO, ERROR_COMP_CHARUCO
+        return DEFAULT_CALIB_CHESS, DEFAULT_ERROR_COMP
+
     def _argv(self) -> list[str]:
         src = self._source()
+        calib, error_comp = self._calib_paths()
         cmd = [
             "--source",
             src,
+            "--calib",
+            str(calib),
             "--ref",
             self.ref.get(),
             "--conf",
@@ -425,7 +445,7 @@ class Launcher(tk.Tk):
         if self.review_dump.get():
             cmd.append("--review-dump")
         if self.error_comp.get():
-            cmd.extend(["--error-comp", str(DEFAULT_ERROR_COMP)])
+            cmd.extend(["--error-comp", str(error_comp)])
         return cmd
 
     def _refresh_cmd(self) -> None:
@@ -490,6 +510,13 @@ class Launcher(tk.Tk):
                 "請把 RTSP 網址裡的帳號、密碼改成攝影機真實帳密。\n"
                 "終端機若出現 401 Unauthorized，就是帳密或網址不對。",
             )
+            return
+        calib, error_comp = self._calib_paths()
+        if not calib.exists():
+            messagebox.showerror("校正", f"找不到校正檔：\n{calib}")
+            return
+        if self.error_comp.get() and not error_comp.exists():
+            messagebox.showerror("補償", f"找不到四點補償檔：\n{error_comp}")
             return
         self._stop_ev.clear()
         self._pause_ev.clear()

@@ -137,7 +137,26 @@ def parse_args() -> argparse.Namespace:
 
 
 def ask_truth() -> tuple[float, float] | None:
-    raw = input("  真實世界座標 X Y（cm，Enter 跳過此點，q 結束量測）: ").strip()
+    prompt = "真實世界座標 X Y（cm，Enter 跳過此點，q 結束量測）: "
+    if sys.stdin is not None and sys.stdin.isatty():
+        raw = input(f"  {prompt}").strip()
+    else:
+        import tkinter as tk
+        from tkinter import simpledialog
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            raw = simpledialog.askstring(
+                "真實座標",
+                "請輸入這個點的實際 X Y（cm），例如：170 405\n取消＝跳過此點",
+                parent=root,
+            )
+        finally:
+            root.destroy()
+        if raw is None:
+            return None
+        raw = raw.strip()
     if not raw:
         return None
     if raw.lower() in {"q", "quit"}:
@@ -189,9 +208,20 @@ def main() -> None:
         raise SystemExit(f"無法讀取影像：{image_path}")
 
     view, scale = resize_for_preview(image, args.max_width)
-    # (image_xy, pred_world, truth_world|None, err_cm|None)
     samples: list[dict] = []
     pending: dict | None = None
+    if args.measure_error and args.out:
+        prev_path = Path(args.out)
+        if prev_path.exists():
+            try:
+                prev = json.loads(prev_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                prev = {}
+            prev_samples = prev.get("samples") or []
+            samples = [s for s in prev_samples if s.get("error_cm") is not None]
+            if samples:
+                print(f"已載入先前 {len(samples)} 點：{prev_path}")
+
 
     win = "Verify Homography" + (" [measure error]" if args.measure_error else "")
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)

@@ -173,7 +173,12 @@ def resize_for_preview(frame: np.ndarray, max_width: int) -> np.ndarray:
     return cv2.resize(frame, (max_width, int(h * scale)), interpolation=cv2.INTER_AREA)
 
 
-def stack_demo_views(camera: np.ndarray, grid: np.ndarray, height: int = 720) -> np.ndarray:
+def stack_demo_views(
+    camera: np.ndarray,
+    grid: np.ndarray,
+    height: int = 720,
+    title: str = "",
+) -> np.ndarray:
     """Place camera and floor-grid views side by side for video export."""
 
     def fit_height(image: np.ndarray) -> np.ndarray:
@@ -184,7 +189,23 @@ def stack_demo_views(camera: np.ndarray, grid: np.ndarray, height: int = 720) ->
     left = fit_height(camera)
     right = fit_height(grid)
     separator = np.full((height, 2, 3), (40, 40, 40), dtype=np.uint8)
-    return np.hstack((left, separator, right))
+    stacked = np.hstack((left, separator, right))
+    if not title:
+        return stacked
+    bar_h = 48
+    canvas = np.zeros((stacked.shape[0] + bar_h, stacked.shape[1], 3), dtype=np.uint8)
+    canvas[bar_h:] = stacked
+    cv2.putText(
+        canvas,
+        title,
+        (12, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return canvas
 
 
 def load_homography(path: Path) -> np.ndarray:
@@ -1975,6 +1996,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="save camera + grid preview as an MP4 using this exact tracking run",
     )
     p.add_argument(
+        "--save-title",
+        default="",
+        help="optional label burned into the top-left of --save-video frames",
+    )
+    p.add_argument(
         "--no-show",
         action="store_true",
         help="do not open preview windows (useful with --save-video)",
@@ -2533,7 +2559,7 @@ def main(
                 for line in logs:
                     print(line)
             if save_path is not None:
-                demo_frame = stack_demo_views(vis, grid)
+                demo_frame = stack_demo_views(vis, grid, title=args.save_title)
                 if video_writer is None:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                     video_writer = cv2.VideoWriter(

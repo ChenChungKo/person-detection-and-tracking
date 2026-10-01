@@ -1,0 +1,107 @@
+{
+  "created_at": "2026-10-01T06:48:25.906669+00:00",
+  "calib": "calibration\\homography_charuco.json",
+  "image": "calibration\\charuco_floor\\capture.jpg",
+  "num_points": 5,
+  "mean_error_cm": 15.599844384537523,
+  "max_error_cm": 57.244527816063,
+  "median_error_cm": 4.344973386693997,
+  "samples": [
+    {
+      "image_xy": [
+        1172.25,
+        1581.75
+      ],
+      "pred_world_xy": [
+        215.36259702240523,
+        447.6689331327582
+      ],
+      "truth_world_xy": [
+        215.0,
+        450.0
+      ],
+      "error_cm": 2.3590992645943727,
+      "error_xy_cm": [
+        0.3625970224052253,
+        -2.331066867241816
+      ]
+    },
+    {
+      "image_xy": [
+        2506.5,
+        1471.5
+      ],
+      "pred_world_xy": [
+        423.74880115430835,
+        445.49805663335985
+      ],
+      "truth_world_xy": [
+        395.0,
+        495.0
+      ],
+      "error_cm": 57.244527816063,
+      "error_xy_cm": [
+        28.748801154308353,
+        -49.50194336664015
+      ]
+    },
+    {
+      "image_xy": [
+        884.25,
+        1597.5
+      ],
+      "pred_world_xy": [
+        170.37662696333237,
+        445.99483005479294
+      ],
+      "truth_world_xy": [
+        170.0,
+        450.0
+      ],
+      "error_cm": 4.022839067064313,
+      "error_xy_cm": [
+        0.3766269633323702,
+        -4.005169945207058
+      ]
+    },
+    {
+      "image_xy": [
+        1455.75,
+        1552.5
+      ],
+      "pred_world_xy": [
+        259.9243597409333,
+        445.6556850617977
+      ],
+      "truth_world_xy": [
+        260.0,
+        450.0
+      ],
+      "error_cm": 4.344973386693997,
+      "error_xy_cm": [
+        -0.07564025906668803,
+        -4.344314938202274
+      ]
+    },
+    {
+      "image_xy": [
+        1077.75,
+        938.25
+      ],
+      "pred_world_xy": [
+        216.70122107359083,
+        125.11757790390902
+      ],
+      "truth_world_xy": [
+        215.0,
+        135.0
+      ],
+      "error_cm": 10.027782388271932,
+      "error_xy_cm": [
+        1.7012210735908297,
+        -9.882422096090977
+      ]
+    }
+  ],
+  "note": "Real localization error = |H(click) - tape-measured world|. This is NOT the chessboard fit residual (mean_reproj_error_cm)."
+}
