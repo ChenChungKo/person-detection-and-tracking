@@ -2196,7 +2196,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--reid-model",
         default="osnet_ain",
-        help="Stable-ID appearance: osnet_ain / osnet / yolo26n-reid.onnx "
+        help="Stable-ID appearance: osnet_ain / osnet_ibn / osnet / yolo26n-reid.onnx "
         "(BoT-SORT short ReID is set in trackers/botsort.yaml)",
     )
     return p.parse_args(argv)

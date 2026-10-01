@@ -233,7 +233,7 @@ class Launcher(tk.Tk):
         ttk.Combobox(
             reid,
             textvariable=self.reid_model,
-            values=("osnet_ain", "osnet", "none"),
+            values=("osnet_ain", "osnet_ibn", "osnet", "none"),
             width=14,
             state="readonly",
         ).pack(side=tk.LEFT, padx=6)
