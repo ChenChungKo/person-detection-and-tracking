@@ -1885,7 +1885,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="optional homography_error_report.json; fit a world-space affine correction from measured points",
     )
-    p.add_argument("--model", default="yolo26s.pt", help="Ultralytics weights (yolo26s.pt or yolo26s-pose.pt)")
+    p.add_argument(
+        "--model",
+        default="yolo26s.pt",
+        help="Ultralytics detect weights (yolo26s.pt / yolo26m.pt / yolo26l.pt; --ref pose 另載同尺寸 *-pose.pt)",
+    )
     p.add_argument(
         "--conf",
         type=float,
