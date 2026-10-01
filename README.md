@@ -174,12 +174,21 @@ python pick_floor_marks.py --source test/test4.mp4 --frame 1
 
 ## 校正
 
-地板 Homography 兩個版本都保留、互不覆蓋。預設腳本讀 `calibration/homography.json`（目前＝**v2，原始畫面標定，未套鏡頭去畸變**）。
+地板 Homography 三個版本都保留、互不覆蓋。預設腳本讀 `calibration/homography.json`（目前＝**v2，原始畫面標定，未套鏡頭去畸變**）。啟動 GUI 的「校正」可改選 **v3 ChArUco**，仍不會覆寫這份預設檔。
 
 | 版本 | 檔案 | 作法 | 備註 |
 |------|------|------|------|
 | **v1** | `calibration/homography_v1_manual.json` | 手動點磁磚角（`calibrate_boundary.py`） | 點擊量測誤差約 **8.9 cm** |
 | **v2** | `calibration/homography_v2_chessboard.json` | 地板大棋盤自動角點 | 目前預設；點擊量測約 **3.8 cm** |
+| **v3** | `calibration/homography_charuco.json` | 地板 ChArUco 交點（`calibrate_charuco_floor.py`） | 試驗用，不取代 v2；板子附近約 **2 cm**。完整入鏡時與棋盤同屬平面 Homography |
+
+### 四點實測補償（日常有在用）
+
+Homography 在棋盤附近準，離板子遠（尤其近端右側）會有系統性偏差。用 `verify_homography.py --measure-error` 在地上量 4 個已知點，存成 `calibration/homography_error_report.json`，定位時加 `--error-comp`：先 Homography，再世界座標 affine。
+
+在這 4 個點上，平均約 **32 cm → 6 cm**（最大約 **90 → 10 cm**）。格子一格約 45 cm，中間走道常常還是同一格，右側／外推比較看得出差。補償修的是 Homography，**不能**修桌後遮擋造成的腳點亂跳。`verify_homography.py` 也可加同一份 `--error-comp`，點擊時看補償後座標。
+
+v3 ChArUco 用另一份 `calibration/charuco_floor/error_report.json`（5 點）；不要把 v2 的補償套到 v3 上。
 
 ### 四點實測補償（日常有在用）
 
@@ -213,6 +222,10 @@ python verify_homography.py --measure-error --image calibration/chessboard_floor
 # v2 棋盤（先 capture 再 calibrate；不要讓它自動套內參）
 python calibrate_chessboard_floor.py capture --source "rtsp://帳號:密碼@攝影機IP:554/stream1"
 python calibrate_chessboard_floor.py calibrate --image calibration/chessboard_floor/capture.jpg --origin-x 190 --origin-y 400 --out calibration/homography_v2_chessboard.json
+
+# v3 ChArUco（寫 homography_charuco.json，不覆蓋 v2）
+python calibrate_charuco_floor.py --capture
+python verify_homography.py --measure-error --calib calibration/homography_charuco.json --image calibration/charuco_floor/capture.jpg --out calibration/charuco_floor/error_report.json
 
 # v1 手動點選
 python calibrate_boundary.py --width 530 --height 540
