@@ -82,6 +82,7 @@ class Launcher(tk.Tk):
         self.video_path = tk.StringVar(value=str(DEFAULT_VIDEO))
         self.rtsp_url = tk.StringVar(value=DEFAULT_RTSP)
         self.ref = tk.StringVar(value="pose")
+        self.yolo_model = tk.StringVar(value="yolo26s")
         self.reid_model = tk.StringVar(value="osnet_ain")
         self.conf = tk.DoubleVar(value=0.35)
         self.stride = tk.IntVar(value=5)
@@ -229,6 +230,14 @@ class Launcher(tk.Tk):
 
         reid = ttk.Frame(frm)
         reid.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
+        ttk.Label(reid, text="YOLO").pack(side=tk.LEFT)
+        ttk.Combobox(
+            reid,
+            textvariable=self.yolo_model,
+            values=("yolo26s", "yolo26m", "yolo26l"),
+            width=10,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(6, 16))
         ttk.Label(reid, text="Re-ID").pack(side=tk.LEFT)
         ttk.Combobox(
             reid,
@@ -355,6 +364,7 @@ class Launcher(tk.Tk):
             self.video_path,
             self.rtsp_url,
             self.ref,
+            self.yolo_model,
             self.reid_model,
             self.skeleton,
             self.track,
@@ -412,6 +422,8 @@ class Launcher(tk.Tk):
         cmd = [
             "--source",
             src,
+            "--model",
+            f"{self.yolo_model.get()}.pt",
             "--calib",
             str(calib),
             "--ref",

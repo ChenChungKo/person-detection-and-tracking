@@ -18,11 +18,11 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-首次偵測會下載 `yolo26s.pt`（也可改 `yolo26n.pt` / `yolo26m.pt`）。`--ref pose` 會再載入 `yolo26s-pose.pt`。
+首次偵測會下載 `yolo26s.pt`。GUI 的 YOLO 可改 `yolo26m` / `yolo26l`（指令 `--model yolo26m.pt`）；`--ref pose` 會自動配對同尺寸的 `*-pose.pt`。日常預設仍是 s。
 
 ## detect_grid launcher GUI
 
-圖形啟動頁：選本機影片或 RTSP、用拉桿或輸入框改參數，按 Run 後左格子、右監視器。
+圖形啟動頁：選本機影片或 RTSP、YOLO 尺寸（s/m/l，預設 s）與 Re-ID、用拉桿或輸入框改參數，按 Run 後左格子、右監視器。
 
 ```powershell
 python launch_detect_grid.py
