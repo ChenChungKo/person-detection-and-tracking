@@ -1,6 +1,6 @@
 ﻿# person-detection-and-tracking
 
-Tapo C230 監視器：偵測人、給穩定 ID、把腳點投到預先規劃的地板格子。原理與限制請參考 [說明書.md](說明書.md)。
+Tapo C230 監視器：偵測人、給穩定 ID、把腳點投到預先規劃的地板格子。原理與限制請參考 [說明書.md](說明書.md)。英文步驟：[English.md](English.md)。
 
 ![系統架構圖](picture/架構圖.png)
 
