@@ -209,6 +209,7 @@ For the single-person clip `test/test.mp4`, set foot ref to `auto`.
 - Full English notes: [Manual.md](Manual.md)
 - Full Chinese notes: [說明書.md](說明書.md)
 - Chinese steps: [README.md](README.md)
+- [10/2](PPT%20report/報告10_2.pdf) ([PPT](PPT%20report/報告10_2.pptx))
 - [9/18](PPT%20report/報告9_18.pdf) ([PPT](PPT%20report/報告9_18.pptx))
 - [8/21](PPT%20report/報告8_21.pdf) ([PPT](PPT%20report/報告8_21.pptx))
 - [8/7](PPT%20report/報告8_7.pdf) ([PPT](PPT%20report/報告8_7.pptx))
