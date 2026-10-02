@@ -1,5 +1,13 @@
 ﻿# Runtime used for this handoff: Python 3.14.x, Windows, torch CPU build (2.13.0+cpu).
-# First detection run still downloads model weights (yolo26*.pt, OSNet) separately.
+#
+# Model weights are NOT listed here on purpose:
+# - This file is only for pip packages (`pip install -r requirements.txt`).
+# - Weights are large binary files (*.pt / *.pth), not Python packages.
+# - They are gitignored and not shipped in the repo.
+# - First detection run downloads them automatically:
+#     yolo26s.pt, yolo26s-pose.pt  (ultralytics; GUI m/l download matching sizes)
+#     OSNet AIN / IBN / x1.0       (torchreid / Hugging Face when Re-ID is enabled)
+# - After download they usually sit in the project root or the torchreid cache.
 
 # Core vision / detection
 opencv-python==5.0.0.93
