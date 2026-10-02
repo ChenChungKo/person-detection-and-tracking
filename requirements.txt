@@ -1,12 +1,31 @@
-﻿opencv-python==5.0.0.93
+﻿# Runtime used for this handoff: Python 3.14.x, Windows, torch CPU build (2.13.0+cpu).
+# First detection run still downloads model weights (yolo26*.pt, OSNet) separately.
+
+# Core vision / detection
+opencv-python==5.0.0.93
 numpy==2.5.1
 ultralytics==8.4.95
+ultralytics-thop==2.0.20
 pillow==12.3.0
-onnxruntime>=1.17.0
-onnx>=1.15.0
-# OSNet Re-ID (optional backend via --reid-model osnet)
-torchreid>=0.2.5
-scipy>=1.11.0
-gdown>=5.0.0
-huggingface_hub>=0.20.0
-tensorboard>=2.14.0
+torch==2.13.0
+torchvision==0.28.0
+lap==0.5.13
+
+# OSNet Re-ID (--reid-model osnet_ain / osnet_ibn / osnet)
+torchreid==0.2.5
+scipy==1.18.0
+gdown==6.1.0
+huggingface_hub==1.26.0
+
+# Optional export / tooling pulled by the stack above
+onnx==1.22.0
+onnxruntime==1.28.0
+tensorboard==2.21.0
+
+# Common ultralytics transitive deps (pinned for reproducibility)
+matplotlib==3.11.0
+PyYAML==6.0.3
+requests==2.34.2
+tqdm==4.70.0
+psutil==7.2.2
+polars==1.42.1
