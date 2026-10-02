@@ -24,6 +24,8 @@ from app_paths import app_root
 DEFAULT_CALIB = app_root() / "calibration" / "homography.json"
 DEFAULT_IMAGE = app_root() / "test" / "static_frame.jpg"
 DEFAULT_OUT = app_root() / "test" / "grid_lit_preview.jpg"
+FLOOR_GRID_JSON = app_root() / "calibration" / "floor_grid.json"
+FLOOR_GRID_IMAGE = app_root() / "test" / "floor_grid_generated.jpg"
 
 # Windows TTF for crisp labels (OpenCV putText is blurry on many displays)
 _FONT_REGULAR: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None
@@ -62,28 +64,116 @@ def _pil_to_bgr(pil_img: Image.Image) -> np.ndarray:
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
+def axis_edges(
+    total: float,
+    n: int,
+    first: float | None = None,
+    last: float | None = None,
+) -> list[float]:
+    """Split ``total`` cm into ``n`` cells. Middle cells are equal.
+
+    - both ``first``/``last`` omitted: all cells equal
+    - only ``first`` (or only ``last``): that end is fixed, the rest equal
+    - both set: head and tail fixed, middle ``n-2`` cells equal
+    """
+    if n < 1:
+        raise ValueError("格數至少 1")
+    if total <= 0:
+        raise ValueError("總長須為正")
+    if first is not None and first <= 0:
+        raise ValueError("頭格須為正")
+    if last is not None and last <= 0:
+        raise ValueError("尾格須為正")
+    if n == 1:
+        if first is not None and abs(first - total) > 1e-6:
+            raise ValueError("只有 1 格時頭格須等於總長")
+        if last is not None and abs(last - total) > 1e-6:
+            raise ValueError("只有 1 格時尾格須等於總長")
+        return [0.0, float(total)]
+
+    if first is None and last is None:
+        sizes = [total / n] * n
+    elif first is not None and last is None:
+        if first >= total:
+            raise ValueError("頭格須小於總長")
+        mid = (total - first) / (n - 1)
+        if mid <= 0:
+            raise ValueError("中間格須為正")
+        sizes = [first] + [mid] * (n - 1)
+    elif first is None and last is not None:
+        if last >= total:
+            raise ValueError("尾格須小於總長")
+        mid = (total - last) / (n - 1)
+        if mid <= 0:
+            raise ValueError("中間格須為正")
+        sizes = [mid] * (n - 1) + [last]
+    elif n == 2:
+        if abs(first + last - total) > 1e-3:
+            raise ValueError(f"兩格時頭+尾須等於總長（{first:g}+{last:g}≠{total:g}）")
+        sizes = [float(first), float(last)]
+    else:
+        remain = total - first - last
+        if remain <= 0:
+            raise ValueError("頭尾加起來已超過總長，中間沒空間")
+        mid = remain / (n - 2)
+        sizes = [float(first)] + [mid] * (n - 2) + [float(last)]
+
+    edges = [0.0]
+    for size in sizes:
+        edges.append(edges[-1] + float(size))
+    edges[-1] = float(total)
+    return edges
+
+
 def x_edges() -> list[float]:
     # 0, 35, then +45 until 530
-    edges = [0.0, 35.0]
-    while edges[-1] < 530.0 - 1e-6:
-        edges.append(edges[-1] + 45.0)
-    # ensure exact end
-    if abs(edges[-1] - 530.0) > 1e-6:
-        edges[-1] = 530.0
-    return edges
+    return axis_edges(530.0, 12, first=35.0)
 
 
 def y_edges() -> list[float]:
-    edges = [0.0]
-    while edges[-1] < 540.0 - 1e-6:
-        edges.append(edges[-1] + 45.0)
-    if abs(edges[-1] - 540.0) > 1e-6:
-        edges[-1] = 540.0
-    return edges
+    return axis_edges(540.0, 12)
 
 
-X_EDGES = x_edges()
-Y_EDGES = y_edges()
+def load_floor_grid(path: Path | None = None) -> tuple[list[float], list[float]]:
+    src = path or FLOOR_GRID_JSON
+    if src.exists():
+        data = json.loads(src.read_text(encoding="utf-8"))
+        xe = [float(v) for v in data.get("x_edges") or []]
+        ye = [float(v) for v in data.get("y_edges") or []]
+        if len(xe) >= 2 and len(ye) >= 2:
+            return xe, ye
+    return x_edges(), y_edges()
+
+
+def apply_floor_grid(x: list[float], y: list[float]) -> None:
+    global X_EDGES, Y_EDGES
+    X_EDGES = [float(v) for v in x]
+    Y_EDGES = [float(v) for v in y]
+    _EMPTY_GRID_CACHE.clear()
+
+
+def save_floor_grid(
+    path: Path,
+    x: list[float],
+    y: list[float],
+    *,
+    extra: dict | None = None,
+) -> None:
+    payload = {
+        "x_edges": [round(float(v), 4) for v in x],
+        "y_edges": [round(float(v), 4) for v in y],
+        "width_cm": float(x[-1] - x[0]),
+        "height_cm": float(y[-1] - y[0]),
+        "n_cols": len(x) - 1,
+        "n_rows": len(y) - 1,
+    }
+    if extra:
+        payload.update(extra)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+X_EDGES, Y_EDGES = load_floor_grid()
 
 # Report overlay marks (world cm). No far-right point.
 MARK_NAMES: tuple[str, ...] = ("A", "B", "C", "O")
@@ -142,8 +232,10 @@ def load_floor_marks(
 
 FLOOR_MARKS = load_floor_marks()
 FLOOR_LANDMARKS = tuple(m for m in FLOOR_MARKS if m[0] != "O")
-GRID_MARGIN_L = 96
+GRID_MARGIN_L = 118
 GRID_MARGIN_T = 52
+GRID_MARGIN_R = 28
+GRID_MARGIN_B = 88
 GRID_CELL_PX = 72
 
 
@@ -336,7 +428,7 @@ _EMPTY_GRID_CACHE: dict[tuple[float, int], Image.Image] = {}
 
 
 def _empty_grid_image(valid_x_min: float, cell_px: int) -> Image.Image:
-    key = (float(valid_x_min), int(cell_px))
+    key = (float(valid_x_min), int(cell_px), tuple(X_EDGES), tuple(Y_EDGES))
     cached = _EMPTY_GRID_CACHE.get(key)
     if cached is not None:
         return cached.copy()
@@ -344,8 +436,8 @@ def _empty_grid_image(valid_x_min: float, cell_px: int) -> Image.Image:
     font, font_title = _load_fonts()
     n_cols = len(X_EDGES) - 1
     n_rows = len(Y_EDGES) - 1
-    margin_l, margin_t = 96, 52
-    margin_r, margin_b = 28, 64
+    margin_l, margin_t = GRID_MARGIN_L, GRID_MARGIN_T
+    margin_r, margin_b = GRID_MARGIN_R, GRID_MARGIN_B
     w = margin_l + n_cols * cell_px + margin_r
     h = margin_t + n_rows * cell_px + margin_b
 
@@ -373,10 +465,11 @@ def _empty_grid_image(valid_x_min: float, cell_px: int) -> Image.Image:
 
     for i, xv in enumerate(X_EDGES):
         px = margin_l + i * cell_px
-        draw.text((px - 14, h - margin_b + 8), f"{xv:g}", fill=(40, 40, 40), font=font)
+        draw.text((px - 14, h - margin_b + 6), f"{xv:g}", fill=(40, 40, 40), font=font)
     for j, yv in enumerate(Y_EDGES):
         py = margin_t + j * cell_px
-        draw.text((8, py - 10), f"{yv:g}", fill=(40, 40, 40), font=font)
+        draw.text((36, py - 10), f"{yv:g}", fill=(40, 40, 40), font=font)
+    _paste_axis_names(img, font_title, margin_l, margin_t, n_cols, n_rows, cell_px, h)
 
     draw.text(
         (margin_l, 8),
@@ -400,6 +493,45 @@ def _empty_grid_image(valid_x_min: float, cell_px: int) -> Image.Image:
         )
     _EMPTY_GRID_CACHE[key] = img
     return img.copy()
+
+
+def _paste_axis_names(
+    img: Image.Image,
+    font,
+    margin_l: int,
+    margin_t: int,
+    n_cols: int,
+    n_rows: int,
+    cell_px: int,
+    height: int,
+) -> None:
+    """Mark world axes: X along the bottom, Y down the left side."""
+    probe = ImageDraw.Draw(img)
+    xb = probe.textbbox((0, 0), "X", font=font)
+    xw, xh = xb[2] - xb[0], xb[3] - xb[1]
+    grid_w = n_cols * cell_px
+    probe.text(
+        (margin_l + (grid_w - xw) // 2, height - xh - 8),
+        "X",
+        fill=(20, 20, 20),
+        font=font,
+    )
+    yb = probe.textbbox((0, 0), "Y", font=font)
+    yw, yh = yb[2] - yb[0] + 4, yb[3] - yb[1] + 4
+    y_img = Image.new("RGBA", (yw, yh), (0, 0, 0, 0))
+    ImageDraw.Draw(y_img).text(
+        (2 - yb[0], 2 - yb[1]),
+        "Y",
+        fill=(20, 20, 20, 255),
+        font=font,
+    )
+    y_img = y_img.rotate(90, expand=True)
+    grid_h = n_rows * cell_px
+    img.paste(
+        y_img,
+        (2, margin_t + (grid_h - y_img.height) // 2),
+        y_img,
+    )
 
 
 def _draw_grid_landmarks(draw, cell_px: int) -> None:
@@ -439,8 +571,8 @@ def draw_grid(
         font_id = font_title
     n_cols = len(X_EDGES) - 1
     n_rows = len(Y_EDGES) - 1
-    margin_l, margin_t = 96, 52
-    margin_r, margin_b = 28, 64
+    margin_l, margin_t = GRID_MARGIN_L, GRID_MARGIN_T
+    margin_r, margin_b = GRID_MARGIN_R, GRID_MARGIN_B
     w = margin_l + n_cols * cell_px + margin_r
     h = margin_t + n_rows * cell_px + margin_b
 
@@ -491,10 +623,10 @@ def draw_grid(
         summary = "  ".join(parts[:8])
         if len(parts) > 8:
             summary += f"  +{len(parts) - 8}"
-        draw.text((margin_l, h - 28), summary, fill=(200, 100, 0), font=font)
+        draw.text((margin_l, h - margin_b + 30), summary, fill=(200, 100, 0), font=font)
     elif active is not None:
         draw.text(
-            (margin_l, h - 28),
+            (margin_l, h - margin_b + 30),
             cell_label(*active),
             fill=(200, 100, 0),
             font=font,

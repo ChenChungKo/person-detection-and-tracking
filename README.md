@@ -1,15 +1,25 @@
 ﻿# person-detection-and-tracking
 
-監視器畫面做人體偵測、追蹤與地板格子定位（Tapo C230 / YOLO26 / Homography）。  
-管線：`YOLO26.track` + BoT-SORT（短期）→ Stable-ID + OSNet-AIN（長期 ID）→ 腳點投到世界座標格子。畫面與格子用同一套 ID 顏色，不假設場上只有一人。
+Tapo C230 監視器：偵測人、給穩定 ID、把腳點投到預先規劃的地板格子。原理與限制請參考 [說明書.md](說明書.md)。
 
-<p align="center">
-  <img src="picture/架構圖.png" alt="系統架構圖" width="560" />
-</p>
+![系統架構圖](picture/架構圖.png)
 
-## 環境
+日常預設：棋盤 Homography v2、四點補償、YOLO26s + pose、OSNet-AIN。  
+即時管線不要去畸變。ChArUco 與手動點磚都不要直接覆蓋 `calibration/homography.json`。不要把 OSNet 寫進 `trackers/botsort.yaml`。
 
-請用專案虛擬環境 `C:\5Gjump\.venv`（VS Code：`Python: Select Interpreter` → `.venv`）。
+## demo影片
+
+示範是左監視器、右格子。主片：[test4_review.mp4](test/review_videos/test4_review.mp4)
+
+![Demo：左監視器、右格子](test/review_videos/test4_review.webp)
+
+舊版對照：[棋盤 v2](test/demo_v2_chessboard.mp4)、[手動點磚 v1](test/demo_v1_manual.mp4)。
+
+---
+
+## 1. 安裝環境
+
+用專案虛擬環境。VS Code 選 Interpreter → `.venv`。
 
 ```powershell
 cd C:\5Gjump
@@ -18,259 +28,180 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-首次偵測會下載 `yolo26s.pt`。GUI 的 YOLO 可改 `yolo26m` / `yolo26l`（指令 `--model yolo26m.pt`）；`--ref pose` 會自動配對同尺寸的 `*-pose.pt`。日常預設仍是 s。
+之後可以跑下面的腳本。第一次偵測會下載 `yolo26s.pt` 與 `yolo26s-pose.pt`。
 
-## detect_grid launcher GUI
+---
 
-圖形啟動頁：選本機影片或 RTSP、YOLO 尺寸（s/m/l，預設 s）與 Re-ID、用拉桿或輸入框改參數，按 Run 後左格子、右監視器。
+## 2. 規劃地板格子
 
-```powershell
-python launch_detect_grid.py
-```
+格子是**先在世界座標量好、切好**，不是從監視器畫面裁出來的。換廠、換機也要先量這間房的地板。虛擬左上角 `(0, 0)`（被擋住點不到也沒關係）；Y 朝相機增大。
 
-<p align="center">
-  <img src="test/demo_gui_launcher.jpg" alt="detect_grid launcher GUI（test4，5 個 Stable-ID）" width="100%" />
-</p>
-
-## 建議指令
-
-本機 `test4`（pose + OSNet-AIN + 四點補償 + A/B/C/O）：
+開 GUI，填總長、總寬、切幾格。可勾「頭尾較小，中間等分」。本場預設：X 530 cm、12 格、頭格 35 cm；Y 540 cm、12 格全等分。按預覽看圖，按儲存。
 
 ```powershell
-python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
+python make_floor_grid.py
 ```
 
-RTSP 把 `--source` 換成 `rtsp://帳號:密碼@IP:554/stream1` 即可（自動 TCP、只處理最新幀）。單人影片可用 `test/test.mp4` 並改 `--ref auto`。
+![規劃地板格子 GUI](test/demo_floor_grid_gui.jpg)
 
-按 `q` 結束，`s` 存圖。預覽寬度上限 1280，視窗可拖曳縮放。
+得到格子圖 `test/floor_grid_generated.jpg`，切法寫入 `calibration/floor_grid.json`（之後偵測與格子視窗用這份）。
 
-| 加上 | 作用 |
-|------|------|
-| `--no-pose-skeleton` | 不畫 COCO-17 骨架 |
-| `--review-dump` | 審查裁圖寫入 `test/reid_review/<開跑時間>/`（不參與即時比對；檔名 `f00160`＝第 160 幀） |
-| `--save-video 路徑.mp4 --no-show --no-realtime` | 錄左右對照影片 |
-| `--no-track` | 只要人框、不要 ID |
-| `--no-floor-grid` | 關掉地上 A/B/C/O |
-| `--realtime` / `--no-realtime` | 本機影片是否限播放速度（都不丟追蹤幀） |
+---
 
-<p align="center">
-  <img src="test/review_videos/test4_review.webp" width="100%" alt="Demo：左偵測右格子"/>
-</p>
+## 3. 舖板、校正 Homography（三種）
 
-目前主 demo：`test/review_videos/test4_review.mp4`（`test4` + pose + OSNet-AIN、`--min-hits 16`；含 dirty-crop 不發號、分身框隱藏、短漏偵防搶號、遠距 walker 不黏搶 ID）。舊版僅定位對照仍在倉庫：`test/demo_v2_chessboard.webp`、`test/demo_v1_manual.webp`。
+板子平放在地上、完整入鏡。原點是編號內角 **#0**（本場約 190, 400）；紙張近左外角約 170, 420。
 
-### 目前設定
+先寫到新檔，確認後再複製成即時用的 `calibration/homography.json`。三種互不覆蓋。**日常用棋盤。** 不要套鏡頭去畸變。
 
-| 項目 | 設定 |
-|------|------|
-| Homography | **v2**（`calibration/homography.json`，**不去畸變**） |
-| 定位補償 | `--error-comp calibration/homography_error_report.json` |
-| 鏡頭內參 | `camera_intrinsics.json` 有檔；**`detect_grid.py` 不套用** |
-| 定位對照 | A/B/C/O，見 `calibration/floor_marks.json` |
-| 偵測 | `yolo26s.pt`、`--ref pose`、`--conf 0.35`、`--cell-hold 2`（每人黏一格，見下方） |
-| 短追蹤 | BoT-SORT（`trackers/botsort.yaml`；GMC off、短 ReID off） |
-| 長期 ID | Stable-ID + `--reid-model osnet_ain`；`--min-hits 16`；`--appear-thresh 0.34` |
-| 效能 | `--stride 5`（約每秒 4 次 YOLO）；本機固定取樣、RTSP 最新幀 |
-| 審查庫 | 預設關；`--review-dump` 才寫。檔名 `fNNNNN`＝本次第幾幀，RTSP 約 20 fps（`f00160` ≈ 開跑後 8 秒） |
+### 3.1 棋盤（日常）
 
-舊校正：`--calib calibration/homography_v1_manual.json`。舊桌區灰格：`--valid-xmin 170`。舊短追蹤：`--tracker trackers/bytetrack_stable.yaml`。
+自動抓角點。偵測 GUI 的校正選「棋盤」。影像預設就是剛拍的 `calibration/chessboard_floor/capture.jpg`。
 
-## 腳點（`--ref pose`）
-
-偵測／追蹤仍用 `yolo26s.pt`，姿態另跑 `yolo26s-pose.pt`。坐姿需連續 3 次證據才當坐；站立補腳需同一 raw track 先累積至少 2 次完整站姿，之後才用該人歷史身體比例補腳。沒有歷史一律退回框底。
-
-| 情況 | 腳點 |
-|------|------|
-| 坐（連續坐姿證據） | 髖 X + 框底 |
-| 站、腳踝可見 | 腳踝 |
-| 站、下半身被擋 | 同一 ID 有完整站姿歷史才補腳；否則框底 |
-
-畫面上方圖例：綠＝座位、青＝腳踝、橘＝站立補腳、紅＝框底、紫＝推估。骨架預設開啟（`kpt-draw-conf ≥ 0.25`）；腳點顏色與骨架顏色分開。雙模型較慢，`--stride 5` 在 CPU 上仍可接近即時。
-
-預設 `--ref auto` 時：bbox 底邊中點；人被畫面裁切時改頭頂下推。
-
-## 人物 ID（Stable-ID）
-
-短追蹤在 `trackers/botsort.yaml`：固定監視器 `gmc_method: none`；`with_reid: False`（外貌交給 Stable-ID，不要把 OSNet `.pth` 寫進 yaml）；`new_track_thresh: 0.65` 減少門邊碎框開新軌。
-
-長期 ID：YOLO 框人 → 比對圖庫 → 命中沿用／連續追蹤換裝則存新原型／都沒中才發新號。
-
-- 即時圖庫 `test/reid_gallery/`：每次重跑清空；比對用記憶體向量
-- 審查庫 `test/reid_review/`：預設關；`--review-dump` 才寫裁圖（見下方）
-- 圖庫只收乾淨、低重疊框
-- 回場：OSNet 仍像同一人（含換外套）→ 沿用。從畫面**邊緣**離開後，外貌低且衣服差很多 → 不因「只剩一個空號」收回，等 `--min-hits` 後發新號。桌後漏檢仍接回、不發新號
-- 陌生軌先隔離再發號；雙框合併留舊號；室內漏檢約 1.2 秒；貼邊立刻清除殘框
-- `--min-hits 16`、`--stride 5`、約 20 fps → 開頭約 4 秒才出現第一個新號（已登錄的人再出現不必再等）。ID 變化會印 `[ID-CHANGE]`
-- 發號外貌是凍結錨（不跟 EMA 被帶偏）。現況既不像錨、世界座標又跳太遠 → 還原原型並暫時取消該 ID（對應 HMP 長期記憶 + ID-switch 還原）
-
-### 審查庫檔名
-
-路徑：`test/reid_review/<開跑時間>/ID001/f00160.jpg`。只給人看，不寫回即時向量。
-
-`f00160` **不是** 1 分 60 秒，是**這次開跑後的第 160 幀**。時間從按下開始、第一張畫面進來算起。
-
-```
-秒數 ≈ 幀號 ÷ fps
-```
-
-| 來源 | fps | `f00160` | `f00200` | `f01200` |
-|------|-----|----------|----------|----------|
-| RTSP（Stable-ID 固定按 20 fps 算） | 20 | 8.0 秒 | 10.0 秒 | 1 分 0 秒 |
-| 本機影片 | 檔案標示的 FPS | 160 ÷ 該 fps | 200 ÷ 該 fps | 1200 ÷ 該 fps |
-
-預設 `--review-every 10`：每個已發號的 ID 固定在第 10、20、30…幀各存一張（約 20 fps 時 0.5 秒一張）。漏標就空掉那一格，後面檔名仍對齊卡點，不會變成 211、221。沒有穩定 ID 的 `person` 不存。
-
-## 跳幀、即時與格子防抖
-
-| 機制 | 目的 | 行為 |
-|------|------|------|
-| `--stride N`（預設 5） | 降低運算量 | 每 N 幀跑一次 YOLO；中間幀沿用並預測跟上。格子標 `cached` 代表沿用 |
-| `LatestFrameCapture` | RTSP 降低落後感 | 推論慢時丟緩衝區舊幀，永遠處理最新畫面。本機 `.mp4` **不**啟用 |
-| `--cell-hold N`（預設 2） | 有 ID 就亮、格線上不閃 | 格子跟**人**黏，不是整格投票。詳見下一節 |
-
-本機影片固定處理第 `1, 1+stride, 1+2×stride, …` 幀，同一支影片重跑 ID 才對得上。`--realtime`（預設開）只限制播放不超過來源 FPS，推論慢時會變慢，但不會為了搶時間軸而丟追蹤幀。
-
-### 格子為何曾忽暗忽亮（`--cell-hold`）
-
-左邊人框／ID 是「這次有人就畫」。右邊格子以前是「哪一格連續 N 次偵測都有人」才亮、都沒人才滅，畫的時候還要 **當下腳點 ∩ 已確認格子**。
-
-人站在格線上時，腳點會在相鄰兩格（A、B）之間跳：
-
-| | 舊方法（整格投票） | 現在（每個 ID 黏一格） |
-|--|-------------------|------------------------|
-| 第一次算到格子 | 要連續 2 次才亮 → 已有 ID，格子還可能是黑的 | 立刻亮 |
-| 腳在 A、B 間晃 | 這一拍腳在 B、已確認卻是 A → 兩格都對不上 → **整格先滅** | 維持上一格 |
-| `--cell-hold 1` | 格子完全跟當下腳點 → 左右格對閃 | 關掉黏住，同樣會對閃 |
-
-請保持 **`--cell-hold 2`**（GUI 預設也是 2）。不要為了「比較快亮」改成 1。
-
-真的走過去：連續 2 次 YOLO 都在隔壁才換格。跨兩格以上（不是緊鄰）立刻換。中間漏算一拍先留燈，連續兩次都沒格子才滅。腳點算出地板外（`cell` 為空）仍會暗，那是定位沒落在地圖上，不是跨線閃爍。
-
-`test4` 建議指令維持：
+拍一張：
 
 ```powershell
-python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
+python calibrate_chessboard_floor.py capture --source "rtsp://帳號:密碼@IP:554/stream1"
 ```
 
-## 定位對照（A/B/C/O）
+用原點 (190, 400) 計算，先存新檔：
 
-相機與右側格子畫同一組地上點（人框只標 ID）。不含遠右角，避免投到桌子／家具上。座標在 `calibration/floor_marks.json`。
+```powershell
+python calibrate_chessboard_floor.py calibrate --origin-x 190 --origin-y 400 --out calibration/homography_v2_chessboard.json
+```
 
-| 點 | 世界座標 (cm) | 位置 |
-|----|----------------|------|
-| **A** | (170, 450) | 近左 |
-| **B** | (170, 180) | 遠左 |
-| **C** | (440, 450) | 近右 |
-| **O** | (260, 315) | 走道中心 |
+角點圖上的原點 #0 位置正確後，再覆蓋偵測實際讀的 `homography.json`：
 
-改點時只點看得見的地面：
+```powershell
+Copy-Item calibration\homography_v2_chessboard.json calibration\homography.json
+```
+
+![棋盤角點與原點 #0](calibration/chessboard_floor/origin_marked.jpg)
+
+### 3.2 ChArUco（試驗）
+
+交點帶編號。只寫 `homography_charuco.json`，不取代棋盤。偵測 GUI 的校正選「ChArUco」才會用這份。補償用 `calibration/charuco_floor/error_report.json`，不要用棋盤那份（第 5 步）。
+
+```powershell
+python calibrate_charuco_floor.py --capture
+```
+
+得到 `calibration/homography_charuco.json`。
+
+![ChArUco 角點與原點 #0](calibration/charuco_floor/detected_corners.jpg)
+
+### 3.3 手動點磁磚角（舊法）
+
+在畫面上點看得見的地磚角，輸入該點的世界座標。誤差較大，不要當日常預設。
+
+```powershell
+python calibrate_boundary.py --width 530 --height 540 --out calibration/homography_v1_manual.json
+```
+
+得到 `homography_v1_manual.json`。
+
+![手動點選磁磚角](calibration/v1_tile_clicks.jpg)
+
+---
+
+## 4. 地上對照點
+
+Homography 做好之後，才在畫面上點看得見的地面，寫入 `calibration/floor_marks.json`。偵測畫面與格子會標這四點。
+
+
+| 點   | 世界座標 (cm)  | 位置   |
+| --- | ---------- | ---- |
+| A   | (170, 450) | 近左   |
+| B   | (170, 180) | 遠左   |
+| C   | (440, 450) | 近右   |
+| O   | (260, 315) | 走道中心 |
+
+
+依序點 A → B → C → O，按 `s` 存檔：
 
 ```powershell
 python pick_floor_marks.py --source test/static_frame.jpg
-python pick_floor_marks.py --source test/test4.mp4 --frame 1
 ```
 
-依序點 A → B → C → O，按 `s` 覆寫 `floor_marks.json`。
+![地上對照點 A B C O](test/floor_overlay_cam.jpg)
 
-## 校正
-
-地板 Homography 三個版本都保留、互不覆蓋。預設腳本讀 `calibration/homography.json`（目前＝**v2，原始畫面標定，未套鏡頭去畸變**）。啟動 GUI 的「校正」可改選 **v3 ChArUco**，仍不會覆寫這份預設檔。
-
-| 版本 | 檔案 | 作法 | 備註 |
-|------|------|------|------|
-| **v1** | `calibration/homography_v1_manual.json` | 手動點磁磚角（`calibrate_boundary.py`） | 點擊量測誤差約 **8.9 cm** |
-| **v2** | `calibration/homography_v2_chessboard.json` | 地板大棋盤自動角點 | 目前預設；點擊量測約 **3.8 cm** |
-| **v3** | `calibration/homography_charuco.json` | 地板 ChArUco 交點（`calibrate_charuco_floor.py`） | 試驗用，不取代 v2；板子附近約 **2 cm**。完整入鏡時與棋盤同屬平面 Homography |
-
-### 四點實測補償（日常有在用）
-
-Homography 在棋盤附近準，離板子遠（尤其近端右側）會有系統性偏差。用 `verify_homography.py --measure-error` 在地上量 4 個已知點，存成 `calibration/homography_error_report.json`，定位時加 `--error-comp`：先 Homography，再世界座標 affine。
-
-在這 4 個點上，平均約 **32 cm → 6 cm**（最大約 **90 → 10 cm**）。格子一格約 45 cm，中間走道常常還是同一格，右側／外推比較看得出差。補償修的是 Homography，**不能**修桌後遮擋造成的腳點亂跳。`verify_homography.py` 也可加同一份 `--error-comp`，點擊時看補償後座標。
-
-v3 ChArUco 用另一份 `calibration/charuco_floor/error_report.json`（5 點）；不要把 v2 的補償套到 v3 上。
-
-### 四點實測補償（日常有在用）
-
-Homography 在棋盤附近準，離板子遠（尤其近端右側）會有系統性偏差。用 `verify_homography.py --measure-error` 在地上量 4 個已知點，存成 `calibration/homography_error_report.json`，定位時加 `--error-comp`：先 Homography，再世界座標 affine。
-
-在這 4 個點上，平均約 **32 cm → 6 cm**（最大約 **90 → 10 cm**）。格子一格約 45 cm，中間走道常常還是同一格，右側／外推比較看得出差。補償修的是 Homography，**不能**修桌後遮擋造成的腳點亂跳。`verify_homography.py` 也可加同一份 `--error-comp`，點擊時看補償後座標。
-
-### 鏡頭內參（有檔、日常不用）
-
-A4 手持棋盤估過 Tapo C230 內參，**`detect_grid.py` 目前不讀、也不去畸變**。
-
-| 檔案 | 用途 |
-|------|------|
-| `calibration/camera_intrinsics.json` | `cv2.calibrateCamera` 內參＋畸變 |
-| `calibration/lens_frames/`、`calibration/lens_chessboard/` | 內參拍攝／棋盤圖 |
-| `calibrate_lens.py`、`make_lens_chessboard.py` | 拍幀、估內參 |
-
-試過先 `undistort` 再重估地板 H：棋盤附近略好，廣角邊緣矯正過強（A 會算出畫面外），所以沒接進即時定位。重跑 `calibrate_chessboard_floor.py calibrate` 若偵測到 `camera_intrinsics.json` 會**自動去畸變**——目前不要這樣做。
-
-### 座標系與重標
-
-- 虛擬左上角為 `(0,0)`（點不到也沒關係）
-- 地板格約 `X 0~530 cm`、`Y 0~540 cm`
-- 地磚：左側第一格 35 cm，其餘 45 cm
-- 預設不再把左側畫成淺灰桌區（`--valid-xmin 0`）；恢復舊遮罩：`--valid-xmin 170`
+在監視器地板上點一下，看右邊格子亮哪一格：
 
 ```powershell
-# 量測誤差／更新四點報告
-python verify_homography.py --measure-error --image calibration/chessboard_floor/capture.jpg
-
-# v2 棋盤（先 capture 再 calibrate；不要讓它自動套內參）
-python calibrate_chessboard_floor.py capture --source "rtsp://帳號:密碼@攝影機IP:554/stream1"
-python calibrate_chessboard_floor.py calibrate --image calibration/chessboard_floor/capture.jpg --origin-x 190 --origin-y 400 --out calibration/homography_v2_chessboard.json
-
-# v3 ChArUco（寫 homography_charuco.json，不覆蓋 v2）
-python calibrate_charuco_floor.py --capture
-python verify_homography.py --measure-error --calib calibration/homography_charuco.json --image calibration/charuco_floor/capture.jpg --out calibration/charuco_floor/error_report.json
-
-# v1 手動點選
-python calibrate_boundary.py --width 530 --height 540
-python verify_homography.py
+python grid_occupancy.py
 ```
 
-## 狀態
+不點畫面，直接用世界座標 (215, 360) 公分看亮哪一格：
 
-**已完成**
+```powershell
+python grid_occupancy.py --x 215 --y 360
+```
 
-- YOLO26 `model.track` + BoT-SORT；長期 ID：Stable-ID + OSNet-AIN
-- `--ref pose`：坐＝髖＋框底；站＋被擋＝同一 ID 的站姿歷史補腳，否則框底
-- 回場：換裝仍像同一人則沿用；從畫面邊緣離開且外貌／衣服明顯不像才發新號
-- 重疊雙框合併、門邊碎框較難開新號、室內漏檢短沿用／貼邊立刻清
-- 本機影片固定追蹤幀；RTSP 最新幀 + TCP；格子防抖／跳幀；A/B/C/O
-- 四點實測補償；鏡頭內參有檔但日常不去畸變
+---
 
-**尚未解決**
+## 5. 驗證定位、四點補償
 
-- 多人遮擋／漏檢仍可能閃號；近鏡頭大框易吃到另一人
-- `test3.mp4` 交叉頻繁，`--min-hits 16` 偏保守
-- 體型／衣服都很像的換人，OSNet 仍可能配回舊號；廣角邊緣單靠內參去畸變效果不佳
-- 桌後遮擋時腳點仍可能跳格
+點地板看預測的世界座標（公分）：
 
-## 其它腳本
+```powershell
+python verify_homography.py
+python verify_homography.py --error-comp calibration/homography_error_report.json
+```
+
+棋盤附近準、離板子遠（尤其近端右側）會偏。在地上量 4 個已知點，存成補償檔；GUI「四點補償」與 `--error-comp` 用這份。不要把 v2 的補償套到 ChArUco。
+
+```powershell
+python verify_homography.py --measure-error --image calibration/chessboard_floor/capture.jpg
+```
+
+得到 `calibration/homography_error_report.json`。
+
+![四點實測補償](test/error_comp_four_points.jpg)
+
+---
+
+## 6. 開偵測
 
 ```powershell
 python launch_detect_grid.py
-python test_rtsp.py "rtsp://帳號:密碼@攝影機IP:554/stream1"
-python detect_person.py --source test/test.mp4 --no-map
-python grid_occupancy.py
-python grid_occupancy.py --x 215 --y 360
-python export_demo_video.py
 ```
 
-- `launch_detect_grid.py`：見上方「detect_grid launcher GUI」。
-- `test_rtsp.py`：只測串流（TCP、預覽 ≤1280，仍讀 2880×1620）。無視窗：`--no-preview --frames 60`
-- `detect_person.py --no-map`：只要 YOLO 人框
-- `grid_occupancy.py`：點監視器地板看格子（黃＝佔用）。刻度參考 `test/floor_grid_generated.jpg`
-- `export_demo_video.py`：匯出左右對照，支援同樣的 `--stride` / `--cell-hold`
+按 Run 後左格子、右監視器。預設是本機影片、校正棋盤、腳點 pose、YOLO `yolo26s`、Re-ID `osnet_ain`，並勾選骨架、追蹤／ID、四點補償、A/B/C/O。
 
-## 報告
+可調的項目：
 
+- 來源：本機影片或 RTSP
+- 校正：棋盤、ChArUco
+- 腳點：pose、auto、foot、head_drop
+- 勾選：骨架、追蹤／ID、四點補償、A/B/C/O、少印 log、審查裁圖
+- YOLO：yolo26s、yolo26m、yolo26l
+- Re-ID：osnet_ain、osnet_ibn、osnet、none
+- 拉桿：conf、stride、cell-hold、min-hits、out-margin
+
+![detect_grid 執行中：五人都在格子與監視器](test/demo_detect_five.jpg)
+
+本機多人片 `test/test4.mp4`（或指令如下）。按 `q` 結束、`s` 存圖。示範：`test/review_videos/test4_review.mp4`。
+
+```powershell
+python detect_grid.py --source test/test4.mp4 --ref pose --cell-hold 2 --quiet --reid-model osnet_ain --error-comp calibration/homography_error_report.json
+```
+
+即時：GUI 選 RTSP，網址 `rtsp://帳號:密碼@IP:554/stream1`（本場 `rtsp://oriongo:123456789@192.168.0.200:554/stream1`）。自動 TCP、只處理最新幀。只測串流：
+
+```powershell
+python test_rtsp.py "rtsp://帳號:密碼@攝影機IP:554/stream1"
+```
+
+單人片可用 `test/test.mp4`，腳點改 `auto`。
+
+---
+
+## 說明與報告
+
+- 完整說明：[說明書.md](說明書.md)
 - [9/18](PPT%20report/報告9_18.pdf)（[PPT](PPT%20report/報告9_18.pptx)）
 - [8/21](PPT%20report/報告8_21.pdf)（[PPT](PPT%20report/報告8_21.pptx)）
 - [8/7](PPT%20report/報告8_7.pdf)（[PPT](PPT%20report/報告8_7.pptx)）
 - [7/24](PPT%20report/報告7_24.pdf)（[PPT](PPT%20report/報告7_24.pptx)）
 - [7/10](PPT%20report/報告7_10.pdf)（[PPT](PPT%20report/報告7_10.pptx)）
+
