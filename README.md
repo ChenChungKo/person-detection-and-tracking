@@ -196,6 +196,16 @@ python test_rtsp.py "rtsp://帳號:密碼@攝影機IP:554/stream1"
 
 ---
 
+## 資料夾
+
+- `PPT report`：進度報告，每份有 PDF 與 PPT。
+- `calibration`：校正結果。偵測讀 `homography.json`（棋盤 v2）、`floor_grid.json`、`floor_marks.json`、`homography_error_report.json`。棋盤、ChArUco、手動點磚各存一份，互不覆蓋。`chessboard_print`、`charuco_print` 是可列印的板；`chessboard_floor`、`charuco_floor` 是拍下來的校正圖。`camera_intrinsics.json` 與 `lens_frames` 是鏡頭內參，日常偵測不去畸變。
+- `picture`：架構圖、時程圖。
+- `test`：示範影片、步驟截圖、單人片 `test.mp4`、多人片 `test4.mp4`、靜態幀 `static_frame.jpg`。剪好的左右對照在 `review_videos/test4_review.mp4`。
+- `trackers`：短追蹤設定 `botsort.yaml`（Re-ID 關）。長期 ID 用 OSNet，不要寫進這個檔。
+
+---
+
 ## 說明與報告
 
 - 完整說明：[說明書.md](說明書.md)

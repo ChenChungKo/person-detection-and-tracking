@@ -10,6 +10,7 @@ venv/
 models/osnet/
 *.mp4
 !test/test.mp4
+!test/test4.mp4
 !test/demo_detect_grid.mp4
 !test/demo_v1_manual.mp4
 !test/demo_v2_chessboard.mp4
