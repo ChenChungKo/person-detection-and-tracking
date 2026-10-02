@@ -1,4 +1,9 @@
-﻿# Runtime used for this handoff: Python 3.14.x, Windows, torch CPU build (2.13.0+cpu).
+﻿# Required / tested runtime for this handoff:
+#   Python 3.14.6 (3.14.x), Windows
+#   torch 2.13.0+cpu  (pip package name is still torch==2.13.0)
+#
+# Create the venv with that interpreter, e.g.:
+#   py -3.14 -m venv .venv
 #
 # Model weights are NOT listed here on purpose:
 # - This file is only for pip packages (`pip install -r requirements.txt`).

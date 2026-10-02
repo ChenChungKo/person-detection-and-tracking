@@ -19,16 +19,16 @@ Tapo C230 監視器：偵測人、給穩定 ID、把腳點投到預先規劃的�
 
 ## 1. 安裝環境
 
-用專案虛擬環境。VS Code 選 Interpreter → `.venv`。
+用 **Python 3.14**（本機測試為 3.14.6）建立專案虛擬環境。VS Code 選 Interpreter → `.venv`。
 
 ```powershell
 cd C:\5Gjump
-python -m venv .venv
+py -3.14 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-之後可以跑下面的腳本。第一次偵測會下載 `yolo26s.pt` 與 `yolo26s-pose.pt`。
+之後可以跑下面的腳本。第一次偵測會下載 `yolo26s.pt` 與 `yolo26s-pose.pt`（權重不在 `requirements.txt`，見該檔註解）。
 
 ---
 

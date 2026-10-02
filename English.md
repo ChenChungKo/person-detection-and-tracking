@@ -19,16 +19,16 @@ Older comparisons: [chessboard v2](test/demo_v2_chessboard.mp4), [manual tile cl
 
 ## 1. Set up the environment
 
-Use the project virtual environment. In VS Code, select Interpreter → `.venv`.
+Use **Python 3.14** (tested on 3.14.6) for the project virtual environment. In VS Code, select Interpreter → `.venv`.
 
 ```powershell
 cd C:\5Gjump
-python -m venv .venv
+py -3.14 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-You can then run the scripts below. The first detection run downloads `yolo26s.pt` and `yolo26s-pose.pt`.
+You can then run the scripts below. The first detection run downloads `yolo26s.pt` and `yolo26s-pose.pt` (weights are not listed in `requirements.txt`; see the comments there).
 
 ---
 
