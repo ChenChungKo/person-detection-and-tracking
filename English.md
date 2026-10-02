@@ -1,6 +1,6 @@
 # person-detection-and-tracking
 
-Tapo C230 camera: detect people, assign stable IDs, and project foot points onto a planned floor grid. For principles and limits, see [說明書.md](說明書.md) (Chinese). The Chinese step guide is [README.md](README.md).
+Tapo C230 camera: detect people, assign stable IDs, and project foot points onto a planned floor grid. For principles and limits, see [Manual.md](Manual.md) (Chinese: [說明書.md](說明書.md)). The Chinese step guide is [README.md](README.md).
 
 ![System architecture](picture/架構圖.png)
 
@@ -206,6 +206,7 @@ For the single-person clip `test/test.mp4`, set foot ref to `auto`.
 
 ## Docs and reports
 
+- Full English notes: [Manual.md](Manual.md)
 - Full Chinese notes: [說明書.md](說明書.md)
 - Chinese steps: [README.md](README.md)
 - [9/18](PPT%20report/報告9_18.pdf) ([PPT](PPT%20report/報告9_18.pptx))
